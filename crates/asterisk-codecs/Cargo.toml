@@ -1,0 +1,23 @@
+[package]
+name = "asterisk-codecs"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Enable native Opus codec via FFI to libopus.
+# When disabled, Opus encode/decode returns a stub error.
+native-opus = []
+# Enable native GSM codec via FFI to libgsm.
+native-gsm = []
+# Enable native Speex codec via FFI to libspeex.
+native-speex = []
+
+[dependencies]
+asterisk-types = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+once_cell = "1"

@@ -1,0 +1,43 @@
+[package]
+name = "asterisk-utils"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "astcanary"
+path = "src/astcanary.rs"
+
+[[bin]]
+name = "astdb2sqlite3"
+path = "src/astdb2sqlite3.rs"
+
+[[bin]]
+name = "check_expr"
+path = "src/check_expr.rs"
+
+[[bin]]
+name = "check_expr2"
+path = "src/check_expr2.rs"
+
+[[bin]]
+name = "ast_coredumper"
+path = "src/ast_coredumper.rs"
+
+[[bin]]
+name = "smsq"
+path = "src/smsq.rs"
+
+[[bin]]
+name = "streamplayer"
+path = "src/streamplayer.rs"
+
+[[bin]]
+name = "muted"
+path = "src/muted.rs"
+
+[[bin]]
+name = "conf_bridge_binaural_hrir_importer"
+path = "src/conf_bridge_binaural.rs"
+
+[dependencies]
+clap = { workspace = true }

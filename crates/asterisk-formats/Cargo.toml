@@ -1,0 +1,11 @@
+[package]
+name = "asterisk-formats"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+asterisk-codecs = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }

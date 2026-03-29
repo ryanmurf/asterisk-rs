@@ -1,0 +1,11 @@
+[package]
+name = "asterisk-funcs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+asterisk-core = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }

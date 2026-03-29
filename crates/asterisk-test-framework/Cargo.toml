@@ -1,0 +1,30 @@
+[package]
+name = "asterisk-test-framework"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+asterisk-core = { workspace = true }
+asterisk-codecs = { workspace = true }
+asterisk-config = { workspace = true }
+asterisk-cdr = { workspace = true }
+asterisk-res = { workspace = true }
+asterisk-channels = { workspace = true }
+asterisk-funcs = { workspace = true }
+asterisk-apps = { workspace = true }
+asterisk-ami = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+md-5 = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+regex = { workspace = true }
+rand = { workspace = true }

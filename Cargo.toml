@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/asterisk-types",
+    "crates/asterisk-config",
+    "crates/asterisk-core",
+    "crates/asterisk-codecs",
+    "crates/asterisk-formats",
+    "crates/asterisk-channels",
+    "crates/asterisk-apps",
+    "crates/asterisk-funcs",
+    "crates/asterisk-sip",
+    "crates/asterisk-cdr",
+    "crates/asterisk-cli",
+    "crates/asterisk-res",
+    "crates/asterisk-ami",
+    "crates/asterisk-ari",
+    "crates/asterisk-test-framework",
+    "crates/asterisk-integration-tests",
+    "crates/asterisk-utils",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+bitflags = "2"
+bytes = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+inventory = "0.3"
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+
+asterisk-test-framework = { path = "crates/asterisk-test-framework" }
+asterisk-types = { path = "crates/asterisk-types" }
+asterisk-config = { path = "crates/asterisk-config" }
+asterisk-core = { path = "crates/asterisk-core" }
+asterisk-codecs = { path = "crates/asterisk-codecs" }
+asterisk-formats = { path = "crates/asterisk-formats" }
+asterisk-channels = { path = "crates/asterisk-channels" }
+asterisk-apps = { path = "crates/asterisk-apps" }
+asterisk-funcs = { path = "crates/asterisk-funcs" }
+asterisk-sip = { path = "crates/asterisk-sip" }
+asterisk-cdr = { path = "crates/asterisk-cdr" }
+asterisk-res = { path = "crates/asterisk-res" }
+asterisk-ami = { path = "crates/asterisk-ami" }
+asterisk-ari = { path = "crates/asterisk-ari" }
+serde_json = "1"
+regex = "1"

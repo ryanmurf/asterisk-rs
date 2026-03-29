@@ -1,0 +1,9 @@
+[package]
+name = "asterisk-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

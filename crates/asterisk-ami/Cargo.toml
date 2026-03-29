@@ -1,0 +1,15 @@
+[package]
+name = "asterisk-ami"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+asterisk-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+md-5 = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }

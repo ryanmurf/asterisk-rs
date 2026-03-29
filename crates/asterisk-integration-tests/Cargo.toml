@@ -1,0 +1,30 @@
+[package]
+name = "asterisk-integration-tests"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+asterisk-types = { workspace = true }
+asterisk-core = { workspace = true }
+asterisk-codecs = { workspace = true }
+asterisk-formats = { workspace = true }
+asterisk-channels = { workspace = true }
+asterisk-apps = { workspace = true }
+asterisk-funcs = { workspace = true }
+asterisk-sip = { workspace = true }
+asterisk-cdr = { workspace = true }
+asterisk-res = { workspace = true }
+asterisk-ari = { workspace = true }
+asterisk-ami = { workspace = true }
+asterisk-config = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+md-5 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

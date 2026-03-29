@@ -1,0 +1,338 @@
+//! SIP Channel Driver.
+//!
+//! Integrates the SIP stack with the Asterisk channel model, implementing
+//! the ChannelDriver trait for SIP/PJSIP-style channel operations.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use tokio::sync::Mutex;
+use tracing::{debug, info};
+
+use asterisk_codecs::{codecs, Codec};
+use asterisk_core::channel::{Channel, ChannelDriver};
+use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
+
+use crate::rtp::RtpSession;
+use crate::sdp::SessionDescription;
+use crate::session::{SessionState, SipSession};
+use crate::transport::{SipTransport, UdpTransport};
+
+/// Per-channel SIP private data.
+struct SipChannelPrivate {
+    /// The SIP session.
+    session: Mutex<SipSession>,
+    /// The RTP session for media.
+    rtp: Mutex<Option<RtpSession>>,
+    /// SIP transport to use.
+    transport: Arc<dyn SipTransport>,
+}
+
+impl fmt::Debug for SipChannelPrivate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SipChannelPrivate").finish()
+    }
+}
+
+/// The SIP channel driver.
+///
+/// Port of chan_pjsip.c. Implements the ChannelDriver trait for SIP calls.
+pub struct SipChannelDriver {
+    /// Local SIP address.
+    local_addr: SocketAddr,
+    /// Active channels.
+    channels: RwLock<HashMap<String, Arc<SipChannelPrivate>>>,
+    /// SIP transport.
+    transport: Option<Arc<dyn SipTransport>>,
+    /// Supported codecs.
+    codecs: Vec<Codec>,
+}
+
+impl fmt::Debug for SipChannelDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SipChannelDriver")
+            .field("local_addr", &self.local_addr)
+            .field("active_channels", &self.channels.read().len())
+            .finish()
+    }
+}
+
+impl SipChannelDriver {
+    /// Create a new SIP channel driver.
+    pub fn new(local_addr: SocketAddr) -> Self {
+        Self {
+            local_addr,
+            channels: RwLock::new(HashMap::new()),
+            transport: None,
+            codecs: vec![codecs::pcmu(), codecs::pcma(), codecs::telephone_event()],
+        }
+    }
+
+    /// Initialize the transport layer.
+    pub async fn init_transport(&mut self) -> AsteriskResult<()> {
+        let transport = UdpTransport::bind(self.local_addr).await.map_err(|e| {
+            AsteriskError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("Failed to bind SIP transport: {}", e),
+            ))
+        })?;
+        self.transport = Some(Arc::new(transport));
+        info!(addr = %self.local_addr, "SIP channel driver initialized");
+        Ok(())
+    }
+
+    fn get_private(&self, id: &str) -> Option<Arc<SipChannelPrivate>> {
+        self.channels.read().get(id).cloned()
+    }
+
+    fn remove_private(&self, id: &str) -> Option<Arc<SipChannelPrivate>> {
+        self.channels.write().remove(id)
+    }
+
+    fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
+        self.transport.clone().ok_or_else(|| {
+            AsteriskError::Internal("SIP transport not initialized".into())
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelDriver for SipChannelDriver {
+    fn name(&self) -> &str {
+        "PJSIP"
+    }
+
+    fn description(&self) -> &str {
+        "PJSIP SIP Channel Driver"
+    }
+
+    /// Request an outbound SIP channel.
+    ///
+    /// `dest` format: `endpoint_name` or `sip:user@host[:port]`
+    async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
+        let transport = self.get_transport()?;
+
+        // Parse destination to determine remote address.
+        let (_to_uri, remote_addr) = if dest.starts_with("sip:") || dest.starts_with("sips:") {
+            let uri = crate::parser::SipUri::parse(dest)
+                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid SIP URI: {}", e.0)))?;
+            let port = uri.port.unwrap_or(5060);
+            let addr: SocketAddr = format!("{}:{}", uri.host, port)
+                .parse()
+                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid address: {}", e)))?;
+            (dest.to_string(), addr)
+        } else {
+            // Treat as user@host
+            let addr_str = if dest.contains(':') {
+                dest.to_string()
+            } else {
+                format!("{}:5060", dest)
+            };
+            let addr: SocketAddr = addr_str
+                .parse()
+                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid dest: {}", e)))?;
+            (format!("sip:{}", dest), addr)
+        };
+
+        // Create RTP session
+        let rtp_bind = SocketAddr::new(self.local_addr.ip(), 0);
+        let rtp_session = RtpSession::bind(rtp_bind).await?;
+        let rtp_port = rtp_session.local_addr()?.port();
+
+        // Create SIP session
+        let mut sip_session = SipSession::new_outbound(self.local_addr, remote_addr);
+
+        // Create SDP offer
+        let sdp = SessionDescription::create_offer(
+            &self.local_addr.ip().to_string(),
+            rtp_port,
+            &self.codecs,
+        );
+        sip_session.local_sdp = Some(sdp);
+
+        let chan_name = format!("PJSIP/{}", dest);
+        let channel = Channel::new(chan_name);
+        let channel_id = channel.unique_id.as_str().to_string();
+
+        let priv_data = Arc::new(SipChannelPrivate {
+            session: Mutex::new(sip_session),
+            rtp: Mutex::new(Some(rtp_session)),
+            transport,
+        });
+
+        self.channels.write().insert(channel_id, priv_data);
+        Ok(channel)
+    }
+
+    /// Initiate the outbound call (send INVITE).
+    async fn call(&self, channel: &mut Channel, dest: &str, _timeout: i32) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let mut session = priv_data.session.lock().await;
+        let to_uri = if dest.starts_with("sip:") {
+            dest.to_string()
+        } else {
+            format!("sip:{}", dest)
+        };
+
+        let invite = session.build_invite(&to_uri);
+
+        // Send the INVITE
+        priv_data
+            .transport
+            .send(&invite, session.remote_addr)
+            .await
+            .map_err(|e| AsteriskError::Internal(format!("Failed to send INVITE: {}", e)))?;
+
+        channel.set_state(ChannelState::Dialing);
+        info!(call_id = %session.call_id, dest, "SIP INVITE sent");
+        Ok(())
+    }
+
+    /// Answer an inbound call (send 200 OK).
+    async fn answer(&self, channel: &mut Channel) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let mut session = priv_data.session.lock().await;
+
+        let response = session.build_200_ok().ok_or_else(|| {
+            AsteriskError::Internal("Failed to build 200 OK".into())
+        })?;
+
+        priv_data
+            .transport
+            .send(&response, session.remote_addr)
+            .await
+            .map_err(|e| AsteriskError::Internal(format!("Failed to send 200 OK: {}", e)))?;
+
+        session.state = SessionState::Established;
+        channel.answer();
+        info!(call_id = %session.call_id, "SIP call answered");
+        Ok(())
+    }
+
+    /// Hang up the call (send BYE).
+    async fn hangup(&self, channel: &mut Channel) -> AsteriskResult<()> {
+        let priv_data = match self.remove_private(channel.unique_id.as_str()) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let mut session = priv_data.session.lock().await;
+
+        if session.state == SessionState::Established || session.state == SessionState::Early {
+            if let Some(bye) = session.build_bye() {
+                let _ = priv_data.transport.send(&bye, session.remote_addr).await;
+            }
+        }
+
+        session.terminate();
+        channel.set_state(ChannelState::Down);
+        info!(call_id = %session.call_id, "SIP call hungup");
+        Ok(())
+    }
+
+    /// Read a frame (from RTP).
+    async fn read_frame(&self, channel: &mut Channel) -> AsteriskResult<Frame> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let rtp_guard = priv_data.rtp.lock().await;
+        let rtp = rtp_guard
+            .as_ref()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+
+        rtp.recv_frame().await
+    }
+
+    /// Write a frame (to RTP).
+    async fn write_frame(&self, channel: &mut Channel, frame: &Frame) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let rtp_guard = priv_data.rtp.lock().await;
+        let rtp = rtp_guard
+            .as_ref()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+
+        rtp.send_frame(frame).await
+    }
+
+    /// Send DTMF via RFC 2833.
+    async fn send_digit_end(&self, channel: &mut Channel, digit: char, duration: u32) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let rtp_guard = priv_data.rtp.lock().await;
+        let rtp = rtp_guard
+            .as_ref()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+
+        // Convert ms to samples (8kHz)
+        let duration_samples = (duration * 8) as u16;
+        rtp.send_dtmf(digit, duration_samples).await
+    }
+
+    /// Indicate a condition (send SIP signaling).
+    async fn indicate(&self, channel: &mut Channel, condition: i32, _data: &[u8]) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel.unique_id.as_str())
+            .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        let session = priv_data.session.lock().await;
+
+        match condition as u32 {
+            x if x == ControlFrame::Ringing as u32 => {
+                if let Some(ref invite) = session.invite {
+                    if let Ok(resp) = invite.create_response(180, "Ringing") {
+                        let _ = priv_data.transport.send(&resp, session.remote_addr).await;
+                    }
+                }
+            }
+            x if x == ControlFrame::Progress as u32 => {
+                if let Some(ref invite) = session.invite {
+                    if let Ok(resp) = invite.create_response(183, "Session Progress") {
+                        let _ = priv_data.transport.send(&resp, session.remote_addr).await;
+                    }
+                }
+            }
+            x if x == ControlFrame::Proceeding as u32 => {
+                if let Some(ref invite) = session.invite {
+                    if let Ok(resp) = invite.create_response(100, "Trying") {
+                        let _ = priv_data.transport.send(&resp, session.remote_addr).await;
+                    }
+                }
+            }
+            x if x == ControlFrame::Busy as u32 => {
+                if let Some(ref invite) = session.invite {
+                    if let Ok(resp) = invite.create_response(486, "Busy Here") {
+                        let _ = priv_data.transport.send(&resp, session.remote_addr).await;
+                    }
+                }
+            }
+            x if x == ControlFrame::Congestion as u32 => {
+                if let Some(ref invite) = session.invite {
+                    if let Ok(resp) = invite.create_response(503, "Service Unavailable") {
+                        let _ = priv_data.transport.send(&resp, session.remote_addr).await;
+                    }
+                }
+            }
+            _ => {
+                debug!(condition, "Unhandled SIP indication");
+            }
+        }
+
+        Ok(())
+    }
+}

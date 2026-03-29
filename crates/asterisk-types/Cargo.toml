@@ -1,0 +1,10 @@
+[package]
+name = "asterisk-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
