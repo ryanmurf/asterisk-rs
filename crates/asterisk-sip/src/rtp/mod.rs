@@ -15,6 +15,7 @@ pub mod engine;
 pub mod avpf;
 pub mod bundle;
 pub mod ice_transport;
+pub mod mos;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
@@ -498,6 +499,9 @@ fn generate_ssrc() -> u32 {
 ///
 /// The CNG payload consists of a single noise level byte (0-127 dBov)
 /// optionally followed by spectral parameters.
+///
+/// This implementation generates actual comfort noise audio samples
+/// with spectral shaping to approximate typical background noise.
 #[derive(Debug, Clone)]
 pub struct ComfortNoise {
     /// Noise level in -dBov (0 = loudest, 127 = silence).
@@ -507,6 +511,12 @@ pub struct ComfortNoise {
     pub active: bool,
     /// Payload type for CNG (RFC 3389 specifies PT 13 for 8kHz, or dynamic).
     pub payload_type: u8,
+    /// LFSR state for white noise generation.
+    noise_state: u32,
+    /// One-pole low-pass filter state for spectral shaping.
+    filter_state: f32,
+    /// Filter coefficient for spectral shaping (controls spectral tilt).
+    filter_coeff: f32,
 }
 
 impl ComfortNoise {
@@ -518,6 +528,9 @@ impl ComfortNoise {
             level,
             active: false,
             payload_type: 13, // Static PT for 8kHz CNG
+            noise_state: 0xACE1_u32,
+            filter_state: 0.0,
+            filter_coeff: 0.7, // Low-pass for pink-ish noise
         }
     }
 
@@ -529,6 +542,52 @@ impl ComfortNoise {
         asterisk_types::Frame::Cng {
             level: self.level as i32,
         }
+    }
+
+    /// Generate actual comfort noise audio samples at the configured level.
+    ///
+    /// - `num_samples`: number of PCM samples to generate
+    ///
+    /// Returns i16 PCM samples shaped to approximate background noise.
+    pub fn generate_audio(&mut self, num_samples: usize) -> Vec<i16> {
+        if self.level >= 127 {
+            // Digital silence
+            return vec![0i16; num_samples];
+        }
+
+        // Convert -dBov level to linear amplitude.
+        // Level 0 = 0 dBov (loudest), 127 = -127 dBov (silence).
+        // Typical comfortable CNG is around level 40-60 (-40 to -60 dBov).
+        let amplitude = 32768.0 * 10.0f32.powf(-(self.level as f32) / 20.0);
+        // Clamp to reasonable range
+        let amplitude = amplitude.min(4000.0);
+
+        let mut output = Vec::with_capacity(num_samples);
+        for _ in 0..num_samples {
+            // Generate white noise using LFSR
+            self.noise_state ^= self.noise_state << 13;
+            self.noise_state ^= self.noise_state >> 17;
+            self.noise_state ^= self.noise_state << 5;
+            let white = (self.noise_state as f32 / u32::MAX as f32) * 2.0 - 1.0;
+
+            // Apply spectral shaping (one-pole low-pass for pink-ish noise)
+            // This makes the noise sound more natural (real background noise
+            // has more energy at lower frequencies).
+            self.filter_state = self.filter_coeff * self.filter_state
+                + (1.0 - self.filter_coeff) * white;
+
+            let sample = (self.filter_state * amplitude)
+                .round()
+                .clamp(-32768.0, 32767.0) as i16;
+            output.push(sample);
+        }
+
+        output
+    }
+
+    /// Set the noise level from a received CNG frame.
+    pub fn set_level_from_received(&mut self, level: i8) {
+        self.level = level;
     }
 
     /// Build a raw CNG RTP payload (RFC 3389 Section 3).
@@ -789,6 +848,52 @@ mod tests {
         assert!(ComfortNoise::is_cng_frame(13));
         assert!(!ComfortNoise::is_cng_frame(0));
         assert!(!ComfortNoise::is_cng_frame(101));
+    }
+
+    #[test]
+    fn test_cng_audio_generation() {
+        let mut cng = ComfortNoise::new(50);
+        let audio = cng.generate_audio(160);
+        assert_eq!(audio.len(), 160);
+        // Should not be all zeros (it's noise)
+        let has_nonzero = audio.iter().any(|&s| s != 0);
+        assert!(has_nonzero, "CNG audio should not be all zeros");
+    }
+
+    #[test]
+    fn test_cng_audio_silence_level() {
+        let mut cng = ComfortNoise::new(127);
+        let audio = cng.generate_audio(160);
+        // Level 127 = digital silence
+        for &s in &audio {
+            assert_eq!(s, 0, "Level 127 should produce silence");
+        }
+    }
+
+    #[test]
+    fn test_cng_audio_level_scaling() {
+        // Louder level should produce higher amplitude noise
+        let mut cng_loud = ComfortNoise::new(30);
+        let loud_audio = cng_loud.generate_audio(8000);
+        let loud_energy: f64 = loud_audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        let mut cng_quiet = ComfortNoise::new(80);
+        let quiet_audio = cng_quiet.generate_audio(8000);
+        let quiet_energy: f64 = quiet_audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        assert!(
+            loud_energy > quiet_energy,
+            "Louder CNG level should produce more energy: loud={}, quiet={}",
+            loud_energy,
+            quiet_energy
+        );
+    }
+
+    #[test]
+    fn test_cng_set_level() {
+        let mut cng = ComfortNoise::new(60);
+        cng.set_level_from_received(40);
+        assert_eq!(cng.level, 40);
     }
 
     // -----------------------------------------------------------------------

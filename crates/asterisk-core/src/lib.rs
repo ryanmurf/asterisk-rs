@@ -35,6 +35,7 @@ pub use bridge::softmix::SoftmixBridgeTech;
 pub use bridge::basic::{BasicBridge, ast_bridge_basic_new};
 pub use pbx::{
     Context, Dialplan, DialplanApp, DialplanFunction, Extension, PbxResult, Priority,
+    set_global_dialplan, get_global_dialplan,
 };
 pub use pbx::app_registry::{AppRegistry, APP_REGISTRY};
 pub use pbx::func_registry::{FuncRegistry, FUNC_REGISTRY};

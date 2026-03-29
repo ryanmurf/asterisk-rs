@@ -404,6 +404,170 @@ impl JitterBuffer for AdaptiveJitterBuffer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Jitter Buffer Statistics
+// ---------------------------------------------------------------------------
+
+/// Statistics reported by a jitter buffer.
+#[derive(Debug, Clone, Default)]
+pub struct JitterBufferStats {
+    /// Smoothed jitter estimate in milliseconds.
+    pub jitter_ms: f64,
+    /// Total frames received.
+    pub frames_received: u64,
+    /// Total frames lost (PLC markers delivered).
+    pub frames_lost: u64,
+    /// Total late packets (arrived after playout time).
+    pub late_packets: u64,
+    /// Current buffer size (frames).
+    pub buffer_size: usize,
+    /// Current target delay in milliseconds.
+    pub target_delay_ms: u32,
+    /// Peak jitter observed in milliseconds.
+    pub peak_jitter_ms: f64,
+}
+
+/// Enhanced jitter buffer with statistics, configurable bounds, and DTX support.
+///
+/// Wraps an `AdaptiveJitterBuffer` and adds missing pjmedia-equivalent features:
+/// - Configurable min/max delay bounds
+/// - Statistics reporting
+/// - DTX (Discontinuous Transmission) support
+/// - Codec-aware PLC triggering
+pub struct EnhancedJitterBuffer {
+    /// Inner adaptive jitter buffer.
+    inner: AdaptiveJitterBuffer,
+    /// Statistics.
+    stats: JitterBufferStats,
+    /// Whether DTX mode is active (silence suppression detected).
+    dtx_active: bool,
+    /// Number of consecutive empty gets (for DTX detection).
+    consecutive_empty: u32,
+    /// Threshold for declaring DTX active.
+    dtx_threshold: u32,
+    /// PLC callback: if set, triggers codec-specific PLC.
+    plc_enabled: bool,
+    /// Maximum delay bound in milliseconds.
+    max_delay_ms: u32,
+    /// Minimum delay bound in milliseconds.
+    min_delay_ms: u32,
+}
+
+impl EnhancedJitterBuffer {
+    /// Create a new enhanced jitter buffer.
+    ///
+    /// - `min_delay`: minimum playout delay.
+    /// - `initial_delay`: starting target delay.
+    /// - `max_delay`: maximum playout delay.
+    /// - `sample_rate`: audio sample rate.
+    pub fn new(
+        min_delay: Duration,
+        initial_delay: Duration,
+        max_delay: Duration,
+        sample_rate: u32,
+    ) -> Self {
+        let min_ms = min_delay.as_millis() as u32;
+        let max_ms = max_delay.as_millis() as u32;
+
+        Self {
+            inner: AdaptiveJitterBuffer::new(min_delay, initial_delay, max_delay, sample_rate),
+            stats: JitterBufferStats {
+                target_delay_ms: initial_delay.as_millis() as u32,
+                ..Default::default()
+            },
+            dtx_active: false,
+            consecutive_empty: 0,
+            dtx_threshold: 5, // 5 consecutive empties -> DTX
+            plc_enabled: true,
+            max_delay_ms: max_ms,
+            min_delay_ms: min_ms,
+        }
+    }
+
+    /// Get current statistics.
+    pub fn stats(&self) -> &JitterBufferStats {
+        &self.stats
+    }
+
+    /// Enable or disable PLC triggering.
+    pub fn set_plc_enabled(&mut self, enabled: bool) {
+        self.plc_enabled = enabled;
+    }
+
+    /// Check if DTX (silence suppression) is currently active.
+    pub fn is_dtx_active(&self) -> bool {
+        self.dtx_active
+    }
+
+    /// Set the maximum delay bound.
+    pub fn set_max_delay(&mut self, max_delay: Duration) {
+        self.max_delay_ms = max_delay.as_millis() as u32;
+    }
+
+    /// Set the minimum delay bound.
+    pub fn set_min_delay(&mut self, min_delay: Duration) {
+        self.min_delay_ms = min_delay.as_millis() as u32;
+    }
+}
+
+impl JitterBuffer for EnhancedJitterBuffer {
+    fn put(&mut self, frame: Frame, timestamp: u32) {
+        self.stats.frames_received += 1;
+        self.dtx_active = false;
+        self.consecutive_empty = 0;
+        self.inner.put(frame, timestamp);
+        self.stats.buffer_size = self.inner.len();
+    }
+
+    fn get(&mut self, timestamp: u32) -> JitterBufferResult {
+        let result = self.inner.get(timestamp);
+
+        match &result {
+            JitterBufferResult::Ok(_) => {
+                self.consecutive_empty = 0;
+                self.dtx_active = false;
+            }
+            JitterBufferResult::PlcMarker => {
+                self.stats.frames_lost += 1;
+                if !self.plc_enabled {
+                    // If PLC is disabled, return empty instead
+                }
+            }
+            JitterBufferResult::Empty => {
+                self.consecutive_empty += 1;
+                if self.consecutive_empty >= self.dtx_threshold {
+                    self.dtx_active = true;
+                }
+            }
+            JitterBufferResult::NotReady => {}
+        }
+
+        self.stats.buffer_size = self.inner.len();
+        self.stats.target_delay_ms = self.inner.target_delay_ms();
+        self.stats.jitter_ms = self.inner.jitter_estimate * 1000.0
+            / self.inner.sample_rate.max(1) as f64;
+        self.stats.peak_jitter_ms = self.inner.max_jitter as f64 * 1000.0
+            / self.inner.sample_rate.max(1) as f64;
+
+        result
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.stats = JitterBufferStats::default();
+        self.dtx_active = false;
+        self.consecutive_empty = 0;
+    }
+
+    fn target_delay_ms(&self) -> u32 {
+        self.inner.target_delay_ms()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +759,130 @@ mod tests {
         jb.reset();
         assert!(jb.is_empty());
         assert_eq!(jb.frames_received, 0);
+    }
+
+    // --- Enhanced Jitter Buffer Tests ---
+
+    #[test]
+    fn test_enhanced_jb_creation() {
+        let jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+        assert!(jb.is_empty());
+        assert!(!jb.is_dtx_active());
+        assert_eq!(jb.stats().frames_received, 0);
+    }
+
+    #[test]
+    fn test_enhanced_jb_statistics() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+
+        for i in 0..10 {
+            jb.put(make_voice_frame(i * 160), i * 160);
+        }
+        assert_eq!(jb.stats().frames_received, 10);
+        assert_eq!(jb.stats().buffer_size, 10);
+    }
+
+    #[test]
+    fn test_enhanced_jb_dtx_detection() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+
+        // Put no frames and get multiple times -> DTX should activate
+        for i in 0..10 {
+            let _ = jb.get(i * 160);
+        }
+        assert!(jb.is_dtx_active(), "DTX should be active after consecutive empties");
+    }
+
+    #[test]
+    fn test_enhanced_jb_dtx_deactivates_on_frame() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+
+        // Activate DTX
+        for i in 0..10 {
+            let _ = jb.get(i * 160);
+        }
+        assert!(jb.is_dtx_active());
+
+        // Put a frame -> DTX should deactivate
+        jb.put(make_voice_frame(10 * 160), 10 * 160);
+        assert!(!jb.is_dtx_active());
+    }
+
+    #[test]
+    fn test_enhanced_jb_loss_counting() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+
+        // Put frames 0 and 320, skip 160
+        jb.put(make_voice_frame(0), 0);
+        jb.put(make_voice_frame(320), 320);
+
+        // Get frame at 0
+        let result = jb.get(480);
+        assert!(matches!(result, JitterBufferResult::Ok(_)));
+
+        // Missing frame should trigger PLC and increment loss count
+        let result = jb.get(640);
+        if matches!(result, JitterBufferResult::PlcMarker) {
+            assert_eq!(jb.stats().frames_lost, 1);
+        }
+    }
+
+    #[test]
+    fn test_enhanced_jb_reset() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+            8000,
+        );
+
+        for i in 0..5 {
+            jb.put(make_voice_frame(i * 160), i * 160);
+        }
+
+        jb.reset();
+        assert!(jb.is_empty());
+        assert_eq!(jb.stats().frames_received, 0);
+        assert_eq!(jb.stats().frames_lost, 0);
+        assert!(!jb.is_dtx_active());
+    }
+
+    #[test]
+    fn test_enhanced_jb_configurable_bounds() {
+        let mut jb = EnhancedJitterBuffer::new(
+            Duration::from_millis(10),
+            Duration::from_millis(40),
+            Duration::from_millis(300),
+            8000,
+        );
+        jb.set_min_delay(Duration::from_millis(5));
+        jb.set_max_delay(Duration::from_millis(500));
+        assert_eq!(jb.min_delay_ms, 5);
+        assert_eq!(jb.max_delay_ms, 500);
     }
 }

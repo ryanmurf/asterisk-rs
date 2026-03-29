@@ -42,6 +42,7 @@
 //! - Retry-After header parsing
 //! - Early media fork handling
 //! - Connection reuse & Via alias
+//! - STIR/SHAKEN (RFC 8224/8225/8226) caller ID attestation & verification
 
 pub mod parser;
 pub mod transport;
@@ -93,6 +94,7 @@ pub mod multipart;
 pub mod service_route;
 pub mod prack;
 pub mod update;
+pub mod stir_shaken;
 
 pub use parser::{SipMessage, SipMethod, SipUri, StartLine};
 pub use transport::SipTransport;
@@ -127,3 +129,10 @@ pub use stun::StunMessage;
 pub use turn::TurnClient;
 pub use rtp::ice_transport::IceRtpTransport;
 pub use pjsip_config::{PjsipConfig, TransportConfig, EndpointConfig, AorConfig, AuthConfig, IdentifyConfig, RegistrationConfig};
+pub use rtp::mos::{MosEstimator, CallQuality, QualityRating, CodecType, RtpMetrics};
+pub use stir_shaken::{
+    AttestationLevel, StirIdentity, PASSporT, PASSporTHeader, PASSporTPayload,
+    TelephoneNumber, VerificationResult, VerificationStatus, StirShakenError,
+    CryptoBackend, HmacPlaceholderBackend, StubBackend, CertificateCache,
+    StirShakenVars,
+};

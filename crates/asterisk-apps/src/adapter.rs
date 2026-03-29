@@ -451,7 +451,7 @@ fn register_stub_apps() {
     register_stub!("IVRDemo", "IVR demo");
     register_stub!("SendImage", "Send image to channel");
     register_stub!("ADSIProg", "ADSI programming");
-    register_stub!("UserEvent", "Send a custom user event");
+    // UserEvent is registered as a real adapter above -- do NOT re-register as stub.
     register_stub!("WaitForRing", "Wait for ring");
     register_stub!("WaitForSilence", "Wait for silence");
     register_stub!("WaitForNoise", "Wait for noise");

@@ -49,12 +49,11 @@ impl AppSet {
             }
         };
 
-        info!("Set: channel '{}' {}={}", channel.name, name, value);
+        debug!("Set: channel '{}' {}={}", channel.name, name, value);
 
-        // In a real implementation:
-        // 1. Check for inheritance prefix (__name or _name)
-        // 2. Check for GLOBAL() or SHARED() function wrappers
-        // 3. Set the channel variable via pbx_builtin_setvar_helper
+        // TODO: Check for inheritance prefix (__name or _name)
+        // TODO: Check for GLOBAL() or SHARED() function wrappers
+        channel.set_variable(name, value);
 
         PbxExecResult::Success
     }
@@ -100,10 +99,8 @@ impl AppMSet {
                 }
             };
 
-            info!("MSet: channel '{}' {}={}", channel.name, name, value);
-
-            // In a real implementation:
-            // pbx_builtin_setvar_helper(channel, name, value)
+            debug!("MSet: channel '{}' {}={}", channel.name, name, value);
+            channel.set_variable(name, value);
         }
 
         PbxExecResult::Success

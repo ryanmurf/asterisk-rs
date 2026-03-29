@@ -555,6 +555,8 @@ impl DtlsSession {
             SrtpCryptoSuite::AesCm128HmacSha1_32 => 0x0002u16,
             SrtpCryptoSuite::Aes256CmHmacSha1_80 => 0x0001u16, // Fallback
             SrtpCryptoSuite::Aes256CmHmacSha1_32 => 0x0002u16,
+            SrtpCryptoSuite::AeadAes128Gcm => 0x0007u16, // RFC 7714
+            SrtpCryptoSuite::AeadAes256Gcm => 0x0008u16, // RFC 7714
         };
         // SRTPProtectionProfiles length (2) + profile (2) + MKI length (1)
         use_srtp.extend_from_slice(&2u16.to_be_bytes()); // profiles length

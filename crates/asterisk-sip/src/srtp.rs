@@ -22,7 +22,7 @@
 
 use std::fmt;
 
-/// SRTP crypto suite identifiers (RFC 4568).
+/// SRTP crypto suite identifiers (RFC 4568, RFC 7714).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrtpCryptoSuite {
     /// AES_CM_128_HMAC_SHA1_80 (default, most common)
@@ -33,20 +33,27 @@ pub enum SrtpCryptoSuite {
     Aes256CmHmacSha1_80,
     /// AES_256_CM_HMAC_SHA1_32
     Aes256CmHmacSha1_32,
+    /// AEAD_AES_128_GCM (RFC 7714)
+    AeadAes128Gcm,
+    /// AEAD_AES_256_GCM (RFC 7714)
+    AeadAes256Gcm,
 }
 
 impl SrtpCryptoSuite {
     /// Key length in bytes for this suite.
     pub fn key_length(&self) -> usize {
         match self {
-            Self::AesCm128HmacSha1_80 | Self::AesCm128HmacSha1_32 => 16,
-            Self::Aes256CmHmacSha1_80 | Self::Aes256CmHmacSha1_32 => 32,
+            Self::AesCm128HmacSha1_80 | Self::AesCm128HmacSha1_32 | Self::AeadAes128Gcm => 16,
+            Self::Aes256CmHmacSha1_80 | Self::Aes256CmHmacSha1_32 | Self::AeadAes256Gcm => 32,
         }
     }
 
     /// Salt length in bytes for this suite.
     pub fn salt_length(&self) -> usize {
-        14
+        match self {
+            Self::AeadAes128Gcm | Self::AeadAes256Gcm => 12, // RFC 7714: 12-byte IV
+            _ => 14,
+        }
     }
 
     /// Total keying material length (key + salt).
@@ -59,7 +66,13 @@ impl SrtpCryptoSuite {
         match self {
             Self::AesCm128HmacSha1_80 | Self::Aes256CmHmacSha1_80 => 10,
             Self::AesCm128HmacSha1_32 | Self::Aes256CmHmacSha1_32 => 4,
+            Self::AeadAes128Gcm | Self::AeadAes256Gcm => 16, // GCM 128-bit tag
         }
+    }
+
+    /// Whether this suite uses AEAD (GCM).
+    pub fn is_aead(&self) -> bool {
+        matches!(self, Self::AeadAes128Gcm | Self::AeadAes256Gcm)
     }
 
     /// Parse a crypto suite from its SDP name.
@@ -69,6 +82,8 @@ impl SrtpCryptoSuite {
             "AES_CM_128_HMAC_SHA1_32" => Some(Self::AesCm128HmacSha1_32),
             "AES_256_CM_HMAC_SHA1_80" => Some(Self::Aes256CmHmacSha1_80),
             "AES_256_CM_HMAC_SHA1_32" => Some(Self::Aes256CmHmacSha1_32),
+            "AEAD_AES_128_GCM" => Some(Self::AeadAes128Gcm),
+            "AEAD_AES_256_GCM" => Some(Self::AeadAes256Gcm),
             _ => None,
         }
     }
@@ -80,6 +95,8 @@ impl SrtpCryptoSuite {
             Self::AesCm128HmacSha1_32 => "AES_CM_128_HMAC_SHA1_32",
             Self::Aes256CmHmacSha1_80 => "AES_256_CM_HMAC_SHA1_80",
             Self::Aes256CmHmacSha1_32 => "AES_256_CM_HMAC_SHA1_32",
+            Self::AeadAes128Gcm => "AEAD_AES_128_GCM",
+            Self::AeadAes256Gcm => "AEAD_AES_256_GCM",
         }
     }
 }
@@ -1006,13 +1023,433 @@ mod openssl_backend {
 pub use openssl_backend::OpenSslSrtp;
 
 // ---------------------------------------------------------------------------
+// AEAD AES-GCM backend (RFC 7714)
+// ---------------------------------------------------------------------------
+
+/// SRTP AEAD AES-GCM backend.
+///
+/// Implements AEAD_AES_128_GCM and AEAD_AES_256_GCM per RFC 7714.
+/// Uses the `aes-gcm` crate for authenticated encryption.
+pub struct AeadGcmSrtp {
+    /// Original keying material.
+    key_material: SrtpKeyMaterial,
+    /// Session encryption key.
+    session_key: Vec<u8>,
+    /// Session salt (IV base), 12 bytes.
+    session_salt: Vec<u8>,
+    /// Rollover counter for RTP.
+    roc: u32,
+    /// Last received RTP sequence number.
+    last_seq: u16,
+    /// Whether we have received any RTP packet yet.
+    seq_initialized: bool,
+    /// Replay protection window.
+    replay_window: ReplayWindow,
+    /// SRTCP index counter.
+    srtcp_index: u32,
+    /// SRTCP replay window.
+    srtcp_replay_window: ReplayWindow,
+}
+
+impl AeadGcmSrtp {
+    /// Create a new AEAD GCM SRTP context.
+    pub fn new(key_material: SrtpKeyMaterial) -> Result<Self, SrtpError> {
+        key_material.validate()?;
+        if !key_material.suite.is_aead() {
+            return Err(SrtpError::ProtectFailed(
+                "AeadGcmSrtp requires an AEAD suite".into(),
+            ));
+        }
+
+        Ok(Self {
+            session_key: key_material.key.clone(),
+            session_salt: key_material.salt.clone(),
+            key_material,
+            roc: 0,
+            last_seq: 0,
+            seq_initialized: false,
+            replay_window: ReplayWindow::new(),
+            srtcp_index: 0,
+            srtcp_replay_window: ReplayWindow::new(),
+        })
+    }
+
+    /// Construct the 12-byte IV per RFC 7714 Section 8.1.
+    ///
+    /// IV = (0x00000000 || SSRC || 0x00000000) XOR salt
+    /// Then XOR the packet index into the last 4 bytes.
+    fn construct_rtp_iv(&self, ssrc: u32, packet_index: u64) -> [u8; 12] {
+        let mut iv = [0u8; 12];
+        // Copy salt as base
+        iv.copy_from_slice(&self.session_salt[..12]);
+        // XOR SSRC into bytes 4..8
+        let ssrc_bytes = ssrc.to_be_bytes();
+        iv[4] ^= ssrc_bytes[0];
+        iv[5] ^= ssrc_bytes[1];
+        iv[6] ^= ssrc_bytes[2];
+        iv[7] ^= ssrc_bytes[3];
+        // XOR packet index (48-bit) into bytes 6..12
+        let pi_bytes = packet_index.to_be_bytes(); // 8 bytes
+        iv[6] ^= pi_bytes[2];
+        iv[7] ^= pi_bytes[3];
+        iv[8] ^= pi_bytes[4];
+        iv[9] ^= pi_bytes[5];
+        iv[10] ^= pi_bytes[6];
+        iv[11] ^= pi_bytes[7];
+        iv
+    }
+
+    /// Construct the 12-byte IV for SRTCP.
+    fn construct_rtcp_iv(&self, ssrc: u32, srtcp_index: u32) -> [u8; 12] {
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&self.session_salt[..12]);
+        let ssrc_bytes = ssrc.to_be_bytes();
+        iv[4] ^= ssrc_bytes[0];
+        iv[5] ^= ssrc_bytes[1];
+        iv[6] ^= ssrc_bytes[2];
+        iv[7] ^= ssrc_bytes[3];
+        let idx_bytes = srtcp_index.to_be_bytes();
+        iv[8] ^= idx_bytes[0];
+        iv[9] ^= idx_bytes[1];
+        iv[10] ^= idx_bytes[2];
+        iv[11] ^= idx_bytes[3];
+        iv
+    }
+
+    /// Estimate packet index (same algorithm as PureRustSrtp).
+    fn estimate_packet_index(&self, seq: u16) -> (u64, u32) {
+        if !self.seq_initialized {
+            return (seq as u64, 0);
+        }
+        let v = self.estimate_roc_standard(seq);
+        let index = ((v as u64) << 16) | (seq as u64);
+        (index, v)
+    }
+
+    fn estimate_roc_standard(&self, seq: u16) -> u32 {
+        let diff = seq.wrapping_sub(self.last_seq) as i16;
+        if diff > 0 {
+            if seq < self.last_seq {
+                self.roc.wrapping_add(1)
+            } else {
+                self.roc
+            }
+        } else if diff < 0 {
+            if seq > self.last_seq {
+                self.roc.wrapping_sub(1)
+            } else {
+                self.roc
+            }
+        } else {
+            self.roc
+        }
+    }
+
+    fn update_roc(&mut self, seq: u16, estimated_roc: u32) {
+        if !self.seq_initialized {
+            self.last_seq = seq;
+            self.roc = 0;
+            self.seq_initialized = true;
+            return;
+        }
+        if estimated_roc > self.roc
+            || (estimated_roc == self.roc && seq > self.last_seq)
+        {
+            self.last_seq = seq;
+            self.roc = estimated_roc;
+        }
+    }
+}
+
+impl SrtpCrypto for AeadGcmSrtp {
+    fn backend_name(&self) -> &str {
+        "aead-gcm"
+    }
+
+    fn protect_rtp(&mut self, packet: &mut Vec<u8>) -> Result<(), SrtpError> {
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit, Nonce};
+
+        if packet.len() < RTP_HEADER_MIN {
+            return Err(SrtpError::PacketTooShort {
+                min: RTP_HEADER_MIN,
+                actual: packet.len(),
+            });
+        }
+
+        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        let seq = u16::from_be_bytes([packet[2], packet[3]]);
+        let cc = (packet[0] & 0x0F) as usize;
+        let mut header_len = RTP_HEADER_MIN + cc * 4;
+
+        // Handle extension headers
+        if (packet[0] & 0x10) != 0 && packet.len() >= header_len + 4 {
+            let ext_len = u16::from_be_bytes([
+                packet[header_len + 2],
+                packet[header_len + 3],
+            ]) as usize;
+            header_len = header_len + 4 + ext_len * 4;
+        }
+
+        if header_len > packet.len() {
+            return Err(SrtpError::PacketTooShort {
+                min: header_len,
+                actual: packet.len(),
+            });
+        }
+
+        let (packet_index, estimated_roc) = self.estimate_packet_index(seq);
+        let iv = self.construct_rtp_iv(ssrc, packet_index);
+        let nonce = aes_gcm::Nonce::from_slice(&iv);
+
+        // AAD = RTP header (authenticated but not encrypted)
+        let aad = packet[..header_len].to_vec();
+        // Payload to encrypt
+        let mut payload = packet[header_len..].to_vec();
+
+        // Encrypt and authenticate
+        let tag = match self.key_material.suite {
+            SrtpCryptoSuite::AeadAes128Gcm => {
+                let cipher = Aes128Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("AES-128-GCM key init: {}", e)))?;
+                cipher
+                    .encrypt_in_place_detached(nonce, &aad, &mut payload)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("AES-128-GCM encrypt: {}", e)))?
+            }
+            SrtpCryptoSuite::AeadAes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("AES-256-GCM key init: {}", e)))?;
+                cipher
+                    .encrypt_in_place_detached(nonce, &aad, &mut payload)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("AES-256-GCM encrypt: {}", e)))?
+            }
+            _ => return Err(SrtpError::ProtectFailed("not a GCM suite".into())),
+        };
+
+        // Rebuild packet: header + encrypted payload + 16-byte auth tag
+        packet.truncate(header_len);
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&tag);
+
+        self.update_roc(seq, estimated_roc);
+        Ok(())
+    }
+
+    fn unprotect_rtp(&mut self, packet: &mut Vec<u8>) -> Result<(), SrtpError> {
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit, Tag};
+
+        let tag_len = 16; // GCM tag is always 16 bytes
+        if packet.len() < RTP_HEADER_MIN + tag_len {
+            return Err(SrtpError::PacketTooShort {
+                min: RTP_HEADER_MIN + tag_len,
+                actual: packet.len(),
+            });
+        }
+
+        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        let seq = u16::from_be_bytes([packet[2], packet[3]]);
+        let cc = (packet[0] & 0x0F) as usize;
+        let mut header_len = RTP_HEADER_MIN + cc * 4;
+
+        if (packet[0] & 0x10) != 0 && packet.len() >= header_len + 4 {
+            let ext_len = u16::from_be_bytes([
+                packet[header_len + 2],
+                packet[header_len + 3],
+            ]) as usize;
+            header_len = header_len + 4 + ext_len * 4;
+        }
+
+        let (packet_index, estimated_roc) = self.estimate_packet_index(seq);
+
+        if !self.replay_window.check(packet_index) {
+            return Err(SrtpError::ReplayDetected(packet_index));
+        }
+
+        let iv = self.construct_rtp_iv(ssrc, packet_index);
+        let nonce = aes_gcm::Nonce::from_slice(&iv);
+
+        let aad = packet[..header_len].to_vec();
+
+        // Extract tag from end
+        let tag_start = packet.len() - tag_len;
+        let mut tag_bytes = [0u8; 16];
+        tag_bytes.copy_from_slice(&packet[tag_start..]);
+        let tag = Tag::from_slice(&tag_bytes);
+
+        // Ciphertext (between header and tag)
+        let mut ciphertext = packet[header_len..tag_start].to_vec();
+
+        // Decrypt and verify
+        match self.key_material.suite {
+            SrtpCryptoSuite::AeadAes128Gcm => {
+                let cipher = Aes128Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::UnprotectFailed(format!("AES-128-GCM key init: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag)
+                    .map_err(|_| SrtpError::AuthenticationFailed)?;
+            }
+            SrtpCryptoSuite::AeadAes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::UnprotectFailed(format!("AES-256-GCM key init: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag)
+                    .map_err(|_| SrtpError::AuthenticationFailed)?;
+            }
+            _ => return Err(SrtpError::UnprotectFailed("not a GCM suite".into())),
+        };
+
+        // Rebuild packet: header + decrypted payload
+        packet.truncate(header_len);
+        packet.extend_from_slice(&ciphertext);
+
+        self.replay_window.update(packet_index);
+        self.update_roc(seq, estimated_roc);
+        Ok(())
+    }
+
+    fn protect_rtcp(&mut self, packet: &mut Vec<u8>) -> Result<(), SrtpError> {
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit};
+
+        if packet.len() < RTCP_HEADER_MIN {
+            return Err(SrtpError::PacketTooShort {
+                min: RTCP_HEADER_MIN,
+                actual: packet.len(),
+            });
+        }
+
+        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let srtcp_index = self.srtcp_index;
+        self.srtcp_index = self.srtcp_index.wrapping_add(1) & 0x7FFFFFFF;
+
+        let iv = self.construct_rtcp_iv(ssrc, srtcp_index);
+        let nonce = aes_gcm::Nonce::from_slice(&iv);
+
+        // AAD = RTCP header (first 8 bytes) + E||index
+        let e_index = 0x80000000u32 | srtcp_index;
+        let mut aad = packet[..RTCP_HEADER_MIN].to_vec();
+        aad.extend_from_slice(&e_index.to_be_bytes());
+
+        // Payload to encrypt
+        let mut payload = if packet.len() > RTCP_HEADER_MIN {
+            packet[RTCP_HEADER_MIN..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let tag = match self.key_material.suite {
+            SrtpCryptoSuite::AeadAes128Gcm => {
+                let cipher = Aes128Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("RTCP GCM key: {}", e)))?;
+                cipher
+                    .encrypt_in_place_detached(nonce, &aad, &mut payload)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("RTCP GCM encrypt: {}", e)))?
+            }
+            SrtpCryptoSuite::AeadAes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("RTCP GCM key: {}", e)))?;
+                cipher
+                    .encrypt_in_place_detached(nonce, &aad, &mut payload)
+                    .map_err(|e| SrtpError::ProtectFailed(format!("RTCP GCM encrypt: {}", e)))?
+            }
+            _ => return Err(SrtpError::ProtectFailed("not GCM".into())),
+        };
+
+        // Rebuild: header + encrypted payload + E||index + tag
+        packet.truncate(RTCP_HEADER_MIN);
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&e_index.to_be_bytes());
+        packet.extend_from_slice(&tag);
+
+        Ok(())
+    }
+
+    fn unprotect_rtcp(&mut self, packet: &mut Vec<u8>) -> Result<(), SrtpError> {
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit, Tag};
+
+        let tag_len = 16;
+        let min_len = RTCP_HEADER_MIN + 4 + tag_len; // header + E||index + tag
+        if packet.len() < min_len {
+            return Err(SrtpError::PacketTooShort {
+                min: min_len,
+                actual: packet.len(),
+            });
+        }
+
+        // Extract tag (last 16 bytes)
+        let tag_start = packet.len() - tag_len;
+        let mut tag_bytes = [0u8; 16];
+        tag_bytes.copy_from_slice(&packet[tag_start..]);
+        let tag = Tag::from_slice(&tag_bytes);
+
+        // Extract E||index (4 bytes before tag)
+        let e_index_start = tag_start - 4;
+        let e_index = u32::from_be_bytes([
+            packet[e_index_start],
+            packet[e_index_start + 1],
+            packet[e_index_start + 2],
+            packet[e_index_start + 3],
+        ]);
+        let _is_encrypted = (e_index & 0x80000000) != 0;
+        let srtcp_index = e_index & 0x7FFFFFFF;
+
+        if !self.srtcp_replay_window.check(srtcp_index as u64) {
+            return Err(SrtpError::ReplayDetected(srtcp_index as u64));
+        }
+
+        let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let iv = self.construct_rtcp_iv(ssrc, srtcp_index);
+        let nonce = aes_gcm::Nonce::from_slice(&iv);
+
+        // AAD = header + E||index
+        let mut aad = packet[..RTCP_HEADER_MIN].to_vec();
+        aad.extend_from_slice(&e_index.to_be_bytes());
+
+        // Ciphertext = between header and E||index
+        let mut ciphertext = packet[RTCP_HEADER_MIN..e_index_start].to_vec();
+
+        match self.key_material.suite {
+            SrtpCryptoSuite::AeadAes128Gcm => {
+                let cipher = Aes128Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::UnprotectFailed(format!("RTCP GCM key: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag)
+                    .map_err(|_| SrtpError::AuthenticationFailed)?;
+            }
+            SrtpCryptoSuite::AeadAes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(&self.session_key)
+                    .map_err(|e| SrtpError::UnprotectFailed(format!("RTCP GCM key: {}", e)))?;
+                cipher
+                    .decrypt_in_place_detached(nonce, &aad, &mut ciphertext, tag)
+                    .map_err(|_| SrtpError::AuthenticationFailed)?;
+            }
+            _ => return Err(SrtpError::UnprotectFailed("not GCM".into())),
+        };
+
+        self.srtcp_replay_window.update(srtcp_index as u64);
+
+        // Rebuild: header + decrypted payload
+        packet.truncate(RTCP_HEADER_MIN);
+        packet.extend_from_slice(&ciphertext);
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory: create the appropriate backend
 // ---------------------------------------------------------------------------
 
 /// Create an SRTP crypto instance using the best available backend.
+///
+/// For AEAD suites (AES-GCM), uses the `AeadGcmSrtp` backend directly.
+/// For non-AEAD suites, uses the feature-gated backend (pure-Rust or OpenSSL).
 pub fn create_srtp_crypto(
     key_material: SrtpKeyMaterial,
 ) -> Result<Box<dyn SrtpCrypto>, SrtpError> {
+    // AEAD suites always use the GCM backend.
+    if key_material.suite.is_aead() {
+        return Ok(Box::new(AeadGcmSrtp::new(key_material)?));
+    }
+
     #[cfg(feature = "pure-rust-crypto")]
     {
         return Ok(Box::new(PureRustSrtp::new(key_material)?));
@@ -1894,5 +2331,147 @@ mod tests {
             u.unprotect_rtcp(&mut pkt).unwrap();
             assert_eq!(pkt, orig, "SRTCP roundtrip failed at index {}", i);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AEAD AES-GCM tests (RFC 7714)
+    // -----------------------------------------------------------------------
+
+    fn make_gcm_pair_128(key: &[u8; 16], salt: &[u8; 12]) -> (AeadGcmSrtp, AeadGcmSrtp) {
+        let suite = SrtpCryptoSuite::AeadAes128Gcm;
+        let km_p = SrtpKeyMaterial::new(suite, key.to_vec(), salt.to_vec());
+        let km_u = SrtpKeyMaterial::new(suite, key.to_vec(), salt.to_vec());
+        (AeadGcmSrtp::new(km_p).unwrap(), AeadGcmSrtp::new(km_u).unwrap())
+    }
+
+    fn make_gcm_pair_256(key: &[u8; 32], salt: &[u8; 12]) -> (AeadGcmSrtp, AeadGcmSrtp) {
+        let suite = SrtpCryptoSuite::AeadAes256Gcm;
+        let km_p = SrtpKeyMaterial::new(suite, key.to_vec(), salt.to_vec());
+        let km_u = SrtpKeyMaterial::new(suite, key.to_vec(), salt.to_vec());
+        (AeadGcmSrtp::new(km_p).unwrap(), AeadGcmSrtp::new(km_u).unwrap())
+    }
+
+    #[test]
+    fn test_gcm_128_rtp_roundtrip() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0xAA; 16], &[0xBB; 12]);
+        let mut pkt = build_rtp_packet(1, 160, 0xDEADBEEF, b"Hello GCM World!");
+        let orig = pkt.clone();
+        p.protect_rtp(&mut pkt).unwrap();
+        // Should be header + encrypted payload + 16-byte tag
+        assert_eq!(pkt.len(), orig.len() + 16);
+        // Header should be unchanged
+        assert_eq!(&pkt[..12], &orig[..12]);
+        // Payload should be encrypted
+        assert_ne!(&pkt[12..12 + 16], &orig[12..]);
+        u.unprotect_rtp(&mut pkt).unwrap();
+        assert_eq!(pkt, orig);
+    }
+
+    #[test]
+    fn test_gcm_256_rtp_roundtrip() {
+        let (mut p, mut u) = make_gcm_pair_256(&[0xCC; 32], &[0xDD; 12]);
+        let mut pkt = build_rtp_packet(1, 160, 0x12345678, &[0xAA; 80]);
+        let orig = pkt.clone();
+        p.protect_rtp(&mut pkt).unwrap();
+        u.unprotect_rtp(&mut pkt).unwrap();
+        assert_eq!(pkt, orig);
+    }
+
+    #[test]
+    fn test_gcm_128_tampered_rejected() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0x11; 16], &[0x22; 12]);
+        let mut pkt = build_rtp_packet(1, 160, 0xDEADBEEF, &[0xCC; 20]);
+        p.protect_rtp(&mut pkt).unwrap();
+        // Tamper with encrypted payload
+        pkt[13] ^= 0xFF;
+        assert!(matches!(u.unprotect_rtp(&mut pkt), Err(SrtpError::AuthenticationFailed)));
+    }
+
+    #[test]
+    fn test_gcm_128_rtcp_roundtrip() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0x33; 16], &[0x44; 12]);
+        let mut pkt = vec![
+            0x80, 0xC8, 0x00, 0x06,
+            0xDE, 0xAD, 0xBE, 0xEF,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x05,
+        ];
+        let orig = pkt.clone();
+        p.protect_rtcp(&mut pkt).unwrap();
+        assert!(pkt.len() > orig.len());
+        u.unprotect_rtcp(&mut pkt).unwrap();
+        assert_eq!(pkt, orig);
+    }
+
+    #[test]
+    fn test_gcm_multiple_packets() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0x55; 16], &[0x66; 12]);
+        for seq in 0u16..10 {
+            let mut pkt = build_rtp_packet(seq, seq as u32 * 160, 0xCAFEBABE, &[seq as u8; 20]);
+            let orig = pkt.clone();
+            p.protect_rtp(&mut pkt).unwrap();
+            u.unprotect_rtp(&mut pkt).unwrap();
+            assert_eq!(pkt, orig);
+        }
+    }
+
+    #[test]
+    fn test_gcm_replay_detection() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0x77; 16], &[0x88; 12]);
+        let mut pkt = build_rtp_packet(5, 800, 0xDEADBEEF, &[0x55; 20]);
+        p.protect_rtp(&mut pkt).unwrap();
+        let copy = pkt.clone();
+        u.unprotect_rtp(&mut pkt).unwrap();
+        // Replay should fail
+        let mut replay = copy;
+        assert!(matches!(u.unprotect_rtp(&mut replay), Err(SrtpError::ReplayDetected(_))));
+    }
+
+    #[test]
+    fn test_gcm_suite_properties() {
+        let suite = SrtpCryptoSuite::AeadAes128Gcm;
+        assert_eq!(suite.key_length(), 16);
+        assert_eq!(suite.salt_length(), 12);
+        assert_eq!(suite.auth_tag_length(), 16);
+        assert!(suite.is_aead());
+        assert_eq!(suite.sdp_name(), "AEAD_AES_128_GCM");
+
+        let suite256 = SrtpCryptoSuite::AeadAes256Gcm;
+        assert_eq!(suite256.key_length(), 32);
+        assert_eq!(suite256.salt_length(), 12);
+        assert!(suite256.is_aead());
+    }
+
+    #[test]
+    fn test_gcm_from_sdp_name() {
+        assert_eq!(
+            SrtpCryptoSuite::from_sdp_name("AEAD_AES_128_GCM"),
+            Some(SrtpCryptoSuite::AeadAes128Gcm)
+        );
+        assert_eq!(
+            SrtpCryptoSuite::from_sdp_name("AEAD_AES_256_GCM"),
+            Some(SrtpCryptoSuite::AeadAes256Gcm)
+        );
+    }
+
+    #[test]
+    fn test_gcm_zero_length_payload() {
+        let (mut p, mut u) = make_gcm_pair_128(&[0x01; 16], &[0x02; 12]);
+        let mut pkt = build_rtp_packet(1, 160, 0xDEADBEEF, &[]);
+        let orig = pkt.clone();
+        p.protect_rtp(&mut pkt).unwrap();
+        assert_eq!(pkt.len(), orig.len() + 16); // Just tag
+        u.unprotect_rtp(&mut pkt).unwrap();
+        assert_eq!(pkt, orig);
+    }
+
+    #[test]
+    fn test_gcm_create_via_factory() {
+        let suite = SrtpCryptoSuite::AeadAes128Gcm;
+        let km = SrtpKeyMaterial::new(suite, vec![0xAA; 16], vec![0xBB; 12]);
+        let result = create_srtp_crypto(km);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().backend_name(), "aead-gcm");
     }
 }

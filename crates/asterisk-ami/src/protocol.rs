@@ -223,8 +223,24 @@ impl AmiEvent {
     /// Create a new event with a set of headers in one go.
     ///
     /// Convenience constructor used by channel lifecycle event emitters.
+    /// The category defaults to `SYSTEM | CALL | USER` (0x43) so that the
+    /// event passes through any session whose read permission includes at
+    /// least one of those categories.  Call sites that need a specific
+    /// category should use [`Self::new`] + [`Self::with_header`] instead,
+    /// or the dedicated [`Self::new_with_headers_cat`] constructor.
     pub fn new_with_headers(name: impl Into<String>, headers: &[(&str, &str)]) -> Self {
-        let mut event = Self::new(name, 0);
+        // Default category covers system + call + user so that events like
+        // FullyBooted, Newchannel, and UserEvent all pass the filter.
+        let mut event = Self::new(name, 0x43);
+        for &(k, v) in headers {
+            event.headers.insert(k.to_string(), v.to_string());
+        }
+        event
+    }
+
+    /// Like [`new_with_headers`] but allows specifying an explicit category.
+    pub fn new_with_headers_cat(name: impl Into<String>, category: u32, headers: &[(&str, &str)]) -> Self {
+        let mut event = Self::new(name, category);
         for &(k, v) in headers {
             event.headers.insert(k.to_string(), v.to_string());
         }

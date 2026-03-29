@@ -24,6 +24,12 @@ pub mod lpc10;
 pub mod adpcm;
 pub mod codec2;
 pub mod resample;
+pub mod echo_cancel;
+pub mod noise_suppress;
+pub mod agc;
+pub mod plc;
+pub mod dtmf_detect;
+pub mod tone_gen;
 
 // Feature-gated FFI codec bridges
 pub mod opus_ffi;

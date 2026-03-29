@@ -13,6 +13,28 @@ pub mod substitute;
 use crate::channel::Channel;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, LazyLock};
+
+// ---------------------------------------------------------------------------
+// Global dialplan singleton
+// ---------------------------------------------------------------------------
+
+/// Global dialplan -- set once at startup, read from Originate and other
+/// subsystems that need to spawn `pbx_run`.
+static GLOBAL_DIALPLAN: LazyLock<parking_lot::RwLock<Option<Arc<Dialplan>>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Store the loaded dialplan in the global singleton.
+///
+/// Called once during startup after `extensions.conf` has been parsed.
+pub fn set_global_dialplan(dp: Arc<Dialplan>) {
+    *GLOBAL_DIALPLAN.write() = Some(dp);
+}
+
+/// Retrieve the global dialplan (if set).
+pub fn get_global_dialplan() -> Option<Arc<Dialplan>> {
+    GLOBAL_DIALPLAN.read().clone()
+}
 
 /// Result of dialplan application execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

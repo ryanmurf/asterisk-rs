@@ -1174,6 +1174,9 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     // which supports `same =>`)
     let dialplan = load_dialplan(config_dir);
 
+    // Store in global singleton so AMI Originate can access it
+    asterisk_core::set_global_dialplan(dialplan.clone());
+
     info!("Registering codecs...");
     // TODO: Register built-in codecs (ulaw, alaw, gsm, etc.)
 
@@ -1437,11 +1440,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
         TECH_REGISTRY.count()
     );
 
-    // Emit FullyBooted event
+    // Emit FullyBooted event (SYSTEM category = 0x01)
     asterisk_ami::publish_event(
-        asterisk_ami::AmiEvent::new_with_headers("FullyBooted", &[
-            ("Status", "Fully Booted"),
-        ]),
+        asterisk_ami::AmiEvent::new("FullyBooted", 0x01)
+            .with_header("Status", "Fully Booted"),
     );
 }
 

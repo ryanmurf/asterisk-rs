@@ -329,7 +329,8 @@ fn handle_core_settings(
 /// Handle the Originate action.
 ///
 /// Creates a real channel via the global channel store, sets context/exten/
-/// priority and optional variables, then emits an OriginateResponse event.
+/// priority and optional variables, then spawns `pbx_run` to execute the
+/// dialplan asynchronously. Emits OriginateResponse when pbx_run finishes.
 fn handle_originate(
     action: &AmiAction,
     _session: &mut AmiSession,
@@ -376,33 +377,80 @@ fn handle_originate(
         channel_str, context, exten, priority
     );
 
-    // Create the channel using the global channel store.
-    let chan_arc = asterisk_core::channel_store::alloc_channel(&channel_str);
+    // Get the global dialplan (needed for pbx_run)
+    let dialplan = match asterisk_core::get_global_dialplan() {
+        Some(dp) => dp,
+        None => {
+            warn!("AMI Originate: no dialplan loaded, cannot execute");
+            return AmiResponse::error("Dialplan not loaded");
+        }
+    };
+
+    // Build the channel name and unique_id. We allocate via the global store
+    // (which uses parking_lot::Mutex) so that the channel is visible to
+    // `core show channels`, AMI Status, etc. Then we create a *separate*
+    // tokio::sync::Mutex wrapper for pbx_run since it needs async locking.
+    let chan_name;
+    let chan_uid;
     {
-        let mut chan = chan_arc.lock();
-        chan.context = context;
-        chan.exten = exten;
+        let store_chan = asterisk_core::channel_store::alloc_channel(&channel_str);
+        let mut chan = store_chan.lock();
+        chan.context = context.clone();
+        chan.exten = exten.clone();
         chan.priority = priority;
         if !caller_id.is_empty() {
-            chan.caller.id.number.number = caller_id;
+            chan.caller.id.number.number = caller_id.clone();
             chan.caller.id.number.valid = true;
         }
-        for (k, v) in variables {
-            chan.set_variable(k, v);
+        for (k, v) in &variables {
+            chan.set_variable(k.clone(), v.clone());
         }
+        chan_name = chan.name.clone();
+        chan_uid = chan.unique_id.0.clone();
     }
 
-    // Emit OriginateResponse event
-    {
-        let chan = chan_arc.lock();
+    // Create a fresh Channel for pbx_run with tokio::sync::Mutex.
+    // We copy over the relevant fields from the store channel.
+    let pbx_channel = {
+        let mut ch = asterisk_core::Channel::new(&chan_name);
+        ch.unique_id = asterisk_core::ChannelId(chan_uid.clone());
+        ch.context = context;
+        ch.exten = exten;
+        ch.priority = priority;
+        ch.linkedid = chan_uid.clone();
+        if !caller_id.is_empty() {
+            ch.caller.id.number.number = caller_id;
+            ch.caller.id.number.valid = true;
+        }
+        for (k, v) in variables {
+            ch.set_variable(k, v);
+        }
+        std::sync::Arc::new(tokio::sync::Mutex::new(ch))
+    };
+
+    // Spawn pbx_run on a background task so the dialplan actually executes.
+    let chan_name_for_task = chan_name.clone();
+    let chan_uid_for_task = chan_uid.clone();
+    tokio::spawn(async move {
+        info!("Originate: starting pbx_run for channel {}", chan_name_for_task);
+        let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
+        info!("Originate: pbx_run finished for channel {} result={:?}", chan_name_for_task, result);
+
+        // Emit OriginateResponse event
+        let response_str = match result {
+            asterisk_core::PbxRunResult::Success => "Success",
+            _ => "Failure",
+        };
         crate::event_bus::publish_event(
-            crate::protocol::AmiEvent::new_with_headers("OriginateResponse", &[
-                ("Response", "Success"),
-                ("Channel", &chan.name),
-                ("Uniqueid", &chan.unique_id.0),
-            ]),
+            crate::protocol::AmiEvent::new("OriginateResponse", 0x02) // CALL category
+                .with_header("Response", response_str)
+                .with_header("Channel", &chan_name_for_task)
+                .with_header("Uniqueid", &chan_uid_for_task),
         );
-    }
+
+        // Remove from the global channel store now that the call is done
+        asterisk_core::channel_store::deregister(&chan_uid_for_task);
+    });
 
     AmiResponse::success("Originate successfully queued")
 }

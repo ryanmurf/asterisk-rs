@@ -30,3 +30,4 @@ base64 = { workspace = true }
 crc32fast = "1"
 hmac = { workspace = true }
 aes = { workspace = true }
+aes-gcm = "0.10"

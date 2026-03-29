@@ -53,7 +53,7 @@ impl AppAnswer {
                 "Answer: answering channel '{}' (was in state {:?})",
                 channel.name, channel.state
             );
-            channel.state = ChannelState::Up;
+            channel.answer(); // Uses set_state() which emits the Newstate AMI event
         } else {
             debug!("Answer: channel '{}' already answered", channel.name);
         }

@@ -5,7 +5,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use asterisk_types::{ChannelState, HangupCause};
+use asterisk_types::HangupCause;
 use tracing::{debug, warn};
 
 /// The Hangup() dialplan application.
@@ -56,10 +56,19 @@ impl AppHangup {
             cause as u32
         );
 
+        // Set the hangup cause and request a soft hangup.
+        // The actual hangup (state transition + AMI event) is performed by
+        // pbx_run after it detects the softhangup flag, so we must NOT set
+        // state = Down here -- that would cause pbx_run's final
+        // channel.hangup() call to be a no-op and suppress the Hangup event.
+        //
+        // Return Success so that pbx_run's check_hangup() detects the
+        // softhangup flag and breaks out cleanly (mirroring real Asterisk
+        // behavior where Hangup returns AST_PBX_KEEPALIVE).
         channel.hangup_cause = cause;
-        channel.state = ChannelState::Down;
+        channel.softhangup(asterisk_core::channel::softhangup::AST_SOFTHANGUP_EXPLICIT);
 
-        PbxExecResult::Hangup
+        PbxExecResult::Success
     }
 }
 
