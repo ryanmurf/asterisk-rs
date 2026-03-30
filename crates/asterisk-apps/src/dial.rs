@@ -1197,10 +1197,29 @@ impl AppDial {
             return (PbxExecResult::Failed, DialStatus::ChanUnavail);
         }
 
-        // Initiate calls on all outbound channels via their channel drivers
+        // Register outbound ;1 channels in the channel store so the
+        // answer callback (from Local channel driver) can find and update them.
+        // Then call driver.call() to start the call.
         {
             use asterisk_core::channel::tech_registry::TECH_REGISTRY;
             for leg in &mut legs {
+                // Register ;1 in the channel store. Create a minimal Channel copy.
+                {
+                    let chan = leg.channel.lock().await;
+                    let mut store_ch = Channel::new(&chan.name);
+                    store_ch.unique_id = chan.unique_id.clone();
+                    store_ch.linkedid = chan.linkedid.clone();
+                    store_ch.state = chan.state;
+                    drop(chan);
+                    let store_chan = asterisk_core::channel_store::register_existing_channel(store_ch);
+                    // The store may assign a new unique_id, update our copy
+                    let new_uid = store_chan.lock().unique_id.clone();
+                    let new_linkedid = store_chan.lock().linkedid.clone();
+                    let mut chan = leg.channel.lock().await;
+                    chan.unique_id = new_uid;
+                    chan.linkedid = new_linkedid;
+                }
+
                 let driver = TECH_REGISTRY.find(&leg.destination.technology);
                 let timeout_ms = dial_args.timeout.as_millis() as i32;
 
@@ -1529,9 +1548,19 @@ impl AppDial {
                         all_congestion = false;
                         _all_unavailable = false;
 
-                        // Check the outbound channel's state
+                        // Check the outbound channel's state.
+                        // First check the channel store (for Local channels,
+                        // the ;1 side gets updated by the answer callback).
                         let chan = leg.channel.lock().await;
-                        match chan.state {
+                        let chan_name = chan.name.clone();
+                        let effective_state = {
+                            if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan_name) {
+                                store_chan.lock().state
+                            } else {
+                                chan.state
+                            }
+                        };
+                        match effective_state {
                             ChannelState::Up => {
                                 // This leg was answered
                                 drop(chan);

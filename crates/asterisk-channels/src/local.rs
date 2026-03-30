@@ -44,6 +44,8 @@ pub struct LocalPairState {
     pub hungup: AtomicBool,
     pub optimize_away: AtomicBool,
     pub bridged: AtomicBool,
+    /// Set to true when ;2 side calls Answer(), so ;1 side (Dial app) can detect it.
+    pub answered: AtomicBool,
 }
 
 struct LocalPrivate {
@@ -115,6 +117,7 @@ impl LocalChannelDriver {
             hungup: AtomicBool::new(false),
             optimize_away: AtomicBool::new(!no_optimize),
             bridged: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
         });
 
         let (tx_1_to_2, rx_1_to_2) = mpsc::channel(LOCAL_FRAME_BUFFER);
@@ -277,6 +280,27 @@ impl ChannelDriver for LocalChannelDriver {
                     ch.caller = guard.caller.clone();
                     Arc::new(tokio::sync::Mutex::new(ch))
                 };
+
+                // Register an answer callback: when ;2 answers, set the pair's
+                // `answered` flag and update ;1's state in the channel store.
+                {
+                    let pair_for_cb = Arc::clone(&pair_state);
+                    let chan1_name_for_cb = chan1_name.clone();
+                    let chan2_uid_for_cb = chan2_uid.clone();
+                    asterisk_core::channel::register_answer_callback(Box::new(move |uid| {
+                        // Check if this is our ;2 channel answering
+                        if uid == chan2_uid_for_cb {
+                            pair_for_cb.answered.store(true, Ordering::SeqCst);
+                            // Also update ;1's state in the channel store to Up
+                            if let Some(chan1_arc) = channel_store::find_by_name(&chan1_name_for_cb) {
+                                let mut ch1 = chan1_arc.lock();
+                                if ch1.state != ChannelState::Up && ch1.state != ChannelState::Down {
+                                    ch1.set_state(ChannelState::Up);
+                                }
+                            }
+                        }
+                    }));
+                }
 
                 // Spawn PBX execution on ;2
                 tokio::spawn(async move {
