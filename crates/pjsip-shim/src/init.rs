@@ -102,27 +102,4 @@ pub unsafe extern "C" fn pjsip_endpt_release_pool(
     crate::pool::pj_pool_release(pool);
 }
 
-// ---------------------------------------------------------------------------
-// Logging stubs
-// ---------------------------------------------------------------------------
-
-/// Set log level.  Currently a no-op.
-#[no_mangle]
-pub unsafe extern "C" fn pj_log_set_level(_level: i32) {
-}
-
-/// Get current log level.
-#[no_mangle]
-pub unsafe extern "C" fn pj_log_get_level() -> i32 {
-    3 // INFO
-}
-
-/// Set log decoration.  No-op.
-#[no_mangle]
-pub unsafe extern "C" fn pj_log_set_decor(_decor: u32) {
-}
-
-/// Set log writer callback.  No-op.
-#[no_mangle]
-pub unsafe extern "C" fn pj_log_set_log_func(_func: *const libc::c_void) {
-}
+// Logging functions have been moved to logging.rs

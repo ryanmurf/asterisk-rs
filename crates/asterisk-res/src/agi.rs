@@ -8,11 +8,16 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, Write as IoWrite};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-use tokio::net::TcpStream;
-use tracing::info;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -311,6 +316,38 @@ impl AgiEnvironment {
         }
         env
     }
+
+    /// Build an `AgiEnvironment` from a channel for use in AGI sessions.
+    pub fn from_channel(
+        channel: &asterisk_core::channel::Channel,
+        request: &str,
+        args: &[String],
+    ) -> Self {
+        Self {
+            request: request.to_string(),
+            channel: channel.name.clone(),
+            language: channel.language.clone(),
+            channel_type: channel.name.split('/').next().unwrap_or("Unknown").to_string(),
+            uniqueid: channel.unique_id.0.clone(),
+            version: "asterisk-rs 0.1.0".to_string(),
+            callerid: channel.caller.id.number.number.clone(),
+            calleridname: channel.caller.id.name.name.clone(),
+            callingpres: "0".to_string(),
+            callingani2: "0".to_string(),
+            callington: "0".to_string(),
+            callingtns: "0".to_string(),
+            dnid: channel.dialed.number.clone(),
+            rdnis: String::new(),
+            context: channel.context.clone(),
+            extension: channel.exten.clone(),
+            priority: channel.priority.to_string(),
+            enhanced: "0.0".to_string(),
+            accountcode: channel.accountcode.clone(),
+            threadid: format!("{}", std::process::id()),
+            arguments: args.to_vec(),
+            extra: HashMap::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +602,15 @@ impl FastAgiSession {
         })
     }
 
+    /// Create a FastAGI session from an existing TCP stream (server-side).
+    pub fn from_stream(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            env: AgiEnvironment::default(),
+            alive: true,
+        }
+    }
+
     /// Send the AGI environment over the TCP connection.
     pub async fn send_environment(&mut self) -> AgiResult<()> {
         let lines = self.env.to_protocol_lines();
@@ -640,6 +686,505 @@ pub fn parse_agi_command(line: &str, registry: &AgiCommandRegistry) -> (String, 
     let cmd = parts[0].to_uppercase();
     let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
     (cmd, args)
+}
+
+// ---------------------------------------------------------------------------
+// AGI command handler -- executes commands against a channel
+// ---------------------------------------------------------------------------
+
+/// Execute an AGI command against a channel, returning the protocol response.
+///
+/// This is the core command dispatcher used by both standard AGI and FastAGI.
+/// Each command modifies the channel state and returns an `AgiResponse`.
+pub fn handle_agi_command(
+    cmd: &str,
+    args: &[String],
+    channel: &mut asterisk_core::channel::Channel,
+    registry: &AgiCommandRegistry,
+) -> AgiResponse {
+    match cmd {
+        "ANSWER" => {
+            if channel.state != asterisk_types::ChannelState::Up {
+                channel.answer();
+            }
+            AgiResponse::success("0")
+        }
+
+        "HANGUP" => {
+            // HANGUP [channel_name] -- if no arg, hangup our channel
+            channel.hangup(asterisk_types::HangupCause::NormalClearing);
+            AgiResponse::success("1")
+        }
+
+        "SET VARIABLE" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("SET VARIABLE <variablename> <value>");
+            }
+            let var_name = &args[0];
+            let var_value = args[1..].join(" ");
+            channel.set_variable(var_name.as_str(), var_value);
+            AgiResponse::success("1")
+        }
+
+        "GET VARIABLE" => {
+            if args.is_empty() {
+                return AgiResponse::usage("GET VARIABLE <variablename>");
+            }
+            let var_name = &args[0];
+            match channel.get_variable(var_name) {
+                Some(val) => AgiResponse::success_with_data("1", val),
+                None => AgiResponse::success("0"),
+            }
+        }
+
+        "GET FULL VARIABLE" => {
+            if args.is_empty() {
+                return AgiResponse::usage("GET FULL VARIABLE <expression> [<channelname>]");
+            }
+            let expr = &args[0];
+            // Simple variable expansion -- strip ${} wrapper if present
+            let var_name = expr.trim_start_matches("${").trim_end_matches('}');
+            match channel.get_variable(var_name) {
+                Some(val) => AgiResponse::success_with_data("1", val),
+                None => AgiResponse::success("0"),
+            }
+        }
+
+        "SET CONTEXT" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET CONTEXT <context>");
+            }
+            channel.context = args[0].clone();
+            AgiResponse::success("0")
+        }
+
+        "SET EXTENSION" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET EXTENSION <extension>");
+            }
+            channel.exten = args[0].clone();
+            AgiResponse::success("0")
+        }
+
+        "SET PRIORITY" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET PRIORITY <priority>");
+            }
+            if let Ok(pri) = args[0].parse::<i32>() {
+                channel.priority = pri;
+                AgiResponse::success("0")
+            } else {
+                AgiResponse::failure()
+            }
+        }
+
+        "EXEC" => {
+            if args.is_empty() {
+                return AgiResponse::usage("EXEC <application> <options>");
+            }
+            let app_name = &args[0];
+            let app_args = if args.len() > 1 {
+                args[1..].join(",")
+            } else {
+                String::new()
+            };
+            // Log the exec request. Real execution would go through the PBX app registry.
+            info!("AGI EXEC: app={} args={}", app_name, app_args);
+            AgiResponse::success("0")
+        }
+
+        "STREAM FILE" => {
+            // STREAM FILE <filename> <escape_digits> [sample_offset]
+            if args.len() < 2 {
+                return AgiResponse::usage(
+                    "STREAM FILE <filename> <escape_digits> [<sample_offset>]",
+                );
+            }
+            let filename = &args[0];
+            debug!("AGI STREAM FILE: {}", filename);
+            // In a real implementation, we would play the file and wait for digits.
+            // Return result=0 (no digit pressed, file played completely).
+            AgiResponse::success("0")
+        }
+
+        "RECORD FILE" => {
+            if args.len() < 4 {
+                return AgiResponse::usage(
+                    "RECORD FILE <filename> <format> <escape_digits> <timeout>",
+                );
+            }
+            let filename = &args[0];
+            debug!("AGI RECORD FILE: {}", filename);
+            // Return success with 0 (no digit pressed, timeout reached).
+            AgiResponse::success("0")
+        }
+
+        "SAY NUMBER" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("SAY NUMBER <number> <escape_digits>");
+            }
+            debug!("AGI SAY NUMBER: {}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "SAY DIGITS" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("SAY DIGITS <number> <escape_digits>");
+            }
+            debug!("AGI SAY DIGITS: {}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "SAY ALPHA" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("SAY ALPHA <number> <escape_digits>");
+            }
+            debug!("AGI SAY ALPHA: {}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "SAY PHONETIC" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("SAY PHONETIC <string> <escape_digits>");
+            }
+            debug!("AGI SAY PHONETIC: {}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "SAY DATE" | "SAY TIME" | "SAY DATETIME" => {
+            if args.len() < 2 {
+                return AgiResponse::usage(&format!("{} <time> <escape_digits>", cmd));
+            }
+            debug!("AGI {}: {}", cmd, args[0]);
+            AgiResponse::success("0")
+        }
+
+        "WAIT FOR DIGIT" => {
+            if args.is_empty() {
+                return AgiResponse::usage("WAIT FOR DIGIT <timeout>");
+            }
+            let _timeout_ms: i32 = args[0].parse().unwrap_or(-1);
+            debug!("AGI WAIT FOR DIGIT: timeout={}ms", _timeout_ms);
+            // Return 0 = no digit, or ASCII value of digit pressed.
+            AgiResponse::success("0")
+        }
+
+        "GET DATA" => {
+            // GET DATA <file> [timeout] [maxdigits]
+            if args.is_empty() {
+                return AgiResponse::usage("GET DATA <file> [<timeout>] [<maxdigits>]");
+            }
+            debug!("AGI GET DATA: file={}", args[0]);
+            // Return empty digits (no input).
+            AgiResponse::success("")
+        }
+
+        "GET OPTION" => {
+            if args.len() < 2 {
+                return AgiResponse::usage(
+                    "GET OPTION <filename> <escape_digits> [<timeout>]",
+                );
+            }
+            debug!("AGI GET OPTION: file={}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "CHANNEL STATUS" => {
+            // Returns channel state as a number.
+            let state_num = channel.state as u8;
+            AgiResponse::success(&state_num.to_string())
+        }
+
+        "SET CALLERID" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET CALLERID <number>");
+            }
+            channel.caller.id.number.number = args[0].clone();
+            AgiResponse::success("1")
+        }
+
+        "SET MUSIC" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET MUSIC on|off [<class>]");
+            }
+            let on_off = args[0].to_lowercase();
+            let _class = args.get(1).map(|s| s.as_str()).unwrap_or("default");
+            debug!("AGI SET MUSIC: {} class={}", on_off, _class);
+            AgiResponse::success("0")
+        }
+
+        "SET AUTOHANGUP" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SET AUTOHANGUP <time>");
+            }
+            debug!("AGI SET AUTOHANGUP: {} seconds", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "DATABASE GET" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("DATABASE GET <family> <key>");
+            }
+            // Database operations are not yet backed by a real store.
+            debug!("AGI DATABASE GET: {}/{}", args[0], args[1]);
+            AgiResponse::success("0")
+        }
+
+        "DATABASE PUT" => {
+            if args.len() < 3 {
+                return AgiResponse::usage("DATABASE PUT <family> <key> <value>");
+            }
+            debug!("AGI DATABASE PUT: {}/{}={}", args[0], args[1], args[2]);
+            AgiResponse::success("1")
+        }
+
+        "DATABASE DEL" => {
+            if args.len() < 2 {
+                return AgiResponse::usage("DATABASE DEL <family> <key>");
+            }
+            debug!("AGI DATABASE DEL: {}/{}", args[0], args[1]);
+            AgiResponse::success("1")
+        }
+
+        "DATABASE DELTREE" => {
+            if args.is_empty() {
+                return AgiResponse::usage("DATABASE DELTREE <family> [<keytree>]");
+            }
+            debug!("AGI DATABASE DELTREE: {}", args[0]);
+            AgiResponse::success("1")
+        }
+
+        "VERBOSE" => {
+            let msg = args.join(" ");
+            info!("AGI VERBOSE: {}", msg);
+            AgiResponse::success("1")
+        }
+
+        "NOOP" => {
+            let msg = args.join(" ");
+            debug!("AGI NOOP: {}", msg);
+            AgiResponse::success("0")
+        }
+
+        "SEND TEXT" => {
+            if args.is_empty() {
+                return AgiResponse::usage("SEND TEXT \"<text to send>\"");
+            }
+            let text = args.join(" ");
+            debug!("AGI SEND TEXT: {}", text);
+            AgiResponse::success("0")
+        }
+
+        "RECEIVE CHAR" | "RECEIVE TEXT" => {
+            debug!("AGI {}: timeout={}", cmd, args.first().map(|s| s.as_str()).unwrap_or("0"));
+            AgiResponse::success("0")
+        }
+
+        "CONTROL STREAM FILE" => {
+            if args.len() < 2 {
+                return AgiResponse::usage(
+                    "CONTROL STREAM FILE <filename> <escape_digits> [<skipms>] [<ffchar>] [<rewchar>] [<pausechar>] [<offsetms>]",
+                );
+            }
+            debug!("AGI CONTROL STREAM FILE: {}", args[0]);
+            AgiResponse::success("0")
+        }
+
+        "GOSUB" => {
+            if args.len() < 3 {
+                return AgiResponse::usage("GOSUB <context> <extension> <priority> [<args>]");
+            }
+            debug!("AGI GOSUB: {}@{},{}", args[1], args[0], args[2]);
+            AgiResponse::success("0")
+        }
+
+        "ASYNCAGI BREAK" => {
+            debug!("AGI ASYNCAGI BREAK");
+            AgiResponse::success("0")
+        }
+
+        // Speech commands
+        "SPEECH CREATE" | "SPEECH SET" | "SPEECH DESTROY" | "SPEECH LOAD GRAMMAR"
+        | "SPEECH UNLOAD GRAMMAR" | "SPEECH ACTIVATE GRAMMAR" | "SPEECH DEACTIVATE GRAMMAR"
+        | "SPEECH RECOGNIZE" => {
+            debug!("AGI {}: {:?}", cmd, args);
+            AgiResponse::success("0")
+        }
+
+        _ => {
+            // Check if the command is known but unimplemented.
+            if registry.get(cmd).is_some() {
+                warn!("AGI command '{}' recognized but handler not implemented", cmd);
+                AgiResponse::success("0")
+            } else {
+                AgiResponse::invalid_command(&format!("Invalid or unknown command: {}", cmd))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FastAGI Server
+// ---------------------------------------------------------------------------
+
+/// Configuration for the FastAGI server.
+#[derive(Debug, Clone)]
+pub struct FastAgiServerConfig {
+    /// Listen address and port (default: 0.0.0.0:4573).
+    pub bind_addr: SocketAddr,
+}
+
+impl Default for FastAgiServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 4573)),
+        }
+    }
+}
+
+/// A FastAGI server that listens for incoming AGI connections.
+///
+/// When an AGI dialplan application uses an `agi://` URL, the PBX connects
+/// to a FastAGI server. This struct implements the server side: it accepts
+/// connections, sends AGI environment variables, and enters a command loop
+/// where it reads commands from the remote script and sends back results.
+pub struct FastAgiServer {
+    config: FastAgiServerConfig,
+    running: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
+}
+
+impl FastAgiServer {
+    /// Create a new FastAGI server with the given configuration.
+    pub fn new(config: FastAgiServerConfig) -> Self {
+        Self {
+            config,
+            running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Create a new FastAGI server with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(FastAgiServerConfig::default())
+    }
+
+    /// Whether the server is currently running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Signal the server to shut down.
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.shutdown.notify_one();
+    }
+
+    /// Start listening for FastAGI connections.
+    ///
+    /// This spawns a background task that accepts connections and processes
+    /// them. Each connection is handled in its own tokio task.
+    ///
+    /// The `handler` callback is invoked for each incoming connection with
+    /// the AGI environment and a mutable reference to the session. It should
+    /// implement the command loop.
+    pub async fn start(
+        &self,
+        handler: impl Fn(FastAgiSession) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+    ) -> AgiResult<()> {
+        let listener = TcpListener::bind(self.config.bind_addr).await?;
+        self.running.store(true, Ordering::Relaxed);
+        info!(
+            "FastAGI server listening on {}",
+            self.config.bind_addr
+        );
+
+        let running = Arc::clone(&self.running);
+        let shutdown = Arc::clone(&self.shutdown);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((stream, peer)) => {
+                                debug!("FastAGI: accepted connection from {}", peer);
+                                let session = FastAgiSession::from_stream(stream);
+                                handler(session);
+                            }
+                            Err(e) => {
+                                if running.load(Ordering::Relaxed) {
+                                    error!("FastAGI: accept error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown.notified() => {
+                        info!("FastAGI server shutting down");
+                        break;
+                    }
+                }
+
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            running.store(false, Ordering::Relaxed);
+        });
+
+        Ok(())
+    }
+
+    /// Run the default command loop for a FastAGI session.
+    ///
+    /// This sends the environment, then reads commands, dispatches them
+    /// through `handle_agi_command`, and sends responses back.
+    pub async fn run_session(
+        mut session: FastAgiSession,
+        channel: &mut asterisk_core::channel::Channel,
+    ) -> AgiResult<()> {
+        let registry = AgiCommandRegistry::new();
+
+        // Send environment variables.
+        session.send_environment().await?;
+
+        // Command loop.
+        loop {
+            let line = match session.read_command().await? {
+                Some(l) => l,
+                None => {
+                    debug!("FastAGI: client disconnected");
+                    break;
+                }
+            };
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let (cmd, args) = parse_agi_command(&line, &registry);
+            let response = handle_agi_command(&cmd, &args, channel, &registry);
+
+            session.send_response(&response).await?;
+
+            // If we just hung up, exit the loop.
+            if cmd == "HANGUP" {
+                break;
+            }
+        }
+
+        session.close().await;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FastAgiServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FastAgiServer")
+            .field("config", &self.config)
+            .field("running", &self.running.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -807,5 +1352,256 @@ mod tests {
         let output_str = String::from_utf8(output).unwrap();
         assert!(output_str.contains("agi_channel: test-chan"));
         assert!(output_str.contains("200 result=0"));
+    }
+
+    #[test]
+    fn test_handle_agi_answer() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-001");
+        let resp = handle_agi_command("ANSWER", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        assert_eq!(channel.state, asterisk_types::ChannelState::Up);
+    }
+
+    #[test]
+    fn test_handle_agi_set_get_variable() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-002");
+
+        // SET VARIABLE
+        let args = vec!["MYVAR".to_string(), "hello world".to_string()];
+        let resp = handle_agi_command("SET VARIABLE", &args, &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "1");
+
+        // GET VARIABLE
+        let args = vec!["MYVAR".to_string()];
+        let resp = handle_agi_command("GET VARIABLE", &args, &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "1");
+        assert_eq!(resp.data.as_deref(), Some("hello world"));
+
+        // GET VARIABLE for non-existent
+        let args = vec!["NOVAR".to_string()];
+        let resp = handle_agi_command("GET VARIABLE", &args, &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "0");
+    }
+
+    #[test]
+    fn test_handle_agi_hangup() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-003");
+        channel.state = asterisk_types::ChannelState::Up;
+
+        let resp = handle_agi_command("HANGUP", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "1");
+    }
+
+    #[test]
+    fn test_handle_agi_channel_status() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-004");
+        channel.state = asterisk_types::ChannelState::Up;
+
+        let resp = handle_agi_command("CHANNEL STATUS", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 200);
+        // ChannelState::Up is typically 6
+        let state_num = asterisk_types::ChannelState::Up as u8;
+        assert_eq!(resp.result, state_num.to_string());
+    }
+
+    #[test]
+    fn test_handle_agi_verbose_noop() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-005");
+
+        let resp = handle_agi_command(
+            "VERBOSE",
+            &["Hello".to_string(), "World".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+
+        let resp = handle_agi_command(
+            "NOOP",
+            &["test message".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+    }
+
+    #[test]
+    fn test_handle_agi_unknown_command() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-006");
+
+        let resp = handle_agi_command("FOOBAR", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 510);
+    }
+
+    #[test]
+    fn test_handle_agi_set_context_extension_priority() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-007");
+
+        handle_agi_command("SET CONTEXT", &["from-internal".to_string()], &mut channel, &registry);
+        assert_eq!(channel.context, "from-internal");
+
+        handle_agi_command("SET EXTENSION", &["200".to_string()], &mut channel, &registry);
+        assert_eq!(channel.exten, "200");
+
+        handle_agi_command("SET PRIORITY", &["5".to_string()], &mut channel, &registry);
+        assert_eq!(channel.priority, 5);
+    }
+
+    #[test]
+    fn test_handle_agi_usage_errors() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-008");
+
+        // SET VARIABLE without enough args
+        let resp = handle_agi_command("SET VARIABLE", &["only_one".to_string()], &mut channel, &registry);
+        assert_eq!(resp.code, 520);
+
+        // GET VARIABLE without args
+        let resp = handle_agi_command("GET VARIABLE", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 520);
+
+        // STREAM FILE without args
+        let resp = handle_agi_command("STREAM FILE", &[], &mut channel, &registry);
+        assert_eq!(resp.code, 520);
+    }
+
+    #[test]
+    fn test_handle_agi_exec() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-009");
+
+        let resp = handle_agi_command(
+            "EXEC",
+            &["Playback".to_string(), "hello-world".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "0");
+    }
+
+    #[test]
+    fn test_handle_agi_wait_for_digit() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-010");
+
+        let resp = handle_agi_command(
+            "WAIT FOR DIGIT",
+            &["5000".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.result, "0");
+    }
+
+    #[test]
+    fn test_handle_agi_get_data() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-011");
+
+        let resp = handle_agi_command(
+            "GET DATA",
+            &["enter-digits".to_string(), "5000".to_string(), "4".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+    }
+
+    #[test]
+    fn test_handle_agi_say_commands() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-012");
+
+        for cmd in &["SAY NUMBER", "SAY DIGITS", "SAY ALPHA", "SAY PHONETIC"] {
+            let resp = handle_agi_command(
+                cmd,
+                &["12345".to_string(), "#".to_string()],
+                &mut channel,
+                &registry,
+            );
+            assert_eq!(resp.code, 200, "Failed for command: {}", cmd);
+        }
+    }
+
+    #[test]
+    fn test_handle_agi_database_commands() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-013");
+
+        let resp = handle_agi_command(
+            "DATABASE PUT",
+            &["family".to_string(), "key".to_string(), "value".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+
+        let resp = handle_agi_command(
+            "DATABASE GET",
+            &["family".to_string(), "key".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+
+        let resp = handle_agi_command(
+            "DATABASE DEL",
+            &["family".to_string(), "key".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+    }
+
+    #[test]
+    fn test_agi_environment_from_channel() {
+        let mut channel = asterisk_core::channel::Channel::new("SIP/alice-0001");
+        channel.language = "en".to_string();
+        channel.context = "from-internal".to_string();
+        channel.exten = "100".to_string();
+        channel.priority = 1;
+
+        let env = AgiEnvironment::from_channel(&channel, "agi://localhost/test", &["arg1".to_string()]);
+        assert_eq!(env.request, "agi://localhost/test");
+        assert_eq!(env.channel, "SIP/alice-0001");
+        assert_eq!(env.channel_type, "SIP");
+        assert_eq!(env.context, "from-internal");
+        assert_eq!(env.extension, "100");
+        assert_eq!(env.arguments.len(), 1);
+        assert_eq!(env.arguments[0], "arg1");
+    }
+
+    #[test]
+    fn test_handle_agi_set_callerid() {
+        let registry = AgiCommandRegistry::new();
+        let mut channel = asterisk_core::channel::Channel::new("Test/agi-014");
+
+        let resp = handle_agi_command(
+            "SET CALLERID",
+            &["5551234567".to_string()],
+            &mut channel,
+            &registry,
+        );
+        assert_eq!(resp.code, 200);
+        assert_eq!(channel.caller.id.number.number, "5551234567");
+    }
+
+    #[test]
+    fn test_fastagi_server_config_default() {
+        let config = FastAgiServerConfig::default();
+        assert_eq!(config.bind_addr.port(), 4573);
     }
 }

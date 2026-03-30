@@ -389,6 +389,66 @@ pub fn register_all_apps() {
         |channel, args| Box::pin(AppExecIf::exec(channel, args)),
     )));
 
+    // -----------------------------------------------------------------------
+    // ChanSpy / ExtenSpy - real async adapters
+    // -----------------------------------------------------------------------
+
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ChanSpy",
+        "Listen to a channel, and optionally whisper into it",
+        |channel, args| {
+            Box::pin(async move {
+                let (result, _spy_result) = crate::chanspy::AppChanSpy::exec(channel, args).await;
+                result
+            })
+        },
+    )));
+
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ExtenSpy",
+        "Listen to a channel by extension",
+        |channel, args| {
+            Box::pin(async move {
+                let (result, _spy_result) = crate::chanspy::AppExtenSpy::exec(channel, args).await;
+                result
+            })
+        },
+    )));
+
+    // -----------------------------------------------------------------------
+    // AgentLogin / AgentRequest - real async adapters
+    // -----------------------------------------------------------------------
+
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "AgentLogin",
+        "Log an agent into the agent pool",
+        |channel, args| {
+            Box::pin(crate::agent_pool::AppAgentLogin::exec(channel, args))
+        },
+    )));
+
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "AgentRequest",
+        "Request an agent from the agent pool",
+        |channel, args| {
+            Box::pin(crate::agent_pool::AppAgentRequest::exec(channel, args))
+        },
+    )));
+
+    // -----------------------------------------------------------------------
+    // AGI - real async adapter (dispatches to script/FastAGI/async based on args)
+    // -----------------------------------------------------------------------
+
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "AGI",
+        "Asterisk Gateway Interface - run external AGI script",
+        |channel, args| {
+            Box::pin(async move {
+                crate::agi_app::AppAgi::exec(channel, args).await
+            })
+        },
+    )));
+
     // Register the remaining apps as stubs (these will be wired incrementally)
     register_stub_apps();
 
@@ -440,8 +500,7 @@ fn register_stub_apps() {
     register_stub!("ExecIf", "Conditionally execute a dialplan application");
     register_stub!("MixMonitor", "Record a call and mix the audio");
     register_stub!("StopMixMonitor", "Stop recording a call");
-    register_stub!("ChanSpy", "Listen to a channel");
-    register_stub!("ExtenSpy", "Listen to a channel by extension");
+    // ChanSpy and ExtenSpy are registered as real adapters above
     register_stub!("Page", "Page/intercom system");
     register_stub!("Directory", "Provide directory of voicemail extensions");
     register_stub!("BlindTransfer", "Blind transfer a channel");
@@ -487,8 +546,7 @@ fn register_stub_apps() {
     register_stub!("DAHDIRas", "DAHDI remote access server");
     register_stub!("SMS", "SMS application");
     register_stub!("AlarmReceiver", "Alarm receiver");
-    register_stub!("AgentLogin", "Log in as a call center agent");
-    register_stub!("AgentRequest", "Request an agent");
+    // AgentLogin and AgentRequest are registered as real adapters above
     register_stub!("Festival", "Festival TTS");
     register_stub!("JACK", "JACK audio");
     register_stub!("ICES", "Icecast streaming");

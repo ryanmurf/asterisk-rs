@@ -129,7 +129,10 @@ pub use srtp::SrtpSession;
 pub use stun::StunClient;
 pub use musiconhold::{MohClass, MohManager, MohMode, MohPlayer};
 pub use parking::{ParkingLot, ParkingLotConfig, ParkingManager, ParkedCall};
-pub use agi::{AgiCommandRegistry, AgiEnvironment, AgiMode, AgiResponse, AgiSession, FastAgiSession};
+pub use agi::{
+    AgiCommandRegistry, AgiEnvironment, AgiMode, AgiResponse, AgiSession, FastAgiSession,
+    FastAgiServer, FastAgiServerConfig, handle_agi_command, parse_agi_command,
+};
 pub use audiosocket::{AudioSocketConnection, AudioSocketKind, AudioSocketMessage};
 pub use speech::{Speech, SpeechEngine, SpeechEngineRegistry, SpeechRecognitionResult, SpeechState};
 pub use smdi::{SmdiInterface, SmdiMdMessage, SmdiMdType, SmdiMwiMessage};

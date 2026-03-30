@@ -27,6 +27,15 @@ pub mod sip_parser;
 pub mod sip_message;
 pub mod sockaddr;
 pub mod init;
+pub mod test_framework;
+pub mod list;
+pub mod logging;
+pub mod timer;
+pub mod time;
+pub mod threading;
+pub mod socket;
+pub mod atomic;
+pub mod misc;
 
 // Re-export everything so symbols appear in the shared library.
 // The `#[no_mangle] pub unsafe extern "C"` functions in each module
@@ -796,10 +805,10 @@ mod tests {
     #[test]
     fn test_logging_stubs() {
         unsafe {
-            init::pj_log_set_level(5);
-            assert_eq!(init::pj_log_get_level(), 3);
-            init::pj_log_set_decor(0);
-            init::pj_log_set_log_func(std::ptr::null());
+            logging::pj_log_set_level(5);
+            assert_eq!(logging::pj_log_get_level(), 5);
+            logging::pj_log_set_decor(0);
+            logging::pj_log_set_log_func(None);
         }
     }
 
@@ -839,6 +848,401 @@ mod tests {
             assert_ne!((*cloned_str).name.ptr, (*hdr).name.ptr);
 
             pool::pj_pool_release(p);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // String extension tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_pj_strcat() {
+        unsafe {
+            let mut buf = [0u8; 64];
+            let mut dst = pj_str_t {
+                ptr: buf.as_mut_ptr() as *mut _,
+                slen: 0,
+            };
+            let hello = std::ffi::CString::new("hello").unwrap();
+            let src = string::pj_str(hello.as_ptr() as *mut _);
+            string::pj_strcat(&mut dst, &src);
+            assert_eq!(dst.slen, 5);
+
+            let world = std::ffi::CString::new(" world").unwrap();
+            let src2 = string::pj_str(world.as_ptr() as *mut _);
+            string::pj_strcat(&mut dst, &src2);
+            assert_eq!(dst.slen, 11);
+            assert_eq!(dst.as_str(), "hello world");
+        }
+    }
+
+    #[test]
+    fn test_pj_strncmp() {
+        unsafe {
+            let a_c = std::ffi::CString::new("abc123").unwrap();
+            let b_c = std::ffi::CString::new("abc456").unwrap();
+            let a = string::pj_str(a_c.as_ptr() as *mut _);
+            let b = string::pj_str(b_c.as_ptr() as *mut _);
+            // First 3 chars are equal
+            assert_eq!(string::pj_strncmp(&a, &b, 3), 0);
+            // First 4 differ
+            assert_ne!(string::pj_strncmp(&a, &b, 4), 0);
+        }
+    }
+
+    #[test]
+    fn test_pj_utoa() {
+        unsafe {
+            let mut buf = [0i8; 32];
+            let len = string::pj_utoa(42, buf.as_mut_ptr());
+            assert_eq!(len, 2);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap(),
+                "42"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pj_ansi_strxcpy() {
+        unsafe {
+            let mut buf = [0i8; 10];
+            let src = std::ffi::CString::new("hello").unwrap();
+            let status = string::pj_ansi_strxcpy(buf.as_mut_ptr(), src.as_ptr(), 10);
+            assert_eq!(status, PJ_SUCCESS);
+            assert_eq!(
+                std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap(),
+                "hello"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // List tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_list_operations() {
+        unsafe {
+            use list::*;
+
+            // Create a sentinel
+            let mut sentinel: pj_list_node = std::mem::zeroed();
+            pj_list_init(&mut sentinel);
+            assert_eq!(pj_list_size(&sentinel), 0);
+
+            // Create 3 nodes
+            let mut n1: pj_list_node = std::mem::zeroed();
+            let mut n2: pj_list_node = std::mem::zeroed();
+            let mut n3: pj_list_node = std::mem::zeroed();
+
+            pj_list_insert_after(&mut sentinel, &mut n1);
+            assert_eq!(pj_list_size(&sentinel), 1);
+
+            pj_list_insert_after(&mut n1, &mut n2);
+            assert_eq!(pj_list_size(&sentinel), 2);
+
+            pj_list_insert_before(&mut sentinel, &mut n3);
+            assert_eq!(pj_list_size(&sentinel), 3);
+
+            // Find
+            let found = pj_list_find_node(&mut sentinel, &mut n2);
+            assert_eq!(found, &mut n2 as *mut _);
+
+            // Erase
+            pj_list_erase(&mut n2);
+            assert_eq!(pj_list_size(&sentinel), 2);
+            let not_found = pj_list_find_node(&mut sentinel, &mut n2);
+            assert!(not_found.is_null());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Timer tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_timer_create_destroy() {
+        unsafe {
+            let p = pool::pj_pool_create(
+                std::ptr::null_mut(),
+                b"timer\0".as_ptr() as *const _,
+                4096, 4096, std::ptr::null_mut(),
+            );
+            let mut heap: *mut timer::pj_timer_heap_t = std::ptr::null_mut();
+            let status = timer::pj_timer_heap_create(p, 64, &mut heap);
+            assert_eq!(status, PJ_SUCCESS);
+            assert!(!heap.is_null());
+            assert_eq!(timer::pj_timer_heap_count(heap), 0);
+
+            // Schedule a timer
+            let mut entry: timer::pj_timer_entry = std::mem::zeroed();
+            timer::pj_timer_entry_init(&mut entry, 1, std::ptr::null_mut(), None);
+            let delay = timer::pj_time_val { sec: 999, msec: 0 };
+            let s = timer::pj_timer_heap_schedule(heap, &mut entry, &delay);
+            assert_eq!(s, PJ_SUCCESS);
+            assert_eq!(timer::pj_timer_heap_count(heap), 1);
+
+            // Cancel
+            let cancelled = timer::pj_timer_heap_cancel(heap, &mut entry);
+            assert_eq!(cancelled, 1);
+            assert_eq!(timer::pj_timer_heap_count(heap), 0);
+
+            timer::pj_timer_heap_destroy(heap);
+            pool::pj_pool_release(p);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Time tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_gettimeofday() {
+        unsafe {
+            let mut tv = timer::pj_time_val { sec: 0, msec: 0 };
+            let status = time::pj_gettimeofday(&mut tv);
+            assert_eq!(status, PJ_SUCCESS);
+            assert!(tv.sec > 0); // Should be a reasonable unix timestamp
+        }
+    }
+
+    #[test]
+    fn test_time_val_normalize() {
+        unsafe {
+            let mut tv = timer::pj_time_val { sec: 1, msec: 2500 };
+            time::pj_time_val_normalize(&mut tv);
+            assert_eq!(tv.sec, 3);
+            assert_eq!(tv.msec, 500);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Threading tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_mutex_create_lock_unlock() {
+        unsafe {
+            let mut mutex: *mut threading::pj_mutex_t = std::ptr::null_mut();
+            let status = threading::pj_mutex_create_simple(
+                std::ptr::null_mut(),
+                b"test\0".as_ptr() as *const _,
+                &mut mutex,
+            );
+            assert_eq!(status, PJ_SUCCESS);
+            assert!(!mutex.is_null());
+
+            assert_eq!(threading::pj_mutex_lock(mutex), PJ_SUCCESS);
+            assert_eq!(threading::pj_mutex_unlock(mutex), PJ_SUCCESS);
+            assert_eq!(threading::pj_mutex_destroy(mutex), PJ_SUCCESS);
+        }
+    }
+
+    #[test]
+    fn test_semaphore() {
+        unsafe {
+            let mut sem: *mut threading::pj_sem_t = std::ptr::null_mut();
+            let status = threading::pj_sem_create(
+                std::ptr::null_mut(),
+                b"sem\0".as_ptr() as *const _,
+                1, 10, &mut sem,
+            );
+            assert_eq!(status, PJ_SUCCESS);
+
+            // Should succeed (count=1)
+            assert_eq!(threading::pj_sem_trywait(sem), PJ_SUCCESS);
+            // Should fail now (count=0)
+            assert_ne!(threading::pj_sem_trywait(sem), PJ_SUCCESS);
+            // Post
+            assert_eq!(threading::pj_sem_post(sem), PJ_SUCCESS);
+            // Should succeed again
+            assert_eq!(threading::pj_sem_trywait(sem), PJ_SUCCESS);
+
+            assert_eq!(threading::pj_sem_destroy(sem), PJ_SUCCESS);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Atomic tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_atomic_ops() {
+        unsafe {
+            let mut a: *mut atomic::pj_atomic_t = std::ptr::null_mut();
+            assert_eq!(atomic::pj_atomic_create(std::ptr::null_mut(), 0, &mut a), PJ_SUCCESS);
+            assert_eq!(atomic::pj_atomic_get(a), 0);
+
+            atomic::pj_atomic_inc(a);
+            assert_eq!(atomic::pj_atomic_get(a), 1);
+
+            atomic::pj_atomic_add(a, 5);
+            assert_eq!(atomic::pj_atomic_get(a), 6);
+
+            let val = atomic::pj_atomic_dec_and_get(a);
+            assert_eq!(val, 5);
+
+            atomic::pj_atomic_set(a, 42);
+            assert_eq!(atomic::pj_atomic_value(a), 42);
+
+            assert_eq!(atomic::pj_atomic_destroy(a), PJ_SUCCESS);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Hash table tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_table() {
+        unsafe {
+            let ht = misc::pj_hash_create(std::ptr::null_mut(), 31);
+            assert!(!ht.is_null());
+            assert_eq!(misc::pj_hash_count(ht), 0);
+
+            let key = b"test_key\0";
+            let val = 42usize as *mut libc::c_void;
+            misc::pj_hash_set(
+                std::ptr::null_mut(),
+                ht, key.as_ptr() as *const _, -1, 0, val,
+            );
+            assert_eq!(misc::pj_hash_count(ht), 1);
+
+            let found = misc::pj_hash_get(ht, key.as_ptr() as *const _, -1, std::ptr::null_mut());
+            assert_eq!(found as usize, 42);
+
+            // Remove
+            misc::pj_hash_set(
+                std::ptr::null_mut(),
+                ht, key.as_ptr() as *const _, -1, 0, std::ptr::null_mut(),
+            );
+            assert_eq!(misc::pj_hash_count(ht), 0);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Test framework tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_test_framework() {
+        unsafe {
+            let p = pool::pj_pool_create(
+                std::ptr::null_mut(),
+                b"tf\0".as_ptr() as *const _,
+                4096, 4096, std::ptr::null_mut(),
+            );
+            let suite = test_framework::pj_test_suite_create(p);
+            assert!(!suite.is_null());
+
+            // Create a test case with a function that returns 0 (success)
+            unsafe extern "C" fn my_test(_tc: *mut test_framework::pj_test_case) -> i32 {
+                0 // success
+            }
+
+            let mut tc: test_framework::pj_test_case = std::mem::zeroed();
+            test_framework::pj_test_case_init(
+                &mut tc,
+                b"my_test\0".as_ptr() as *const _,
+                0,
+                Some(my_test),
+            );
+
+            test_framework::pj_test_suite_add_case(suite, &mut tc);
+
+            // Create runner
+            let runner = test_framework::pj_test_create_basic_runner(p);
+            assert!(!runner.is_null());
+
+            // Run
+            test_framework::pj_test_run(runner, suite);
+
+            // Check stat
+            let mut stat = test_framework::pj_test_stat::default();
+            test_framework::pj_test_get_stat(suite, &mut stat);
+            assert_eq!(stat.ntests, 1);
+            assert_eq!(stat.nfailed, 0);
+
+            test_framework::pj_test_destroy_runner(runner);
+            pool::pj_pool_release(p);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // File I/O tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_file_exists() {
+        unsafe {
+            let path = b"/tmp\0".as_ptr() as *const libc::c_char;
+            assert_eq!(misc::pj_file_exists(path), PJ_TRUE);
+
+            let nopath = b"/nonexistent_test_path_xyz\0".as_ptr() as *const libc::c_char;
+            assert_eq!(misc::pj_file_exists(nopath), PJ_FALSE);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Group lock tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_grp_lock() {
+        unsafe {
+            let mut lock: *mut atomic::pj_grp_lock_t = std::ptr::null_mut();
+            let status = atomic::pj_grp_lock_create(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut lock,
+            );
+            assert_eq!(status, PJ_SUCCESS);
+            assert!(!lock.is_null());
+
+            assert_eq!(atomic::pj_grp_lock_acquire(lock), PJ_SUCCESS);
+            assert_eq!(atomic::pj_grp_lock_release(lock), PJ_SUCCESS);
+
+            atomic::pj_grp_lock_add_ref(lock);
+            assert_eq!(atomic::pj_grp_lock_dec_ref(lock), PJ_SUCCESS);
+            // Still alive (ref_count was 2, now 1)
+            assert_eq!(atomic::pj_grp_lock_dec_ref(lock), PJ_SUCCESS);
+            // Now destroyed (ref_count was 1, now 0)
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // I/O Queue tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ioqueue_create_destroy() {
+        unsafe {
+            let mut ioq: *mut misc::pj_ioqueue_t = std::ptr::null_mut();
+            let status = misc::pj_ioqueue_create(
+                std::ptr::null_mut(), 64, &mut ioq,
+            );
+            assert_eq!(status, PJ_SUCCESS);
+            assert!(!ioq.is_null());
+
+            let count = misc::pj_ioqueue_poll(ioq, std::ptr::null());
+            assert_eq!(count, 0);
+
+            assert_eq!(misc::pj_ioqueue_destroy(ioq), PJ_SUCCESS);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Random tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_random() {
+        unsafe {
+            misc::pj_srand(12345);
+            let r1 = misc::pj_rand();
+            let r2 = misc::pj_rand();
+            assert_ne!(r1, r2);
         }
     }
 }
