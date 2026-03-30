@@ -13,7 +13,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info, warn};
 
@@ -1745,13 +1745,34 @@ async fn main() {
     // Print startup banner
     print_banner(args.quiet);
 
-    // Set up shutdown signal handling
+    // Set up shutdown signal handling for both SIGTERM and SIGINT
     let running = Arc::new(AtomicBool::new(true));
     let running_for_signal = running.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Received shutdown signal");
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("failed to register SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down");
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, shutting down");
+            }
+        }
+
         running_for_signal.store(false, Ordering::SeqCst);
+
+        // Safety valve: force exit after 5 seconds if graceful shutdown hangs
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            warn!("Forced exit after shutdown timeout");
+            std::process::exit(0);
+        });
     });
 
     // Create server state and register CLI commands BEFORE starting anything
