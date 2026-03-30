@@ -145,6 +145,19 @@ pub async fn pbx_run(
                 "Executing dialplan priority"
             );
 
+            // Emit Newexten AMI event
+            {
+                let priority_str = priority.to_string();
+                crate::channel::publish_channel_event("Newexten", &[
+                    ("Channel", &channel_name),
+                    ("Context", &context),
+                    ("Extension", &exten),
+                    ("Priority", &priority_str),
+                    ("Application", &app_name),
+                    ("AppData", &app_data),
+                ]);
+            }
+
             // Substitute variables in app data
             let substituted_data = {
                 let chan = channel.lock().await;

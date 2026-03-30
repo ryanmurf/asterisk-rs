@@ -1155,7 +1155,23 @@ impl AppDial {
                 // ast_app_exec_sub(Some(caller), &mut outbound, &loc.to_gosub_args(), true)
             }
 
-            // Publish DialBegin stasis event
+            // Publish DialBegin AMI event
+            {
+                let dest_chan = outbound.lock().await;
+                let dest_name = dest_chan.name.clone();
+                let dest_uid = dest_chan.unique_id.0.clone();
+                drop(dest_chan);
+                asterisk_core::channel::publish_channel_event("Dial", &[
+                    ("SubEvent", "Begin"),
+                    ("Channel", &caller.name),
+                    ("Destination", &dest_name),
+                    ("CallerIDNum", &caller.caller.id.number.number),
+                    ("CallerIDName", &caller.caller.id.name.name),
+                    ("Uniqueid", &caller.unique_id.0),
+                    ("DestUniqueid", &dest_uid),
+                    ("Dialstring", &chan_name),
+                ]);
+            }
             debug!(
                 "Dial: publishing DialBegin event for {} -> {}",
                 caller.name, chan_name
@@ -1388,6 +1404,22 @@ impl AppDial {
                 (PbxExecResult::Hangup, DialStatus::Cancel)
             }
         };
+
+        // Publish Dial SubEvent: End for all legs
+        for leg in &legs {
+            let chan = leg.channel.lock().await;
+            let dest_name = chan.name.clone();
+            let dest_uid = chan.unique_id.0.clone();
+            drop(chan);
+            asterisk_core::channel::publish_channel_event("Dial", &[
+                ("SubEvent", "End"),
+                ("Channel", &caller.name),
+                ("Destination", &dest_name),
+                ("DialStatus", dial_status.as_str()),
+                ("Uniqueid", &caller.unique_id.0),
+                ("DestUniqueid", &dest_uid),
+            ]);
+        }
 
         // Set common channel variables
         caller.set_variable("DIALSTATUS", dial_status.as_str());

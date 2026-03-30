@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::parser::SipMessage;
 use crate::session::SipSession;
@@ -116,7 +116,19 @@ impl SipEventHandler {
             states.insert(call_id.clone(), call_state.clone());
         }
 
-        // 8. Spawn PBX execution on a background task
+        // 8. Spawn PBX execution on a background task.
+        //
+        // The task lifecycle:
+        //   a) Wait for the Answer() dialplan app to fire (answer callback)
+        //      then send SIP 200 OK.
+        //   b) Run pbx_run (which blocks as long as the dialplan keeps
+        //      executing -- Wait(), Echo(), ConfBridge(), etc.).
+        //   c) After pbx_run completes and the channel hangs up, do NOT
+        //      eagerly send BYE.  Instead, wait for the remote to send
+        //      BYE.  The SIP dialog stays alive until the remote tears
+        //      it down or a generous timeout expires.  This is critical
+        //      for SIPp tests that send additional in-dialog requests
+        //      (re-INVITE, MESSAGE, INFO) after 200 OK.
         let dialplan = self.dialplan.clone();
         let ch_for_pbx = channel.clone();
         let ch_name_for_cleanup = channel_name.clone();
@@ -124,8 +136,37 @@ impl SipEventHandler {
         let call_id_for_task = call_id.clone();
         let call_states_ref = self.call_states.clone();
         let callid_map_ref = self.callid_map.clone();
+
+        // Notify that fires when Answer() is called on the channel.
+        let answer_notify = Arc::new(tokio::sync::Notify::new());
+        let answer_notify_for_cb = answer_notify.clone();
+
+        // Notify that fires when channel.hangup() is called.
+        let hangup_notify = Arc::new(tokio::sync::Notify::new());
+        let hangup_notify_for_cb = hangup_notify.clone();
+
+        let unique_id_for_cb = {
+            let ch = channel.lock();
+            ch.unique_id.0.clone()
+        };
+        let unique_id_for_answer_cb = unique_id_for_cb.clone();
+
+        // Register an answer callback -- fires when Answer() sets state to Up.
+        asterisk_core::channel::register_answer_callback(Box::new(move |uid| {
+            if uid == unique_id_for_answer_cb {
+                answer_notify_for_cb.notify_one();
+            }
+        }));
+
+        // Register a hangup callback -- fires when Channel::hangup() is called.
+        asterisk_core::channel::register_hangup_callback(Box::new(move |uid, _cause| {
+            if uid == unique_id_for_cb {
+                hangup_notify_for_cb.notify_one();
+            }
+        }));
+
         tokio::spawn(async move {
-            // Convert from parking_lot::Mutex to tokio::sync::Mutex for pbx_run
+            // Convert from parking_lot::Mutex to tokio::sync::Mutex for pbx_run.
             // pbx_run expects Arc<tokio::sync::Mutex<Channel>>.
             let channel_data = {
                 let guard = ch_for_pbx.lock();
@@ -141,67 +182,92 @@ impl SipEventHandler {
             };
 
             let tokio_channel = Arc::new(tokio::sync::Mutex::new(channel_data));
-            let result = asterisk_core::pbx::exec::pbx_run(tokio_channel, dialplan).await;
-            info!(channel = %ch_name_for_cleanup, "PBX completed with result: {:?}", result);
 
-            // After PBX completes, send BYE to the remote side
-            {
-                let cs = call_state.lock().await;
-                // Build and send BYE (or 200 OK to BYE if remote already sent BYE)
-                // For an inbound call that we answered, we send BYE when hanging up.
-                let mut session = SipSession::new_inbound(
-                    cs.session.invite.as_ref().unwrap_or(&SipMessage::new_request(
-                        crate::parser::SipMethod::Invite,
-                        "sip:placeholder@localhost",
-                    )),
-                    cs.session.local_addr,
-                    cs.remote_addr,
-                ).unwrap_or_else(|| {
-                    SipSession::new_outbound(cs.session.local_addr, cs.remote_addr)
-                });
-                // Copy dialog from stored session
-                session.dialog = cs.session.dialog.clone();
-                session.call_id = cs.session.call_id.clone();
-                session.invite = cs.session.invite.clone();
+            // Spawn pbx_run concurrently -- it will call Answer() which
+            // triggers our answer_notify, at which point we send 200 OK.
+            let dialplan_clone = dialplan.clone();
+            let tokio_channel_clone = tokio_channel.clone();
+            let pbx_handle = tokio::spawn(async move {
+                asterisk_core::pbx::exec::pbx_run(tokio_channel_clone, dialplan_clone).await
+            });
 
-                if let Some(bye) = session.build_bye() {
-                    if let Err(e) = transport.send(&bye, cs.remote_addr).await {
-                        warn!(call_id = %call_id_for_task, "Failed to send BYE: {}", e);
-                    } else {
-                        info!(call_id = %call_id_for_task, "Sent BYE");
+            // Wait for Answer() to be called (or pbx_run to finish without
+            // answering, in which case we never send 200 OK).
+            // Timeout after 30s to avoid leaking.
+            let answered = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                answer_notify.notified(),
+            ).await;
+
+            if answered.is_ok() {
+                // Answer() was called -- send 200 OK now.
+                let still_active = call_states_ref.read().contains_key(&call_id_for_task);
+                if still_active {
+                    let mut cs = call_state.lock().await;
+                    if let Some(ok_response) = cs.session.build_200_ok() {
+                        if let Err(e) = transport.send(&ok_response, cs.remote_addr).await {
+                            warn!(call_id = %call_id_for_task, "Failed to send 200 OK: {}", e);
+                        } else {
+                            info!(call_id = %call_id_for_task, "Sent 200 OK (triggered by Answer app)");
+                            cs.session.state = crate::session::SessionState::Established;
+                        }
                     }
                 }
+            } else {
+                debug!(call_id = %call_id_for_task, "Answer() not called within timeout");
             }
 
-            // Clean up call state
-            call_states_ref.write().remove(&call_id_for_task);
-            callid_map_ref.write().remove(&call_id_for_task);
+            // Wait for pbx_run to finish.
+            let result = pbx_handle.await;
+            match &result {
+                Ok(r) => info!(channel = %ch_name_for_cleanup, "PBX completed with result: {:?}", r),
+                Err(e) => warn!(channel = %ch_name_for_cleanup, "PBX task failed: {}", e),
+            }
 
-            // Clean up from global store
-            let uid = ch_for_pbx.lock().unique_id.0.clone();
-            store::deregister(&uid);
+            // pbx_run calls chan.hangup() at the end, which fires the
+            // hangup callback.  Wait briefly for that signal.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                hangup_notify.notified(),
+            ).await;
+
+            // Do NOT eagerly send BYE.  The SIP dialog stays alive so
+            // that SIPp (or any remote UA) can send additional in-dialog
+            // messages.  The remote will send BYE when it is done, and
+            // handle_bye() will clean up.
+            //
+            // We only clean up after a generous timeout (32s, matching
+            // SIP Timer B / Timer F) to avoid leaking state if the
+            // remote disappears without sending BYE.
+            let call_id_for_cleanup = call_id_for_task.clone();
+            let call_states_cleanup = call_states_ref.clone();
+            let callid_map_cleanup = callid_map_ref.clone();
+            let ch_for_cleanup = ch_for_pbx.clone();
+
+            tokio::spawn(async move {
+                // Wait for remote BYE (handle_bye removes the call state).
+                // Poll periodically instead of blocking with a Notify,
+                // since handle_bye already cleans up the maps directly.
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(32);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if !call_states_cleanup.read().contains_key(&call_id_for_cleanup) {
+                        debug!(call_id = %call_id_for_cleanup, "Call state cleaned up by remote BYE");
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        info!(call_id = %call_id_for_cleanup, "Dialog timeout -- cleaning up stale call state");
+                        call_states_cleanup.write().remove(&call_id_for_cleanup);
+                        callid_map_cleanup.write().remove(&call_id_for_cleanup);
+                        break;
+                    }
+                }
+
+                // Clean up from global store
+                let uid = ch_for_cleanup.lock().unique_id.0.clone();
+                store::deregister(&uid);
+            });
         });
-
-        // 9. Send 200 OK for the INVITE (answer the call)
-        // In a proper implementation this would be triggered by the Answer() app,
-        // but for now we send it eagerly since the dialplan will answer immediately.
-        {
-            let cs = {
-                let states = self.call_states.read();
-                states.get(&call_id).cloned()
-            };
-            if let Some(cs) = cs {
-                let mut state = cs.lock().await;
-                if let Some(ok_response) = state.session.build_200_ok() {
-                    if let Err(e) = self.transport.send(&ok_response, state.remote_addr).await {
-                        warn!(call_id = %call_id, "Failed to send 200 OK: {}", e);
-                    } else {
-                        info!(call_id = %call_id, "Sent 200 OK");
-                        state.session.state = crate::session::SessionState::Established;
-                    }
-                }
-            }
-        }
 
         Some(call_id)
     }

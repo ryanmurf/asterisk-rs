@@ -205,9 +205,9 @@ impl AppWaitDigit {
         //       }
         //   }
 
-        // Stub: simulate timeout
+        // Wait for the full duration (no real DTMF detection yet).
         if !timeout.is_zero() {
-            tokio::time::sleep(timeout.min(Duration::from_millis(100))).await;
+            tokio::time::sleep(timeout).await;
         }
         channel.set_variable("WAITDIGITSTATUS", "");
 
@@ -322,7 +322,7 @@ impl AppWaitUntil {
         //       }
         //   }
 
-        tokio::time::sleep(wait_duration.min(Duration::from_millis(100))).await;
+        tokio::time::sleep(wait_duration).await;
 
         channel.set_variable("WAITUNTILSTATUS", WaitUntilStatus::Ok.as_str());
         PbxExecResult::Success

@@ -63,6 +63,33 @@ fn fire_hangup_callbacks(unique_id: &str, cause: &HangupCause) {
 }
 
 // ---------------------------------------------------------------------------
+// Answer callback registry
+// ---------------------------------------------------------------------------
+
+/// Callback type for answer notifications.
+/// Receives the channel's unique_id. Fired when channel.answer() is called.
+pub type AnswerCallback = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Global registry of answer callbacks.
+static ANSWER_CALLBACKS: LazyLock<parking_lot::Mutex<Vec<AnswerCallback>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Register a callback to be invoked whenever a channel is answered.
+///
+/// The callback receives the channel's unique_id.
+pub fn register_answer_callback(cb: AnswerCallback) {
+    ANSWER_CALLBACKS.lock().push(cb);
+}
+
+/// Invoke all registered answer callbacks.
+fn fire_answer_callbacks(unique_id: &str) {
+    let callbacks = ANSWER_CALLBACKS.lock();
+    for cb in callbacks.iter() {
+        cb(unique_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel event publisher -- decoupled from AMI via a callback
 // ---------------------------------------------------------------------------
 
@@ -96,7 +123,7 @@ pub fn register_channel_event_publisher(publisher: ChannelEventPublisher) {
 /// Publish a channel lifecycle event through the registered publisher.
 ///
 /// If no publisher is registered this is a no-op.
-fn publish_channel_event(name: &str, headers: &[(&str, &str)]) {
+pub fn publish_channel_event(name: &str, headers: &[(&str, &str)]) {
     let guard = CHANNEL_EVENT_PUBLISHER.lock();
     if let Some(ref publisher) = *guard {
         publisher(name, headers);
@@ -279,6 +306,8 @@ impl Channel {
     /// Answer the channel.
     pub fn answer(&mut self) {
         self.set_state(ChannelState::Up);
+        // Fire answer callbacks so the SIP event handler can send 200 OK
+        fire_answer_callbacks(&self.unique_id.0);
     }
 
     /// Hangup the channel with the given cause.

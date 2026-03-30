@@ -271,6 +271,14 @@ pub async fn bridge_create(
 
     info!(bridge_id = %bridge_id, name = %name, tech = technology.name(), "Bridge created and registered");
 
+    // Emit BridgeCreate AMI event
+    crate::channel::publish_channel_event("BridgeCreate", &[
+        ("BridgeUniqueid", &bridge_id),
+        ("BridgeType", "basic"),
+        ("BridgeTechnology", "simple_bridge"),
+        ("BridgeNumChannels", "0"),
+    ]);
+
     // Call technology's start method.
     {
         let mut br = bridge_arc.lock().await;
@@ -334,14 +342,27 @@ pub async fn bridge_join(
 
     let bc_arc = Arc::new(Mutex::new(bc));
 
+    // Get the current channel count for the event
+    let num_channels = {
+        let br = bridge.lock().await;
+        br.channels.len().to_string()
+    };
+
     info!(
         channel = %channel_name,
         bridge_id = %bridge_id,
         "Channel joined bridge"
     );
 
-    // In a full implementation we would publish a Stasis BridgeEnter event here:
-    // stasis_topic.publish(BridgeEnterMessage { bridge_id, channel_id, ... })
+    // Emit BridgeEnter AMI event
+    crate::channel::publish_channel_event("BridgeEnter", &[
+        ("BridgeUniqueid", &bridge_id),
+        ("BridgeType", "basic"),
+        ("BridgeTechnology", "simple_bridge"),
+        ("BridgeNumChannels", &num_channels),
+        ("Channel", &channel_name),
+        ("Uniqueid", &channel_id.0),
+    ]);
 
     Ok(bc_arc)
 }
@@ -383,12 +404,25 @@ pub async fn bridge_leave(
         bc.state = BridgeChannelState::Leaving;
     }
 
+    // Get the bridge_id for the event
+    let bridge_id = {
+        let br = bridge.lock().await;
+        br.unique_id.clone()
+    };
+
     info!(
         channel = %channel_name,
         "Channel left bridge"
     );
 
-    // In a full implementation we would publish a Stasis BridgeLeave event here.
+    // Emit BridgeLeave AMI event
+    crate::channel::publish_channel_event("BridgeLeave", &[
+        ("BridgeUniqueid", &bridge_id),
+        ("BridgeType", "basic"),
+        ("BridgeTechnology", "simple_bridge"),
+        ("Channel", &channel_name),
+        ("Uniqueid", &channel_id.0),
+    ]);
 
     // Check if bridge should dissolve.
     let should_dissolve = {
@@ -461,6 +495,13 @@ pub async fn bridge_dissolve(
 
     // Deregister from global container.
     deregister_bridge(&bridge_id);
+
+    // Emit BridgeDestroy AMI event
+    crate::channel::publish_channel_event("BridgeDestroy", &[
+        ("BridgeUniqueid", &bridge_id),
+        ("BridgeType", "basic"),
+        ("BridgeTechnology", "simple_bridge"),
+    ]);
 
     info!(bridge_id = %bridge_id, "Bridge dissolved and deregistered");
     Ok(())

@@ -20,6 +20,10 @@ use tracing::{debug, error, info, warn};
 /// The version string that matches what the test harness expects.
 const ASTERISK_VERSION: &str = "Asterisk 22.0.0-rs";
 
+/// Global flag indicating whether the daemon has completed its full startup
+/// sequence. Used by `core waitfullybooted` to block until ready.
+static FULLY_BOOTED: AtomicBool = AtomicBool::new(false);
+
 /// Asterisk-RS: An open source telephony toolkit (Rust implementation).
 ///
 /// Command-line flags are compatible with the real Asterisk binary.
@@ -438,7 +442,19 @@ impl CliCommand for CmdCoreWaitFullyBooted {
     fn command(&self) -> &str { "core waitfullybooted" }
     fn description(&self) -> &str { "Wait for Asterisk to be fully booted" }
     fn execute(&self, _args: &[&str], _state: &ServerState) -> Vec<String> {
-        vec!["Asterisk has fully booted.".to_string()]
+        // Synchronous path (used by local -x execution and console).
+        // For the async path (remote -rx via Unix socket), the socket handler
+        // intercepts this command and polls FULLY_BOOTED with async sleep.
+        if FULLY_BOOTED.load(Ordering::SeqCst) {
+            vec!["Asterisk has fully booted.".to_string()]
+        } else {
+            // Block synchronously -- this branch is only hit from the console
+            // or local -x mode before full boot, which is unlikely but safe.
+            while !FULLY_BOOTED.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            vec!["Asterisk has fully booted.".to_string()]
+        }
     }
 }
 
@@ -664,6 +680,11 @@ async fn start_control_socket(
 /// Handle a single control socket connection.
 ///
 /// Reads one line (the command), executes it, sends back the output, then closes.
+///
+/// Special handling for `core waitfullybooted`: instead of dispatching through
+/// the normal (synchronous) CliCommand trait, this handler polls the global
+/// [`FULLY_BOOTED`] flag asynchronously so it can wait without blocking the
+/// Tokio runtime.
 async fn handle_control_connection(
     stream: tokio::net::UnixStream,
     state: Arc<tokio::sync::RwLock<ServerState>>,
@@ -678,7 +699,23 @@ async fn handle_control_connection(
             let cmd = line.trim();
             debug!("Control socket received command: {}", cmd);
 
-            let output = {
+            // Intercept "core waitfullybooted" for async waiting
+            let output = if cmd.eq_ignore_ascii_case("core waitfullybooted") {
+                // Wait up to 30 seconds for full boot
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(30);
+                while !FULLY_BOOTED.load(Ordering::SeqCst) {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if FULLY_BOOTED.load(Ordering::SeqCst) {
+                    "Asterisk has fully booted.".to_string()
+                } else {
+                    "Timeout waiting for Asterisk to fully boot.".to_string()
+                }
+            } else {
                 let s = state.read().await;
                 s.execute_command(cmd)
             };
@@ -1592,6 +1629,9 @@ async fn main() {
         // Run startup sequence
         startup_sequence(&config_dir, &dirs).await;
 
+        // Mark fully booted so local commands see the right state
+        FULLY_BOOTED.store(true, Ordering::SeqCst);
+
         let running = Arc::new(AtomicBool::new(true));
         let mut state = ServerState::new(running, &config_dir, &run_dir);
         state.register_builtins();
@@ -1626,16 +1666,16 @@ async fn main() {
         running_for_signal.store(false, Ordering::SeqCst);
     });
 
-    // Run startup sequence
-    startup_sequence(&config_dir, &dirs).await;
-
-    // Create server state
+    // Create server state and register CLI commands BEFORE starting anything
+    // else so the control socket can dispatch commands immediately.
     let mut state = ServerState::new(running.clone(), &config_dir, &run_dir);
     state.verbose_level.store(args.verbose, Ordering::Relaxed);
     state.debug_level.store(args.debug, Ordering::Relaxed);
     state.register_builtins();
 
-    // Start the Unix control socket (item 1) for -rx support
+    // Start the Unix control socket EARLY -- before the full startup sequence.
+    // This ensures that `asterisk -rx "core waitfullybooted"` can connect and
+    // wait even while SIP, AMI, dialplan etc. are still loading.
     let shared_state = Arc::new(tokio::sync::RwLock::new(state));
     {
         let ss = shared_state.clone();
@@ -1643,6 +1683,14 @@ async fn main() {
             warn!("Failed to start control socket: {} (continuing without -rx support)", e);
         }
     }
+
+    // Run the full startup sequence (config, codecs, SIP, AMI, etc.)
+    startup_sequence(&config_dir, &dirs).await;
+
+    // Signal that the daemon is fully booted.  Any pending
+    // `core waitfullybooted` connections will now unblock.
+    FULLY_BOOTED.store(true, Ordering::SeqCst);
+    info!("Asterisk-RS is fully booted.");
 
     if console {
         // Console mode: interactive CLI via rustyline

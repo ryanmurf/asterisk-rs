@@ -18,7 +18,7 @@ use asterisk_core::channel::{Channel, ChannelDriver};
 use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
 
 const LOCAL_FRAME_BUFFER: usize = 150;
-static PAIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PAIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSide {
@@ -111,8 +111,8 @@ impl LocalChannelDriver {
         let (tx_1_to_2, rx_1_to_2) = mpsc::channel(LOCAL_FRAME_BUFFER);
         let (tx_2_to_1, rx_2_to_1) = mpsc::channel(LOCAL_FRAME_BUFFER);
 
-        let chan_name_1 = format!("Local/{}@{};1", extension, context);
-        let chan_name_2 = format!("Local/{}@{};2", extension, context);
+        let chan_name_1 = format!("Local/{}@{}-{:08x};1", extension, context, pair_id);
+        let chan_name_2 = format!("Local/{}@{}-{:08x};2", extension, context, pair_id);
 
         let chan1 = Channel::new(chan_name_1.clone());
         let priv1 = Arc::new(LocalPrivate {

@@ -83,8 +83,17 @@ impl AppEcho {
         //   - Modem/Null: skip
         //   - DTMF '#': exit
         //
-        // For the stub, we simulate a brief wait.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Without real frame I/O, we block by polling the channel state.
+        // This keeps the dialplan alive so the SIP dialog stays open until
+        // the remote side hangs up (softhangup sets state to Down).
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if channel.state == ChannelState::Down
+                || channel.check_hangup()
+            {
+                break;
+            }
+        }
 
         info!("Echo: echo completed on channel '{}'", channel.name);
         PbxExecResult::Success

@@ -259,8 +259,18 @@ impl AmiEvent {
     }
 
     /// Serialize this event to AMI wire format.
+    ///
+    /// The output always includes a `Privilege:` header immediately after
+    /// the `Event:` line.  Many AMI clients (starpy, pyst2, etc.) require
+    /// this header on every event or they crash/ignore the message.  The
+    /// privilege string is derived from the event's category bitmask.
     pub fn serialize(&self) -> String {
         let mut buf = format!("Event: {}\r\n", self.name);
+
+        // Emit the Privilege header -- required by starpy and other clients.
+        let privilege = category_to_privilege(self.category);
+        buf.push_str(&format!("Privilege: {}\r\n", privilege));
+
         for (key, value) in &self.headers {
             buf.push_str(&format!("{}: {}\r\n", key, value));
         }
@@ -333,6 +343,49 @@ pub fn read_message(buffer: &str) -> Option<(&str, usize)> {
         Some((&buffer[..end], end))
     } else {
         None
+    }
+}
+
+/// Convert an event category bitmask to a comma-separated privilege string.
+///
+/// This mirrors the privilege names that Asterisk's AMI sends in the
+/// `Privilege:` header of every event.  The mapping matches the
+/// `EVENT_FLAG_*` constants from `include/asterisk/manager.h`:
+///
+///   0x01 = system, 0x02 = call, 0x04 = log, 0x08 = verbose,
+///   0x10 = command, 0x20 = agent, 0x40 = user, 0x80 = config,
+///   0x100 = dtmf, 0x200 = reporting, 0x400 = cdr, 0x800 = dialplan,
+///   0x1000 = security.
+fn category_to_privilege(category: u32) -> String {
+    let flags: &[(u32, &str)] = &[
+        (0x01, "system"),
+        (0x02, "call"),
+        (0x04, "log"),
+        (0x08, "verbose"),
+        (0x10, "command"),
+        (0x20, "agent"),
+        (0x40, "user"),
+        (0x80, "config"),
+        (0x100, "dtmf"),
+        (0x200, "reporting"),
+        (0x400, "cdr"),
+        (0x800, "dialplan"),
+        (0x1000, "security"),
+    ];
+
+    let mut parts: Vec<&str> = Vec::new();
+    for &(flag, name) in flags {
+        if category & flag != 0 {
+            parts.push(name);
+        }
+    }
+
+    if parts.is_empty() {
+        "system,all".to_string()
+    } else {
+        let mut s = parts.join(",");
+        s.push_str(",all");
+        s
     }
 }
 
@@ -410,8 +463,24 @@ mod tests {
             .with_header("ChannelState", "6");
         let s = event.serialize();
         assert!(s.starts_with("Event: Newchannel\r\n"));
+        assert!(s.contains("Privilege: system,all\r\n"));
         assert!(s.contains("Channel: SIP/1234-00000001\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_serialize_event_privilege_multi_category() {
+        // Category 0x43 = system(0x01) | call(0x02) | user(0x40)
+        let event = AmiEvent::new("UserEvent", 0x43);
+        let s = event.serialize();
+        assert!(s.contains("Privilege: system,call,user,all\r\n"));
+    }
+
+    #[test]
+    fn test_category_to_privilege_zero() {
+        // Category 0 should give "system,all" as fallback
+        let s = category_to_privilege(0);
+        assert_eq!(s, "system,all");
     }
 
     #[test]
