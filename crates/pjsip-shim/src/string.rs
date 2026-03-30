@@ -50,11 +50,8 @@ pub unsafe extern "C" fn pj_strbuf(s: *const pj_str_t) -> *mut libc::c_char {
 /// Compare pj_str_t against pj_str_t.
 #[no_mangle]
 pub unsafe extern "C" fn pj_strcmp(s1: *const pj_str_t, s2: *const pj_str_t) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let len1 = (*s1).slen as usize;
-    let len2 = (*s2).slen as usize;
+    let len1 = if s1.is_null() { 0usize } else { (*s1).slen.max(0) as usize };
+    let len2 = if s2.is_null() { 0usize } else { (*s2).slen.max(0) as usize };
     let cmp_len = len1.min(len2);
     if cmp_len > 0 {
         let result = libc::memcmp((*s1).ptr as *const _, (*s2).ptr as *const _, cmp_len);
@@ -68,11 +65,8 @@ pub unsafe extern "C" fn pj_strcmp(s1: *const pj_str_t, s2: *const pj_str_t) -> 
 /// Compare pj_str_t against a C string.
 #[no_mangle]
 pub unsafe extern "C" fn pj_strcmp2(s1: *const pj_str_t, s2: *const libc::c_char) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let len1 = (*s1).slen as usize;
-    let s2_len = libc::strlen(s2);
+    let len1 = if s1.is_null() { 0usize } else { (*s1).slen.max(0) as usize };
+    let s2_len = if s2.is_null() { 0usize } else { libc::strlen(s2) };
     let cmp_len = len1.min(s2_len);
     if cmp_len > 0 {
         let result = libc::memcmp((*s1).ptr as *const _, s2 as *const _, cmp_len);
@@ -86,36 +80,39 @@ pub unsafe extern "C" fn pj_strcmp2(s1: *const pj_str_t, s2: *const libc::c_char
 /// Case-insensitive compare of pj_str_t against pj_str_t.
 #[no_mangle]
 pub unsafe extern "C" fn pj_stricmp(s1: *const pj_str_t, s2: *const pj_str_t) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let a = (*s1).as_str();
-    let b = (*s2).as_str();
-    // Compare character by character, case-insensitively
-    for (ca, cb) in a.bytes().zip(b.bytes()) {
-        let diff = ca.to_ascii_lowercase() as i32 - cb.to_ascii_lowercase() as i32;
-        if diff != 0 {
-            return diff;
+    let len1 = if s1.is_null() { 0usize } else { (*s1).slen.max(0) as usize };
+    let len2 = if s2.is_null() { 0usize } else { (*s2).slen.max(0) as usize };
+    let cmp_len = len1.min(len2);
+    if cmp_len > 0 {
+        let a = std::slice::from_raw_parts((*s1).ptr as *const u8, len1);
+        let b = std::slice::from_raw_parts((*s2).ptr as *const u8, len2);
+        for i in 0..cmp_len {
+            let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
+            if diff != 0 {
+                return diff;
+            }
         }
     }
-    (a.len() as i32) - (b.len() as i32)
+    (len1 as i32) - (len2 as i32)
 }
 
 /// Case-insensitive compare of pj_str_t against a C string.
 #[no_mangle]
 pub unsafe extern "C" fn pj_stricmp2(s1: *const pj_str_t, s2: *const libc::c_char) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let a = (*s1).as_str();
-    let b = std::ffi::CStr::from_ptr(s2).to_bytes();
-    for (ca, cb) in a.bytes().zip(b.iter().copied()) {
-        let diff = ca.to_ascii_lowercase() as i32 - cb.to_ascii_lowercase() as i32;
-        if diff != 0 {
-            return diff;
+    let len1 = if s1.is_null() { 0usize } else { (*s1).slen.max(0) as usize };
+    let len2 = if s2.is_null() { 0usize } else { libc::strlen(s2) };
+    let cmp_len = len1.min(len2);
+    if cmp_len > 0 {
+        let a = std::slice::from_raw_parts((*s1).ptr as *const u8, len1);
+        let b = std::slice::from_raw_parts(s2 as *const u8, len2);
+        for i in 0..cmp_len {
+            let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
+            if diff != 0 {
+                return diff;
+            }
         }
     }
-    (a.len() as i32) - (b.len() as i32)
+    (len1 as i32) - (len2 as i32)
 }
 
 // ---------------------------------------------------------------------------
@@ -128,23 +125,24 @@ pub unsafe extern "C" fn pj_strdup(
     pool: *mut pj_pool_t,
     dst: *mut pj_str_t,
     src: *const pj_str_t,
-) {
+) -> *mut pj_str_t {
     if dst.is_null() || src.is_null() {
-        return;
+        return dst;
     }
     let len = (*src).slen as usize;
     if len == 0 || (*src).ptr.is_null() {
         (*dst).ptr = std::ptr::null_mut();
         (*dst).slen = 0;
-        return;
+        return dst;
     }
     let buf = pj_pool_alloc(pool, len) as *mut libc::c_char;
     if buf.is_null() {
-        return;
+        return std::ptr::null_mut();
     }
     libc::memcpy(buf as *mut _, (*src).ptr as *const _, len);
     (*dst).ptr = buf;
     (*dst).slen = len as isize;
+    dst
 }
 
 /// Duplicate a C string into pool memory as a pj_str_t.
@@ -153,23 +151,24 @@ pub unsafe extern "C" fn pj_strdup2(
     pool: *mut pj_pool_t,
     dst: *mut pj_str_t,
     src: *const libc::c_char,
-) {
+) -> *mut pj_str_t {
     if dst.is_null() || src.is_null() {
         if !dst.is_null() {
             (*dst).ptr = std::ptr::null_mut();
             (*dst).slen = 0;
         }
-        return;
+        return dst;
     }
     let len = libc::strlen(src);
     let buf = pj_pool_alloc(pool, len + 1) as *mut libc::c_char;
     if buf.is_null() {
-        return;
+        return std::ptr::null_mut();
     }
     libc::memcpy(buf as *mut _, src as *const _, len);
     *buf.add(len) = 0;
     (*dst).ptr = buf;
     (*dst).slen = len as isize;
+    dst
 }
 
 /// Duplicate a C string into pool memory as a pj_str_t with a trailing null byte.
@@ -178,23 +177,24 @@ pub unsafe extern "C" fn pj_strdup2_with_null(
     pool: *mut pj_pool_t,
     dst: *mut pj_str_t,
     src: *const libc::c_char,
-) {
+) -> *mut pj_str_t {
     if dst.is_null() || src.is_null() {
         if !dst.is_null() {
             (*dst).ptr = std::ptr::null_mut();
             (*dst).slen = 0;
         }
-        return;
+        return dst;
     }
     let len = libc::strlen(src);
     let buf = pj_pool_alloc(pool, len + 1) as *mut libc::c_char;
     if buf.is_null() {
-        return;
+        return std::ptr::null_mut();
     }
     libc::memcpy(buf as *mut _, src as *const _, len);
     *buf.add(len) = 0;
     (*dst).ptr = buf;
     (*dst).slen = len as isize;
+    dst
 }
 
 /// Duplicate a pj_str_t into pool memory with a trailing null byte.
@@ -203,9 +203,9 @@ pub unsafe extern "C" fn pj_strdup_with_null(
     pool: *mut pj_pool_t,
     dst: *mut pj_str_t,
     src: *const pj_str_t,
-) {
+) -> *mut pj_str_t {
     if dst.is_null() || src.is_null() {
-        return;
+        return dst;
     }
     let len = (*src).slen as usize;
     if len == 0 || (*src).ptr.is_null() {
@@ -215,16 +215,17 @@ pub unsafe extern "C" fn pj_strdup_with_null(
         }
         (*dst).ptr = buf;
         (*dst).slen = 0;
-        return;
+        return dst;
     }
     let buf = pj_pool_alloc(pool, len + 1) as *mut libc::c_char;
     if buf.is_null() {
-        return;
+        return std::ptr::null_mut();
     }
     libc::memcpy(buf as *mut _, (*src).ptr as *const _, len);
     *buf.add(len) = 0;
     (*dst).ptr = buf;
     (*dst).slen = len as isize;
+    dst
 }
 
 /// Assign one pj_str_t to another (shallow copy -- shares pointer).
@@ -458,23 +459,16 @@ pub unsafe extern "C" fn pj_strncmp(
     s2: *const pj_str_t,
     len: usize,
 ) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let l1 = ((*s1).slen as usize).min(len);
-    let l2 = ((*s2).slen as usize).min(len);
-    let cmp_len = l1.min(l2).min(len);
+    let l1 = if s1.is_null() { 0usize } else { ((*s1).slen.max(0) as usize).min(len) };
+    let l2 = if s2.is_null() { 0usize } else { ((*s2).slen.max(0) as usize).min(len) };
+    let cmp_len = l1.min(l2);
     if cmp_len > 0 {
         let result = libc::memcmp((*s1).ptr as *const _, (*s2).ptr as *const _, cmp_len);
         if result != 0 {
             return result;
         }
     }
-    if l1.min(len) == l2.min(len) {
-        0
-    } else {
-        (l1 as i32) - (l2 as i32)
-    }
+    (l1 as i32) - (l2 as i32)
 }
 
 /// Compare first `len` bytes of pj_str_t against C string.
@@ -484,11 +478,8 @@ pub unsafe extern "C" fn pj_strncmp2(
     s2: *const libc::c_char,
     len: usize,
 ) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let l1 = ((*s1).slen as usize).min(len);
-    let s2_len = libc::strlen(s2);
+    let l1 = if s1.is_null() { 0usize } else { ((*s1).slen.max(0) as usize).min(len) };
+    let s2_len = if s2.is_null() { 0usize } else { libc::strlen(s2) };
     let l2 = s2_len.min(len);
     let cmp_len = l1.min(l2);
     if cmp_len > 0 {
@@ -497,7 +488,7 @@ pub unsafe extern "C" fn pj_strncmp2(
             return result;
         }
     }
-    if l1 == l2 { 0 } else { (l1 as i32) - (l2 as i32) }
+    (l1 as i32) - (l2 as i32)
 }
 
 /// Case-insensitive compare of first `len` bytes of two pj_str_t.
@@ -507,21 +498,20 @@ pub unsafe extern "C" fn pj_strnicmp(
     s2: *const pj_str_t,
     len: usize,
 ) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let l1 = ((*s1).slen as usize).min(len);
-    let l2 = ((*s2).slen as usize).min(len);
+    let l1 = if s1.is_null() { 0usize } else { ((*s1).slen.max(0) as usize).min(len) };
+    let l2 = if s2.is_null() { 0usize } else { ((*s2).slen.max(0) as usize).min(len) };
     let cmp_len = l1.min(l2);
-    let a = std::slice::from_raw_parts((*s1).ptr as *const u8, l1);
-    let b = std::slice::from_raw_parts((*s2).ptr as *const u8, l2);
-    for i in 0..cmp_len {
-        let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
-        if diff != 0 {
-            return diff;
+    if cmp_len > 0 {
+        let a = std::slice::from_raw_parts((*s1).ptr as *const u8, l1);
+        let b = std::slice::from_raw_parts((*s2).ptr as *const u8, l2);
+        for i in 0..cmp_len {
+            let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
+            if diff != 0 {
+                return diff;
+            }
         }
     }
-    if l1 == l2 { 0 } else { (l1 as i32) - (l2 as i32) }
+    (l1 as i32) - (l2 as i32)
 }
 
 /// Case-insensitive compare of first `len` bytes of pj_str_t against C string.
@@ -531,75 +521,80 @@ pub unsafe extern "C" fn pj_strnicmp2(
     s2: *const libc::c_char,
     len: usize,
 ) -> i32 {
-    if s1.is_null() || s2.is_null() {
-        return if s1.is_null() && s2.is_null() { 0 } else { -1 };
-    }
-    let l1 = ((*s1).slen as usize).min(len);
-    let s2_len = libc::strlen(s2);
+    let l1 = if s1.is_null() { 0usize } else { ((*s1).slen.max(0) as usize).min(len) };
+    let s2_len = if s2.is_null() { 0usize } else { libc::strlen(s2) };
     let l2 = s2_len.min(len);
     let cmp_len = l1.min(l2);
-    let a = std::slice::from_raw_parts((*s1).ptr as *const u8, l1);
-    let b = std::slice::from_raw_parts(s2 as *const u8, l2);
-    for i in 0..cmp_len {
-        let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
-        if diff != 0 {
-            return diff;
+    if cmp_len > 0 {
+        let a = std::slice::from_raw_parts((*s1).ptr as *const u8, l1);
+        let b = std::slice::from_raw_parts(s2 as *const u8, l2);
+        for i in 0..cmp_len {
+            let diff = a[i].to_ascii_lowercase() as i32 - b[i].to_ascii_lowercase() as i32;
+            if diff != 0 {
+                return diff;
+            }
         }
     }
-    if l1 == l2 { 0 } else { (l1 as i32) - (l2 as i32) }
+    (l1 as i32) - (l2 as i32)
 }
 
 // ---------------------------------------------------------------------------
 // Extended conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a pj_str_t to an unsigned long, with end-pointer.
+/// Convert a pj_str_t to an unsigned long, with end-pointer as pj_str_t.
+/// The endptr pj_str_t receives the remaining unconsumed portion of the string.
 #[no_mangle]
 pub unsafe extern "C" fn pj_strtoul2(
     s: *const pj_str_t,
-    endptr: *mut *const libc::c_char,
+    endptr: *mut pj_str_t,
     base: u32,
 ) -> libc::c_ulong {
     if s.is_null() || (*s).ptr.is_null() || (*s).slen <= 0 {
         if !endptr.is_null() {
-            *endptr = if !s.is_null() { (*s).ptr } else { std::ptr::null() };
+            (*endptr).ptr = if !s.is_null() { (*s).ptr } else { std::ptr::null_mut() };
+            (*endptr).slen = 0;
         }
         return 0;
     }
-    let text = (*s).as_str().trim();
+    let ptr = (*s).ptr as *const u8;
+    let slen = (*s).slen as usize;
+
     let base = if base == 0 {
-        if text.starts_with("0x") || text.starts_with("0X") { 16u32 } else { 10u32 }
+        if slen >= 2 && *ptr == b'0' && (*ptr.add(1) == b'x' || *ptr.add(1) == b'X') {
+            16u32
+        } else {
+            10u32
+        }
     } else {
         base
     };
-    let (parse_str, actual_base) = if base == 16 && (text.starts_with("0x") || text.starts_with("0X")) {
-        (&text[2..], 16)
-    } else {
-        (text, base)
-    };
+
+    let mut offset = 0usize;
+    // Skip 0x prefix for hex
+    if base == 16 && slen >= 2 && *ptr == b'0' && (*ptr.add(1) == b'x' || *ptr.add(1) == b'X') {
+        offset = 2;
+    }
 
     let mut result = 0u64;
-    let mut consumed = 0usize;
-    for ch in parse_str.bytes() {
+    while offset < slen {
+        let ch = *ptr.add(offset);
         let digit = match ch {
             b'0'..=b'9' => (ch - b'0') as u64,
-            b'a'..=b'f' if actual_base > 10 => (ch - b'a' + 10) as u64,
-            b'A'..=b'F' if actual_base > 10 => (ch - b'A' + 10) as u64,
+            b'a'..=b'f' if base > 10 => (ch - b'a' + 10) as u64,
+            b'A'..=b'F' if base > 10 => (ch - b'A' + 10) as u64,
             _ => break,
         };
-        if digit >= actual_base as u64 {
+        if digit >= base as u64 {
             break;
         }
-        result = result * actual_base as u64 + digit;
-        consumed += 1;
+        result = result * base as u64 + digit;
+        offset += 1;
     }
 
     if !endptr.is_null() {
-        let offset = text.len() - parse_str.len() + consumed;
-        let ptr_start = (*s).ptr as *const u8;
-        // Skip leading whitespace in original
-        let ws = (*s).as_str().len() - text.len();
-        *endptr = ptr_start.add(ws + offset) as *const libc::c_char;
+        (*endptr).ptr = (*s).ptr.add(offset);
+        (*endptr).slen = (slen - offset) as isize;
     }
 
     result as libc::c_ulong
@@ -642,7 +637,7 @@ pub unsafe extern "C" fn pj_create_random_string(
 // Safe string copy (pj_ansi_strxcpy / pj_ansi_strxcat / pj_ansi_strxcpy2)
 // ---------------------------------------------------------------------------
 
-/// Safe strncpy -- always null-terminates. Returns PJ_SUCCESS or PJ_ETOOMANY.
+/// Safe strncpy -- always null-terminates. Returns length or -PJ_ETOOBIG.
 #[no_mangle]
 pub unsafe extern "C" fn pj_ansi_strxcpy(
     dst: *mut libc::c_char,
@@ -650,28 +645,7 @@ pub unsafe extern "C" fn pj_ansi_strxcpy(
     dst_size: usize,
 ) -> i32 {
     if dst.is_null() || dst_size == 0 {
-        return PJ_EINVAL;
-    }
-    if src.is_null() {
-        *dst = 0;
-        return PJ_SUCCESS;
-    }
-    let src_len = libc::strlen(src);
-    let copy_len = src_len.min(dst_size - 1);
-    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, copy_len);
-    *dst.add(copy_len) = 0;
-    if src_len >= dst_size { PJ_ETOOMANY } else { PJ_SUCCESS }
-}
-
-/// Safe strncpy variant returning pj_str_t-style length.
-#[no_mangle]
-pub unsafe extern "C" fn pj_ansi_strxcpy2(
-    dst: *mut libc::c_char,
-    src: *const libc::c_char,
-    dst_size: usize,
-) -> isize {
-    if dst.is_null() || dst_size == 0 {
-        return -1;
+        return -PJ_ETOOBIG;
     }
     if src.is_null() {
         *dst = 0;
@@ -681,10 +655,61 @@ pub unsafe extern "C" fn pj_ansi_strxcpy2(
     let copy_len = src_len.min(dst_size - 1);
     std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, copy_len);
     *dst.add(copy_len) = 0;
-    if src_len >= dst_size { -(copy_len as isize) } else { copy_len as isize }
+    if src_len >= dst_size { -PJ_ETOOBIG } else { copy_len as i32 }
+}
+
+/// Safe strncpy variant that copies from pj_str_t to a char buffer.
+/// Copies byte-by-byte, stopping at null bytes or end of src.
+/// Returns number of characters copied, or -PJ_ETOOBIG if truncated.
+#[no_mangle]
+pub unsafe extern "C" fn pj_ansi_strxcpy2(
+    dst: *mut libc::c_char,
+    src: *const pj_str_t,
+    dst_size: usize,
+) -> i32 {
+    if dst.is_null() || src.is_null() {
+        return -PJ_EINVAL;
+    }
+    if dst_size == 0 {
+        return -PJ_ETOOBIG;
+    }
+
+    let odst = dst;
+    let mut d = dst;
+    let ssrc_start = (*src).ptr as *const u8;
+    let src_len = (*src).slen.max(0) as usize;
+    let esrc = if ssrc_start.is_null() { ssrc_start } else { ssrc_start.add(src_len) };
+    let mut ssrc = ssrc_start;
+    let mut remaining = dst_size;
+
+    // Copy byte-by-byte, stopping at null bytes, end of src, or dst full
+    while !ssrc.is_null() && ssrc < esrc {
+        remaining -= 1;
+        if remaining == 0 {
+            break;
+        }
+        let ch = *ssrc;
+        *d = ch as libc::c_char;
+        if ch == 0 {
+            break;
+        }
+        d = d.add(1);
+        ssrc = ssrc.add(1);
+    }
+
+    // Null terminate
+    *d = 0;
+
+    // Check if we consumed everything or stopped at a null
+    if ssrc == esrc || (ssrc < esrc && *ssrc == 0) || ssrc.is_null() {
+        d.offset_from(odst) as i32
+    } else {
+        -PJ_ETOOBIG
+    }
 }
 
 /// Safe strncat -- always null-terminates.
+/// Returns total length on success, or -PJ_ETOOBIG if truncated.
 #[no_mangle]
 pub unsafe extern "C" fn pj_ansi_strxcat(
     dst: *mut libc::c_char,
@@ -692,21 +717,24 @@ pub unsafe extern "C" fn pj_ansi_strxcat(
     dst_size: usize,
 ) -> i32 {
     if dst.is_null() || dst_size == 0 {
-        return PJ_EINVAL;
-    }
-    if src.is_null() {
-        return PJ_SUCCESS;
+        return -PJ_ETOOBIG;
     }
     let dst_len = libc::strlen(dst);
+    if src.is_null() || libc::strlen(src) == 0 {
+        if dst_len >= dst_size {
+            return -PJ_ETOOBIG;
+        }
+        return dst_len as i32;
+    }
     if dst_len >= dst_size - 1 {
-        return PJ_ETOOMANY;
+        return -PJ_ETOOBIG;
     }
     let remaining = dst_size - dst_len - 1;
     let src_len = libc::strlen(src);
     let copy_len = src_len.min(remaining);
     std::ptr::copy_nonoverlapping(src as *const u8, dst.add(dst_len) as *mut u8, copy_len);
     *dst.add(dst_len + copy_len) = 0;
-    if src_len > remaining { PJ_ETOOMANY } else { PJ_SUCCESS }
+    if src_len > remaining { -PJ_ETOOBIG } else { (dst_len + copy_len) as i32 }
 }
 
 // ---------------------------------------------------------------------------

@@ -389,38 +389,13 @@ pub unsafe extern "C" fn pj_rand() -> i32 {
 // ============================================================================
 // Exception handling
 // ============================================================================
+//
+// The core push/pop/throw functions are implemented in log_wrapper.c because
+// they require setjmp.h (longjmp), which is C-only.  Only the ID management
+// helpers remain here in Rust.
+// ============================================================================
 
-/// Exception handler stack (simplified with setjmp/longjmp stubs).
-#[repr(C)]
-pub struct pj_exception_state_t {
-    pub prev: *mut pj_exception_state_t,
-    _pad: [u8; 256], // space for jmp_buf
-}
-
-static mut EXCEPTION_STACK: *mut pj_exception_state_t = std::ptr::null_mut();
 static mut EXCEPTION_ID_COUNTER: i32 = 1;
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_throw_exception(id: i32) {
-    // In a real impl this would longjmp. We just log and abort.
-    eprintln!("pj_throw_exception({}): not supported in shim, aborting", id);
-    std::process::abort();
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_push_exception_handler(rec: *mut pj_exception_state_t) {
-    if !rec.is_null() {
-        (*rec).prev = EXCEPTION_STACK;
-        EXCEPTION_STACK = rec;
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_pop_exception_handler(rec: *mut pj_exception_state_t) {
-    if !rec.is_null() && EXCEPTION_STACK == rec {
-        EXCEPTION_STACK = (*rec).prev;
-    }
-}
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_exception_id_alloc(
@@ -450,6 +425,8 @@ pub unsafe extern "C" fn pj_exception_id_name(id: i32) -> *const libc::c_char {
 // FIFO buffer
 // ============================================================================
 
+const FIFOBUF_SZ: usize = std::mem::size_of::<u32>(); // sizeof(unsigned) = 4
+
 #[repr(C)]
 pub struct pj_fifobuf_t {
     pub first: *mut libc::c_char,
@@ -457,6 +434,18 @@ pub struct pj_fifobuf_t {
     pub ubegin: *mut libc::c_char,
     pub uend: *mut libc::c_char,
     pub full: i32,
+}
+
+/// Store a u32 size at a possibly unaligned location.
+unsafe fn fifobuf_put_size(ptr: *mut libc::c_char, size: u32) {
+    libc::memcpy(ptr as *mut _, &size as *const _ as *const _, 4);
+}
+
+/// Read a u32 size from a possibly unaligned location.
+unsafe fn fifobuf_get_size(ptr: *const libc::c_char) -> u32 {
+    let mut size: u32 = 0;
+    libc::memcpy(&mut size as *mut _ as *mut _, ptr as *const _, 4);
+    size
 }
 
 #[no_mangle]
@@ -469,10 +458,10 @@ pub unsafe extern "C" fn pj_fifobuf_init(
         return;
     }
     (*fb).first = buffer as *mut _;
-    (*fb).last = (buffer as *mut u8).add(size as usize) as *mut _;
+    (*fb).last = (buffer as *mut libc::c_char).add(size as usize);
     (*fb).ubegin = (*fb).first;
     (*fb).uend = (*fb).first;
-    (*fb).full = 0;
+    (*fb).full = if (*fb).last == (*fb).first { 1 } else { 0 };
 }
 
 #[no_mangle]
@@ -488,19 +477,51 @@ pub unsafe extern "C" fn pj_fifobuf_alloc(
     fb: *mut pj_fifobuf_t,
     size: u32,
 ) -> *mut libc::c_void {
-    if fb.is_null() || size == 0 {
+    if fb.is_null() {
         return std::ptr::null_mut();
     }
-    // Simplified: allocate from the end
-    let available = (*fb).last.offset_from((*fb).uend) as u32;
-    if available >= size + 4 {
-        let ptr = (*fb).uend;
-        // Store size in first 4 bytes
-        *(ptr as *mut u32) = size;
-        let result = ptr.add(4);
-        (*fb).uend = result.add(size as usize);
-        return result as *mut _;
+    let fifobuf = &mut *fb;
+
+    if fifobuf.full != 0 {
+        return std::ptr::null_mut();
     }
+
+    let sz = FIFOBUF_SZ;
+
+    // Try to allocate from the end part
+    if fifobuf.uend >= fifobuf.ubegin {
+        let available = fifobuf.last.offset_from(fifobuf.uend) as u32;
+        if available >= size + sz as u32 {
+            let ptr = fifobuf.uend;
+            fifobuf.uend = fifobuf.uend.add((size + sz as u32) as usize);
+            if fifobuf.uend == fifobuf.last {
+                fifobuf.uend = fifobuf.first;
+            }
+            if fifobuf.uend == fifobuf.ubegin {
+                fifobuf.full = 1;
+            }
+            fifobuf_put_size(ptr, size + sz as u32);
+            return ptr.add(sz) as *mut _;
+        }
+    }
+
+    // Try to allocate from the beginning (wrapped around)
+    let start = if fifobuf.uend <= fifobuf.ubegin {
+        fifobuf.uend
+    } else {
+        fifobuf.first
+    };
+    let available = fifobuf.ubegin.offset_from(start) as u32;
+    if available >= size + sz as u32 {
+        let ptr = start;
+        fifobuf.uend = start.add((size + sz as u32) as usize);
+        if fifobuf.uend == fifobuf.ubegin {
+            fifobuf.full = 1;
+        }
+        fifobuf_put_size(ptr, size + sz as u32);
+        return ptr.add(sz) as *mut _;
+    }
+
     std::ptr::null_mut()
 }
 
@@ -509,18 +530,7 @@ pub unsafe extern "C" fn pj_fifobuf_unalloc(
     fb: *mut pj_fifobuf_t,
     buf: *mut libc::c_void,
 ) -> pj_status_t {
-    if fb.is_null() || buf.is_null() {
-        return PJ_EINVAL;
-    }
-    let ptr = (buf as *mut u8).sub(4);
-    let size = *(ptr as *const u32);
-    // Only free if this was the last allocation
-    let expected_end = (buf as *mut u8).add(size as usize);
-    if expected_end == (*fb).uend as *mut u8 {
-        (*fb).uend = ptr as *mut _;
-        return PJ_SUCCESS;
-    }
-    PJ_EINVAL
+    pj_fifobuf_free(fb, buf)
 }
 
 #[no_mangle]
@@ -528,7 +538,47 @@ pub unsafe extern "C" fn pj_fifobuf_free(
     fb: *mut pj_fifobuf_t,
     buf: *mut libc::c_void,
 ) -> pj_status_t {
-    pj_fifobuf_unalloc(fb, buf)
+    if fb.is_null() || buf.is_null() {
+        return PJ_EINVAL;
+    }
+    let fifobuf = &mut *fb;
+    let sz = FIFOBUF_SZ;
+
+    let ptr = (buf as *mut libc::c_char).sub(sz);
+    if ptr < fifobuf.first || ptr >= fifobuf.last {
+        return PJ_EINVAL;
+    }
+
+    if ptr != fifobuf.ubegin && ptr != fifobuf.first {
+        return PJ_EINVAL;
+    }
+
+    let end = if fifobuf.uend > fifobuf.ubegin {
+        fifobuf.uend
+    } else {
+        fifobuf.last
+    };
+    let chunk_sz = fifobuf_get_size(ptr) as usize;
+    if ptr.add(chunk_sz) > end {
+        return PJ_EINVAL;
+    }
+
+    fifobuf.ubegin = ptr.add(chunk_sz);
+
+    // Rollover
+    if fifobuf.ubegin == fifobuf.last {
+        fifobuf.ubegin = fifobuf.first;
+    }
+
+    // Reset if empty
+    if fifobuf.ubegin == fifobuf.uend {
+        fifobuf.ubegin = fifobuf.first;
+        fifobuf.uend = fifobuf.first;
+    }
+
+    fifobuf.full = 0;
+
+    PJ_SUCCESS
 }
 
 // ============================================================================
@@ -970,11 +1020,10 @@ pub unsafe extern "C" fn pj_pool_secure_release(ppool: *mut *mut pj_pool_t) {
 #[no_mangle]
 pub unsafe extern "C" fn pj_pool_aligned_alloc(
     pool: *mut pj_pool_t,
+    alignment: usize,
     size: usize,
-    _alignment: usize,
 ) -> *mut libc::c_void {
-    // Our alloc already aligns to 8 bytes
-    crate::pool::pj_pool_alloc(pool, size)
+    crate::pool::pj_pool_aligned_alloc_internal(pool, alignment, size)
 }
 
 // ============================================================================
@@ -990,21 +1039,64 @@ pub unsafe extern "C" fn pj_strerror(
     if buf.is_null() || bufsize == 0 {
         return std::ptr::null_mut();
     }
-    let msg = match status {
-        0 => "Success",
-        70014 => "Invalid value or argument",
-        70015 => "Not enough memory",
-        70018 => "Not found",
-        70027 => "Too many objects",
-        70028 => "End of file",
-        70029 => "Resource busy",
-        70030 => "Invalid operation",
-        _ => "Unknown error",
+    // PJ_ERRNO_START_SYS = PJ_ERRNO_START(20000) + PJ_ERRNO_SPACE_SIZE(50000) * 2 = 120000
+    const PJ_ERRNO_START_SYS: pj_status_t = 120000;
+
+    let msg: Option<&str> = match status {
+        0 => Some("Success"),
+        70001 => Some("Unknown error (PJ_EUNKNOWN)"),
+        70002 => Some("Pending operation (PJ_EPENDING)"),
+        70003 => Some("Too many connections (PJ_ETOOMANYCONN)"),
+        70004 => Some("Invalid value or argument (PJ_EINVAL)"),
+        70005 => Some("Name too long (PJ_ENAMETOOLONG)"),
+        70006 => Some("Not found (PJ_ENOTFOUND)"),
+        70007 => Some("Not enough memory (PJ_ENOMEM)"),
+        70008 => Some("Bug detected! (PJ_EBUG)"),
+        70009 => Some("Operation timed out (PJ_ETIMEDOUT)"),
+        70010 => Some("Too many objects of the specified type (PJ_ETOOMANY)"),
+        70011 => Some("Object is busy (PJ_EBUSY)"),
+        70012 => Some("Option/operation is not supported (PJ_ENOTSUP)"),
+        70013 => Some("Invalid operation (PJ_EINVALIDOP)"),
+        70014 => Some("Operation is cancelled (PJ_ECANCELLED)"),
+        70015 => Some("Object already exists (PJ_EEXISTS)"),
+        70016 => Some("End of file (PJ_EEOF)"),
+        70017 => Some("Size is too big (PJ_ETOOBIG)"),
+        70018 => Some("Error in gethostbyname() (PJ_ERESOLVE)"),
+        70019 => Some("Size is too short (PJ_ETOOSMALL)"),
+        70020 => Some("Ignored (PJ_EIGNORED)"),
+        70021 => Some("IPv6 is not supported (PJ_EIPV6NOTSUP)"),
+        70022 => Some("Unsupported address family (PJ_EAFNOTSUP)"),
+        70023 => Some("Object no longer exists (PJ_EGONE)"),
+        70024 => Some("Socket is stopped (PJ_ESOCKETSTOP)"),
+        70025 => Some("Try again (PJ_ETRYAGAIN)"),
+        _ => None,
     };
-    let bytes = msg.as_bytes();
-    let copy_len = bytes.len().min(bufsize - 1);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy_len);
-    *buf.add(copy_len) = 0;
+
+    if let Some(m) = msg {
+        let bytes = m.as_bytes();
+        let copy_len = bytes.len().min(bufsize - 1);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy_len);
+        *buf.add(copy_len) = 0;
+    } else if status >= PJ_ERRNO_START_SYS {
+        // OS-mapped error: recover the native errno and use strerror
+        let os_err = status - PJ_ERRNO_START_SYS;
+        let c_msg = libc::strerror(os_err);
+        if !c_msg.is_null() {
+            let len = libc::strlen(c_msg).min(bufsize - 1);
+            std::ptr::copy_nonoverlapping(c_msg, buf, len);
+            *buf.add(len) = 0;
+        } else {
+            let fallback = b"Unknown OS error\0";
+            let copy_len = (fallback.len() - 1).min(bufsize - 1);
+            std::ptr::copy_nonoverlapping(fallback.as_ptr(), buf as *mut u8, copy_len);
+            *buf.add(copy_len) = 0;
+        }
+    } else {
+        let fallback = b"Unknown error\0";
+        let copy_len = (fallback.len() - 1).min(bufsize - 1);
+        std::ptr::copy_nonoverlapping(fallback.as_ptr(), buf as *mut u8, copy_len);
+        *buf.add(copy_len) = 0;
+    }
 
     // Return a static pj_str_t pointing to the buffer
     // (The caller typically ignores the return value)
@@ -1013,7 +1105,7 @@ pub unsafe extern "C" fn pj_strerror(
         slen: 0,
     };
     RET_STR.ptr = buf;
-    RET_STR.slen = copy_len as isize;
+    RET_STR.slen = libc::strlen(buf) as isize;
     std::ptr::addr_of_mut!(RET_STR)
 }
 
@@ -1438,7 +1530,8 @@ pub unsafe extern "C" fn pj_sockaddr_set_len(_addr: *mut pj_sockaddr, _len: i32)
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_dump_config() {
-    eprintln!("pjlib config: Rust shim");
+    eprintln!("pjlib-rs 0.1.0 (Rust implementation)");
+    eprintln!("  Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
 }
 
 // ============================================================================
@@ -1446,26 +1539,43 @@ pub unsafe extern "C" fn pj_dump_config() {
 // ============================================================================
 
 #[no_mangle]
-pub unsafe extern "C" fn pj_fifobuf_available_size(fb: *const pj_fifobuf_t) -> u32 {
+pub unsafe extern "C" fn pj_fifobuf_available_size(fb: *mut pj_fifobuf_t) -> u32 {
     if fb.is_null() {
         return 0;
     }
-    let fb = &*fb;
-    if fb.full != 0 {
+    let fifobuf = &*fb;
+    let sz = FIFOBUF_SZ as u32;
+
+    if fifobuf.full != 0 {
         return 0;
     }
-    // Simplified: available = total - used
-    let total = fb.last.offset_from(fb.first) as u32;
-    let used = fb.uend.offset_from(fb.ubegin) as u32;
-    if used > total { 0 } else { total - used }
+
+    if fifobuf.uend >= fifobuf.ubegin {
+        let s1 = fifobuf.last.offset_from(fifobuf.uend) as u32;
+        let s2 = fifobuf.ubegin.offset_from(fifobuf.first) as u32;
+        let s = if s1 <= sz {
+            s2
+        } else if s2 <= sz {
+            s1
+        } else if s1 < s2 {
+            s2
+        } else {
+            s1
+        };
+        if s >= sz { s - sz } else { 0 }
+    } else {
+        let s = fifobuf.ubegin.offset_from(fifobuf.uend) as u32;
+        if s >= sz { s - sz } else { 0 }
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pj_fifobuf_capacity(fb: *const pj_fifobuf_t) -> u32 {
+pub unsafe extern "C" fn pj_fifobuf_capacity(fb: *mut pj_fifobuf_t) -> u32 {
     if fb.is_null() {
         return 0;
     }
-    (*fb).last.offset_from((*fb).first) as u32
+    let cap = (*fb).last.offset_from((*fb).first) as u32;
+    if cap > 0 { cap - FIFOBUF_SZ as u32 } else { 0 }
 }
 
 // ============================================================================
@@ -1474,56 +1584,34 @@ pub unsafe extern "C" fn pj_fifobuf_capacity(fb: *const pj_fifobuf_t) -> u32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_pool_aligned_create(
-    factory: *mut libc::c_void,
+    _factory: *mut libc::c_void,
     name: *const libc::c_char,
     initial_size: usize,
     increment_size: usize,
+    alignment: usize,
     callback: *mut libc::c_void,
-    _alignment: usize,
 ) -> *mut pj_pool_t {
-    crate::pool::pj_pool_create(factory, name, initial_size, increment_size, callback)
+    crate::pool::pj_pool_create_internal(name, initial_size, increment_size, alignment, callback)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_pool_create_on_buf(
-    _name: *const libc::c_char,
-    buf: *mut libc::c_void,
+    name: *const libc::c_char,
+    _buf: *mut libc::c_void,
     size: usize,
 ) -> *mut pj_pool_t {
-    // We can't truly create a pool on an existing buffer with our allocator.
-    // Just create a regular pool and ignore the buffer.
-    let _ = buf;
-    let _ = size;
-    crate::pool::pj_pool_create(
-        std::ptr::null_mut(),
-        _name,
+    // We can't truly create a pool on the caller's buffer with our allocator.
+    // Create a regular pool with the given size but no increment (non-expandable).
+    crate::pool::pj_pool_create_internal(
+        name,
         size,
-        256,
+        0, // no increment -- pool_buf cannot grow
+        crate::pool::PJ_POOL_ALIGNMENT,
         std::ptr::null_mut(),
     )
 }
 
-// ============================================================================
-// Exception handling -- underscore-suffixed variants
-// ============================================================================
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_throw_exception_(id: i32) {
-    pj_throw_exception(id);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_push_exception_handler_(rec: *mut pj_exception_state_t) {
-    pj_push_exception_handler(rec);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_pop_exception_handler_(_rec: *mut pj_exception_state_t) {
-    // Pop the top of the exception stack regardless of which record is passed
-    if !EXCEPTION_STACK.is_null() {
-        EXCEPTION_STACK = (*EXCEPTION_STACK).prev;
-    }
-}
+// (underscore-suffixed exception variants are now in log_wrapper.c)
 
 // ============================================================================
 // Red-black tree
@@ -1987,15 +2075,16 @@ pub unsafe extern "C" fn pj_atomic_slist_destroy(slist: *mut pj_atomic_slist_t) 
 pub unsafe extern "C" fn pj_atomic_slist_push(
     slist: *mut pj_atomic_slist_t,
     node: *mut pj_atomic_slist_node_t,
-) {
+) -> pj_status_t {
     if slist.is_null() || node.is_null() {
-        return;
+        return PJ_EINVAL;
     }
     let inner = &mut *(slist as *mut AtomicSlistInner);
     let _guard = inner.lock.lock();
     (*node).next = inner.head;
     inner.head = node;
     inner.count += 1;
+    PJ_SUCCESS
 }
 
 #[no_mangle]

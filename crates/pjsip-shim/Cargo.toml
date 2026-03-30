@@ -13,3 +13,6 @@ asterisk-types = { path = "../asterisk-types" }
 asterisk-codecs = { path = "../asterisk-codecs" }
 parking_lot = { workspace = true }
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"

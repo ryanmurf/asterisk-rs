@@ -15,6 +15,7 @@ pub const PJ_SUCCESS: pj_status_t = 0;
 pub const PJ_EINVAL: pj_status_t = 70014;
 pub const PJ_ENOMEM: pj_status_t = 70015;
 pub const PJ_ENOTFOUND: pj_status_t = 70018;
+pub const PJ_ETOOBIG: pj_status_t = 70017;
 pub const PJ_ETOOMANY: pj_status_t = 70027;
 pub const PJ_EEOF: pj_status_t = 70028;
 pub const PJ_EBUSY: pj_status_t = 70029;

@@ -5,6 +5,7 @@
 
 use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ============================================================================
 // Threads
@@ -23,6 +24,8 @@ struct ThreadInner {
     name: String,
     handle: Option<std::thread::JoinHandle<i32>>,
     _registered: bool,
+    /// Gate for suspended-thread support.
+    resume_gate: Option<Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
 }
 
 // Thread-local for "this thread" lookup.
@@ -41,7 +44,7 @@ pub unsafe extern "C" fn pj_thread_create(
     proc_: Option<pj_thread_proc>,
     arg: *mut libc::c_void,
     _stack_size: usize,
-    _flags: u32,
+    flags: u32,
     p_thread: *mut *mut pj_thread_t,
 ) -> pj_status_t {
     if p_thread.is_null() {
@@ -64,10 +67,18 @@ pub unsafe extern "C" fn pj_thread_create(
     // responsible for ensuring it outlives the thread.
     let arg_send = arg as usize;
 
+    let suspended = (flags & 1) != 0; // PJ_THREAD_SUSPENDED = 1
+    let gate = if suspended {
+        Some(Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new())))
+    } else {
+        None
+    };
+
     let inner = Box::new(ThreadInner {
         name: name_str.clone(),
         handle: None,
         _registered: false,
+        resume_gate: gate.clone(),
     });
     let thread_ptr = Box::into_raw(inner) as *mut pj_thread_t;
 
@@ -75,9 +86,18 @@ pub unsafe extern "C" fn pj_thread_create(
     let thread_ptr_usize = thread_ptr as usize;
     let proc_usize = proc_ as usize;
 
+    let gate_clone = gate.clone();
     let builder = std::thread::Builder::new().name(name_str);
     let handle = builder
         .spawn(move || {
+            // If suspended, wait for resume signal
+            if let Some(gate) = gate_clone {
+                let (lock, cvar) = &*gate;
+                let mut started = lock.lock();
+                while !*started {
+                    cvar.wait(&mut started);
+                }
+            }
             CURRENT_THREAD.with(|c| {
                 c.set(thread_ptr_usize);
             });
@@ -100,10 +120,11 @@ pub unsafe extern "C" fn pj_thread_create(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pj_thread_destroy(thread: *mut pj_thread_t) {
+pub unsafe extern "C" fn pj_thread_destroy(thread: *mut pj_thread_t) -> pj_status_t {
     if !thread.is_null() {
         let _ = Box::from_raw(thread as *mut ThreadInner);
     }
+    PJ_SUCCESS
 }
 
 #[no_mangle]
@@ -126,6 +147,7 @@ pub unsafe extern "C" fn pj_thread_register(
         name: name_str,
         handle: None,
         _registered: true,
+        resume_gate: None,
     });
     let ptr = Box::into_raw(inner) as *mut pj_thread_t;
     CURRENT_THREAD.with(|c| {
@@ -153,6 +175,7 @@ pub unsafe extern "C" fn pj_thread_this() -> *mut pj_thread_t {
             name: "main".to_string(),
             handle: None,
             _registered: true,
+            resume_gate: None,
         });
         MAIN_THREAD = Box::into_raw(inner) as *mut pj_thread_t;
         CURRENT_THREAD.with(|c| {
@@ -196,15 +219,24 @@ pub unsafe extern "C" fn pj_thread_sleep(msec: u32) -> pj_status_t {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pj_thread_resume(_thread: *mut pj_thread_t) -> pj_status_t {
-    // pjproject threads are not suspendable in our implementation -- no-op
+pub unsafe extern "C" fn pj_thread_resume(thread: *mut pj_thread_t) -> pj_status_t {
+    if thread.is_null() {
+        return PJ_EINVAL;
+    }
+    let inner = &*(thread as *const ThreadInner);
+    if let Some(gate) = &inner.resume_gate {
+        let (lock, cvar) = &**gate;
+        let mut started = lock.lock();
+        *started = true;
+        cvar.notify_one();
+    }
     PJ_SUCCESS
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_thread_attach(
-    _pool: *mut pj_pool_t,
     name: *const libc::c_char,
+    _desc: *mut libc::c_void, // pj_thread_desc (stack space)
     p_thread: *mut *mut pj_thread_t,
 ) -> pj_status_t {
     if p_thread.is_null() {
@@ -221,6 +253,7 @@ pub unsafe extern "C" fn pj_thread_attach(
         name: name_str,
         handle: None,
         _registered: true,
+        resume_gate: None,
     });
     let ptr = Box::into_raw(inner) as *mut pj_thread_t;
     CURRENT_THREAD.with(|c| {

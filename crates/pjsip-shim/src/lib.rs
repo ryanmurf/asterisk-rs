@@ -1138,7 +1138,7 @@ mod tests {
             assert!(!suite.is_null());
 
             // Create a test case with a function that returns 0 (success)
-            unsafe extern "C" fn my_test(_tc: *mut test_framework::pj_test_case) -> i32 {
+            unsafe extern "C" fn my_test(_arg: *mut libc::c_void) -> i32 {
                 0 // success
             }
 
@@ -1148,6 +1148,10 @@ mod tests {
                 b"my_test\0".as_ptr() as *const _,
                 0,
                 Some(my_test),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
             );
 
             test_framework::pj_test_suite_add_case(suite, &mut tc);

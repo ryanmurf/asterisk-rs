@@ -68,11 +68,43 @@ pub unsafe extern "C" fn pj_list_insert_after(
 }
 
 // ---------------------------------------------------------------------------
+// pj_list_insert_nodes_after
+// ---------------------------------------------------------------------------
+
+/// Insert a chain of nodes after `pos`.  `lst` is the first node of a
+/// circular chain; all nodes in the chain (including `lst` itself) are
+/// spliced in after `pos`.
+///
+/// This matches pjproject semantics: `lst` is a real node, NOT a sentinel.
+#[no_mangle]
+pub unsafe extern "C" fn pj_list_insert_nodes_after(
+    pos: *mut pj_list_node,
+    lst: *mut pj_list_node,
+) {
+    if pos.is_null() || lst.is_null() {
+        return;
+    }
+    let lst_last = (*lst).prev;
+    let pos_next = (*pos).next;
+
+    // link pos -> lst
+    (*pos).next = lst;
+    (*lst).prev = pos;
+
+    // link lst_last -> pos_next
+    (*lst_last).next = pos_next;
+    (*pos_next).prev = lst_last;
+}
+
+// ---------------------------------------------------------------------------
 // pj_list_insert_nodes_before
 // ---------------------------------------------------------------------------
 
-/// Insert a sub-list (lst) before `pos`.  `lst` is a list head whose nodes
-/// are spliced into the list before `pos`.
+/// Insert a chain of nodes before `pos`.  `lst` is the first node of a
+/// circular chain; all nodes in the chain (including `lst` itself) are
+/// spliced in before `pos`.
+///
+/// This matches pjproject semantics: `lst` is a real node, NOT a sentinel.
 #[no_mangle]
 pub unsafe extern "C" fn pj_list_insert_nodes_before(
     pos: *mut pj_list_node,
@@ -81,23 +113,8 @@ pub unsafe extern "C" fn pj_list_insert_nodes_before(
     if pos.is_null() || lst.is_null() {
         return;
     }
-    // If lst is empty (points to itself), nothing to do
-    if (*lst).next == lst {
-        return;
-    }
-    let first = (*lst).next;
-    let last = (*lst).prev;
-    let prev = (*pos).prev;
-
-    // Splice in
-    (*prev).next = first;
-    (*first).prev = prev;
-    (*last).next = pos;
-    (*pos).prev = last;
-
-    // Reset lst to empty
-    (*lst).next = lst;
-    (*lst).prev = lst;
+    // Equivalent to pj_list_insert_nodes_after(pos->prev, lst)
+    pj_list_insert_nodes_after((*pos).prev, lst);
 }
 
 // ---------------------------------------------------------------------------
@@ -147,12 +164,13 @@ pub unsafe extern "C" fn pj_list_find_node(
 // ---------------------------------------------------------------------------
 
 /// Search a list using a comparison function.
-/// The comparison function receives (node, value) and should return 0 on match.
+/// The comparison function receives (value, node) and should return 0 on match.
+/// This matches pjproject's signature: `int (*comp)(void *value, const pj_list_type *node)`.
 #[no_mangle]
 pub unsafe extern "C" fn pj_list_search(
     list: *mut pj_list_node,
     value: *mut libc::c_void,
-    comp: Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> i32>,
+    comp: Option<unsafe extern "C" fn(*mut libc::c_void, *const libc::c_void) -> i32>,
 ) -> *mut pj_list_node {
     if list.is_null() {
         return std::ptr::null_mut();
@@ -163,7 +181,7 @@ pub unsafe extern "C" fn pj_list_search(
     };
     let mut cur = (*list).next;
     while cur != list {
-        if comp(cur as *const _, value as *const _) == 0 {
+        if comp(value, cur as *const _) == 0 {
             return cur;
         }
         cur = (*cur).next;
