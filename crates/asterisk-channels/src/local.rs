@@ -14,8 +14,9 @@ use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info};
 
-use asterisk_core::channel::{Channel, ChannelDriver};
-use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
+use asterisk_core::channel::{Channel, ChannelDriver, publish_channel_event};
+use asterisk_core::{channel_store, get_global_dialplan, pbx_run};
+use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame, HangupCause};
 
 const LOCAL_FRAME_BUFFER: usize = 150;
 static PAIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -62,13 +63,20 @@ impl fmt::Debug for LocalPrivate {
 }
 
 pub struct LocalChannelDriver {
+    /// Private data for each channel side, keyed by channel name.
+    /// We key by name (not unique_id) because the global channel store may
+    /// reassign unique_ids when registering channels, but the name is stable.
     channels: RwLock<HashMap<String, Arc<LocalPrivate>>>,
+    /// Pending ;2 channels, keyed by ;1's channel name.
+    /// Stored after request(), consumed by call().
+    pending_chan2: RwLock<HashMap<String, Channel>>,
 }
 
 impl fmt::Debug for LocalChannelDriver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalChannelDriver")
             .field("active_channels", &self.channels.read().len())
+            .field("pending_chan2", &self.pending_chan2.read().len())
             .finish()
     }
 }
@@ -77,6 +85,7 @@ impl LocalChannelDriver {
     pub fn new() -> Self {
         Self {
             channels: RwLock::new(HashMap::new()),
+            pending_chan2: RwLock::new(HashMap::new()),
         }
     }
 
@@ -136,13 +145,31 @@ impl LocalChannelDriver {
 
         {
             let mut channels = self.channels.write();
-            channels.insert(chan1.unique_id.as_str().to_string(), priv1);
-            channels.insert(chan2.unique_id.as_str().to_string(), priv2);
+            channels.insert(chan_name_1.clone(), priv1);
+            channels.insert(chan_name_2.clone(), priv2);
         }
 
         info!(pair_id, chan1 = %chan_name_1, chan2 = %chan_name_2, "Created Local channel pair");
 
         Ok((chan1, chan2))
+    }
+
+    /// Store a ;2 channel in the pending map, keyed by the ;1 channel's name.
+    ///
+    /// We key by name (not unique_id) because register_existing_channel() may
+    /// reassign the unique_id, but the channel name is stable.
+    ///
+    /// Called by `ChannelDriver::request()` after `request_pair()` returns.
+    /// The stored ;2 is consumed by `call()` when it starts PBX on the ;2 side.
+    fn store_pending_chan2(&self, chan1_name: &str, chan2: Channel) {
+        self.pending_chan2.write().insert(chan1_name.to_string(), chan2);
+    }
+
+    /// Take the pending ;2 channel for a given ;1 channel name.
+    ///
+    /// Returns `None` if no pending ;2 exists (already consumed or never created).
+    pub fn take_pending_chan2(&self, chan1_name: &str) -> Option<Channel> {
+        self.pending_chan2.write().remove(chan1_name)
     }
 
     fn get_private(&self, channel_id: &str) -> Option<Arc<LocalPrivate>> {
@@ -189,13 +216,17 @@ impl ChannelDriver for LocalChannelDriver {
     }
 
     async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
-        let (chan1, _chan2) = self.request_pair(dest)?;
+        let (chan1, chan2) = self.request_pair(dest)?;
+        // Store ;2 in the pending map keyed by ;1's name so call() on ;1
+        // can retrieve it and start PBX on it. We use name (not unique_id)
+        // because register_existing_channel() may reassign the unique_id.
+        self.store_pending_chan2(&chan1.name, chan2);
         Ok(chan1)
     }
 
     async fn call(&self, channel: &mut Channel, _dest: &str, _timeout: i32) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         if priv_data.pair.hungup.load(Ordering::Relaxed) {
@@ -204,6 +235,83 @@ impl ChannelDriver for LocalChannelDriver {
 
         channel.set_state(ChannelState::Ring);
         let _ = priv_data.tx.send(Frame::control(ControlFrame::Ringing)).await;
+
+        let local_context = priv_data.pair.context.clone();
+        let local_extension = priv_data.pair.extension.clone();
+
+        // Retrieve the pending ;2 channel and start PBX on it
+        // This mirrors C Asterisk's local_call() -> ast_pbx_start(p->chan)
+        if let Some(chan2) = self.take_pending_chan2(&channel.name) {
+            let chan2_name = chan2.name.clone();
+
+            // Register ;2 in the global channel store and emit Newchannel
+            let store_chan2 = channel_store::register_existing_channel(chan2);
+
+            // Get the NEW unique_id assigned by register_existing_channel
+            let chan2_uid = store_chan2.lock().unique_id.0.clone();
+
+            // Emit LocalBridge event
+            publish_channel_event("LocalBridge", &[
+                ("Channel1", &channel.name),
+                ("Channel2", &chan2_name),
+                ("Context", &local_context),
+                ("Exten", &local_extension),
+            ]);
+
+            // Get the dialplan for PBX execution
+            if let Some(dialplan) = get_global_dialplan() {
+                let chan1_name = channel.name.clone();
+                let _chan1_uid = channel.unique_id.0.clone();
+                let pair_state = Arc::clone(&priv_data.pair);
+
+                // Create a tokio::sync::Mutex-wrapped Channel for pbx_run
+                // by cloning the relevant fields from the store channel
+                let pbx_chan2 = {
+                    let guard = store_chan2.lock();
+                    let mut ch = Channel::new(&guard.name);
+                    ch.unique_id = guard.unique_id.clone();
+                    ch.context = guard.context.clone();
+                    ch.exten = guard.exten.clone();
+                    ch.priority = guard.priority;
+                    ch.linkedid = guard.linkedid.clone();
+                    ch.caller = guard.caller.clone();
+                    Arc::new(tokio::sync::Mutex::new(ch))
+                };
+
+                // Spawn PBX execution on ;2
+                tokio::spawn(async move {
+                    info!(
+                        chan2 = %chan2_name,
+                        context = %local_context,
+                        exten = %local_extension,
+                        "Starting PBX on Local ;2 channel"
+                    );
+
+                    let _result = pbx_run(pbx_chan2, dialplan).await;
+
+                    info!(chan2 = %chan2_name, "Local ;2 PBX completed");
+
+                    // When ;2's PBX completes, also soft-hangup ;1
+                    // This mirrors C Asterisk's behavior where hanging up one
+                    // side of a Local pair tears down the other side.
+                    pair_state.hungup.store(true, Ordering::Relaxed);
+
+                    // Hangup ;1 if it's still in the channel store
+                    if let Some(chan1_arc) = channel_store::find_by_name(&chan1_name) {
+                        let mut ch1 = chan1_arc.lock();
+                        if ch1.state != ChannelState::Down {
+                            ch1.hangup(HangupCause::NormalClearing);
+                        }
+                        let uid = ch1.unique_id.0.clone();
+                        drop(ch1);
+                        channel_store::deregister(&uid);
+                    }
+
+                    // Clean up ;2 from the channel store
+                    channel_store::deregister(&chan2_uid);
+                });
+            }
+        }
 
         info!(
             pair_id = priv_data.pair.pair_id,
@@ -216,7 +324,7 @@ impl ChannelDriver for LocalChannelDriver {
 
     async fn answer(&self, channel: &mut Channel) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         channel.answer();
@@ -226,7 +334,7 @@ impl ChannelDriver for LocalChannelDriver {
     }
 
     async fn hangup(&self, channel: &mut Channel) -> AsteriskResult<()> {
-        let priv_data = match self.remove_private(channel.unique_id.as_str()) {
+        let priv_data = match self.remove_private(&channel.name) {
             Some(p) => p,
             None => return Ok(()),
         };
@@ -240,7 +348,7 @@ impl ChannelDriver for LocalChannelDriver {
 
     async fn read_frame(&self, channel: &mut Channel) -> AsteriskResult<Frame> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         if priv_data.pair.hungup.load(Ordering::Relaxed) {
@@ -259,7 +367,7 @@ impl ChannelDriver for LocalChannelDriver {
 
     async fn write_frame(&self, channel: &mut Channel, frame: &Frame) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         if priv_data.pair.hungup.load(Ordering::Relaxed) {

@@ -6,12 +6,18 @@
 
 use crate::auth::{self, UserRegistry};
 use crate::events::EventCategory;
-use crate::protocol::{AmiAction, AmiResponse};
+use crate::protocol::{AmiAction, AmiEvent, AmiResponse};
 use crate::session::AmiSession;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::Instant;
 use tracing::{debug, info, warn};
+
+/// Global startup time -- initialized when the module is first accessed.
+/// Used by CoreStatus to report real uptime.
+static STARTUP_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Type alias for action handler functions.
 ///
@@ -170,6 +176,26 @@ impl ActionRegistry {
 
         // QueuePause
         self.register("queuepause", Box::new(handle_queue_pause));
+
+        // GetVar
+        self.register("getvar", Box::new(handle_getvar));
+
+        // SetVar
+        self.register("setvar", Box::new(handle_setvar));
+
+        // PJSIP actions
+        self.register("pjsipshowendpoints", Box::new(handle_pjsip_show_endpoints));
+        self.register("pjsipshowendpoint", Box::new(handle_pjsip_show_endpoint));
+        self.register(
+            "pjsipshowregistrationsinbound",
+            Box::new(handle_pjsip_show_registrations_inbound),
+        );
+        self.register(
+            "pjsipshowregistrationsoutbound",
+            Box::new(handle_pjsip_show_registrations_outbound),
+        );
+        self.register("pjsipnotify", Box::new(handle_pjsip_notify));
+        self.register("pjsipqualify", Box::new(handle_pjsip_qualify));
     }
 }
 
@@ -230,6 +256,9 @@ fn handle_login(
 }
 
 /// Handle the Logoff action.
+///
+/// Real Asterisk returns `Response: Goodbye` (not `Response: Success`)
+/// so that starpy and other clients can check `message['response'] == 'Goodbye'`.
 fn handle_logoff(
     _action: &AmiAction,
     session: &mut AmiSession,
@@ -241,7 +270,8 @@ fn handle_logoff(
     );
     session.authenticated = false;
     session.username = None;
-    AmiResponse::success("Goodbye")
+    AmiResponse::success("Thanks for all the fish.")
+        .with_response_value("Goodbye")
 }
 
 /// Handle the Challenge action (MD5 auth step 1).
@@ -275,29 +305,58 @@ fn handle_ping(
 
 /// Handle CoreShowChannels action.
 fn handle_core_show_channels(
-    _action: &AmiAction,
+    action: &AmiAction,
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
-    // In a real implementation, iterate over all active channels:
-    //
-    //   let channels = ChannelRegistry::list_all();
-    //   for ch in &channels {
-    //       let event = AmiEvent::new("CoreShowChannel", EventCategory::SYSTEM.0)
-    //           .with_header("Channel", &ch.name)
-    //           .with_header("Uniqueid", &ch.unique_id.0)
-    //           .with_header("Context", &ch.context)
-    //           .with_header("Extension", &ch.exten)
-    //           .with_header("Priority", &ch.priority.to_string())
-    //           .with_header("ChannelState", &(ch.state as u8).to_string());
-    //       session.send_event(&event).await;
-    //   }
-    //   let complete = AmiEvent::new("CoreShowChannelsComplete", EventCategory::SYSTEM.0)
-    //       .with_header("ListItems", &channels.len().to_string());
-    //   session.send_event(&complete).await;
+    let action_id = action.action_id.clone().unwrap_or_default();
+    let channels = asterisk_core::channel_store::all_channels();
+    let count = channels.len();
 
-    AmiResponse::success("Channels will follow")
-        .with_header("ListItems", "0")
+    let mut resp = AmiResponse::success("Channels will follow");
+
+    for chan_arc in &channels {
+        let chan = chan_arc.lock();
+        let state_num = (chan.state as u8).to_string();
+        let state_desc = chan.state.to_string();
+        let priority_str = chan.priority.to_string();
+        let duration_str = "0"; // TODO: track creation time
+
+        let mut event = AmiEvent::new("CoreShowChannel", 0x01);
+        if !action_id.is_empty() {
+            event.add_header("ActionID", &action_id);
+        }
+        event.add_header("Channel", &chan.name);
+        event.add_header("Uniqueid", &chan.unique_id.0);
+        event.add_header("Linkedid", &chan.linkedid);
+        event.add_header("Context", &chan.context);
+        event.add_header("Extension", &chan.exten);
+        event.add_header("Priority", &priority_str);
+        event.add_header("ChannelState", &state_num);
+        event.add_header("ChannelStateDesc", &state_desc);
+        event.add_header("CallerIDNum", &chan.caller.id.number.number);
+        event.add_header("CallerIDName", &chan.caller.id.name.name);
+        event.add_header("ConnectedLineNum", "");
+        event.add_header("ConnectedLineName", "");
+        event.add_header("Language", &chan.language);
+        event.add_header("AccountCode", &chan.accountcode);
+        event.add_header("Duration", duration_str);
+        event.add_header("BridgeId", "");
+        event.add_header("Application", "");
+        event.add_header("ApplicationData", "");
+
+        resp.add_followup_event(event);
+    }
+
+    let mut complete = AmiEvent::new("CoreShowChannelsComplete", 0x01);
+    if !action_id.is_empty() {
+        complete.add_header("ActionID", &action_id);
+    }
+    complete.add_header("EventList", "Complete");
+    complete.add_header("ListItems", &count.to_string());
+    resp.add_followup_event(complete);
+
+    resp
 }
 
 /// Handle CoreStatus action.
@@ -306,10 +365,27 @@ fn handle_core_status(
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
+    let uptime_secs = STARTUP_TIME.elapsed().as_secs();
+    let active_channels = asterisk_core::channel_store::count();
+
+    // Format startup date/time from system time - epoch seconds of STARTUP_TIME
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let startup_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(uptime_secs);
+    // Simple epoch-to-date formatting
+    let startup_date = format_epoch_date(startup_epoch);
+    let startup_time = format_epoch_time(startup_epoch);
+
     AmiResponse::success("Core Status")
-        .with_header("CoreStartupDate", "2026-01-01")
-        .with_header("CoreStartupTime", "00:00:00")
-        .with_header("CoreCurrentCalls", "0")
+        .with_header("CoreStartupDate", &startup_date)
+        .with_header("CoreStartupTime", &startup_time)
+        .with_header("CoreReloadDate", &startup_date)
+        .with_header("CoreReloadTime", &startup_time)
+        .with_header("CoreCurrentCalls", active_channels.to_string())
+        .with_header("CoreStartupSecs", uptime_secs.to_string())
 }
 
 /// Handle CoreSettings action.
@@ -328,9 +404,18 @@ fn handle_core_settings(
 
 /// Handle the Originate action.
 ///
-/// Creates a real channel via the global channel store, sets context/exten/
-/// priority and optional variables, then spawns `pbx_run` to execute the
-/// dialplan asynchronously. Emits OriginateResponse when pbx_run finishes.
+/// Parses the channel technology from the Channel header (e.g. "Local/100@default"),
+/// looks up the channel driver via `TECH_REGISTRY`, calls `request()` to create
+/// the channel, then `call()` to initiate the outbound leg.
+///
+/// For Local channels this creates a proper ;1/;2 pair:
+///   - ;1 (owner) gets the Originate context/exten/priority and runs PBX
+///   - ;2 (chan) runs the dialplan at the Local destination
+///   - Both channels are registered in the global store and emit Newchannel events
+///   - PBX is started on ;2 via local_call() -> ast_pbx_start(;2) semantics
+///
+/// This mirrors the C Asterisk flow: action_originate -> ast_pbx_outgoing_exten
+/// -> ast_request -> local_request -> local_call -> ast_pbx_start(;2).
 fn handle_originate(
     action: &AmiAction,
     _session: &mut AmiSession,
@@ -377,7 +462,25 @@ fn handle_originate(
         channel_str, context, exten, priority
     );
 
-    // Get the global dialplan (needed for pbx_run)
+    // Parse technology/data from channel string (e.g. "Local/100@default" -> tech="Local", data="100@default")
+    let (tech, data) = match channel_str.split_once('/') {
+        Some((t, d)) => (t.to_string(), d.to_string()),
+        None => {
+            // No slash means use the whole string as the channel name (legacy)
+            return originate_simple(&channel_str, &context, &exten, priority, &caller_id, variables);
+        }
+    };
+
+    // Look up the technology driver in the global registry
+    let driver = match asterisk_core::TECH_REGISTRY.find(&tech) {
+        Some(d) => d,
+        None => {
+            warn!("AMI Originate: unknown channel technology '{}'", tech);
+            // Fall back to simple originate (just alloc + pbx_run)
+            return originate_simple(&channel_str, &context, &exten, priority, &caller_id, variables);
+        }
+    };
+
     let dialplan = match asterisk_core::get_global_dialplan() {
         Some(dp) => dp,
         None => {
@@ -386,20 +489,151 @@ fn handle_originate(
         }
     };
 
-    // Build the channel name and unique_id. We allocate via the global store
-    // (which uses parking_lot::Mutex) so that the channel is visible to
-    // `core show channels`, AMI Status, etc. Then we create a *separate*
-    // tokio::sync::Mutex wrapper for pbx_run since it needs async locking.
+    // Spawn the originate asynchronously since driver.request() is async
+    let channel_str_clone = channel_str.clone();
+    tokio::spawn(async move {
+        // Request a channel from the technology driver
+        let chan = match driver.request(&data, None).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Originate: driver.request('{}') failed: {}", data, e);
+                crate::event_bus::publish_event(
+                    crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
+                        .with_header("Response", "Failure")
+                        .with_header("Channel", &channel_str_clone),
+                );
+                return;
+            }
+        };
+
+        // Register the channel in the global store (emits Newchannel)
+        let store_chan = asterisk_core::channel_store::register_existing_channel(chan);
+
+        // Set Originate context/exten/priority, caller ID, and variables
+        let chan_name;
+        let chan_uid;
+        {
+            let mut ch = store_chan.lock();
+            ch.context = context.clone();
+            ch.exten = exten.clone();
+            ch.priority = priority;
+            if !caller_id.is_empty() {
+                ch.caller.id.number.number = caller_id.clone();
+                ch.caller.id.number.valid = true;
+            }
+            for (k, v) in &variables {
+                ch.set_variable(k.clone(), v.clone());
+            }
+            chan_name = ch.name.clone();
+            chan_uid = ch.unique_id.0.clone();
+        }
+
+        // Build a standalone Channel copy for driver.call() -- we cannot
+        // hold the parking_lot::MutexGuard across an .await point.
+        let mut call_channel = {
+            let ch = store_chan.lock();
+            let mut c = asterisk_core::Channel::new(&ch.name);
+            c.unique_id = ch.unique_id.clone();
+            c.context = ch.context.clone();
+            c.exten = ch.exten.clone();
+            c.priority = ch.priority;
+            c.linkedid = ch.linkedid.clone();
+            c.caller = ch.caller.clone();
+            c
+        };
+        // parking_lot guard is dropped here, before any .await
+
+        // Call the driver's call() method.
+        // For Local channels, this:
+        //   - Sets ;1 to Ring state
+        //   - Retrieves the pending ;2 channel
+        //   - Registers ;2 in the channel store (emits Newchannel for ;2)
+        //   - Emits LocalBridge event
+        //   - Spawns pbx_run on ;2
+        if let Err(e) = driver.call(&mut call_channel, &data, 30000).await {
+            warn!("Originate: driver.call() failed for {}: {}", chan_name, e);
+            crate::event_bus::publish_event(
+                crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
+                    .with_header("Response", "Failure")
+                    .with_header("Channel", &chan_name)
+                    .with_header("Uniqueid", &chan_uid),
+            );
+            asterisk_core::channel_store::deregister(&chan_uid);
+            return;
+        }
+
+        // Sync state changes from call() back to the store channel
+        {
+            let mut ch = store_chan.lock();
+            ch.state = call_channel.state;
+        }
+
+        // Create a tokio::sync::Mutex copy for pbx_run on ;1
+        let pbx_channel = {
+            let guard = store_chan.lock();
+            let mut ch = asterisk_core::Channel::new(&guard.name);
+            ch.unique_id = guard.unique_id.clone();
+            ch.context = guard.context.clone();
+            ch.exten = guard.exten.clone();
+            ch.priority = guard.priority;
+            ch.linkedid = guard.linkedid.clone();
+            ch.caller = guard.caller.clone();
+            for (k, v) in &variables {
+                ch.set_variable(k.clone(), v.clone());
+            }
+            std::sync::Arc::new(tokio::sync::Mutex::new(ch))
+        };
+
+        info!("Originate: starting pbx_run for ;1 channel {}", chan_name);
+        let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
+        info!("Originate: pbx_run finished for channel {} result={:?}", chan_name, result);
+
+        // Emit OriginateResponse event
+        let response_str = match result {
+            asterisk_core::PbxRunResult::Success => "Success",
+            _ => "Failure",
+        };
+        crate::event_bus::publish_event(
+            crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
+                .with_header("Response", response_str)
+                .with_header("Channel", &chan_name)
+                .with_header("Uniqueid", &chan_uid),
+        );
+
+        // Remove from the global channel store
+        asterisk_core::channel_store::deregister(&chan_uid);
+    });
+
+    AmiResponse::success("Originate successfully queued")
+}
+
+/// Simple originate: allocate a channel directly and run pbx_run on it.
+/// Used as fallback when the tech driver is not in the registry.
+fn originate_simple(
+    channel_str: &str,
+    context: &str,
+    exten: &str,
+    priority: i32,
+    caller_id: &str,
+    variables: Vec<(String, String)>,
+) -> AmiResponse {
+    let dialplan = match asterisk_core::get_global_dialplan() {
+        Some(dp) => dp,
+        None => {
+            return AmiResponse::error("Dialplan not loaded");
+        }
+    };
+
     let chan_name;
     let chan_uid;
     {
-        let store_chan = asterisk_core::channel_store::alloc_channel(&channel_str);
+        let store_chan = asterisk_core::channel_store::alloc_channel(channel_str);
         let mut chan = store_chan.lock();
-        chan.context = context.clone();
-        chan.exten = exten.clone();
+        chan.context = context.to_string();
+        chan.exten = exten.to_string();
         chan.priority = priority;
         if !caller_id.is_empty() {
-            chan.caller.id.number.number = caller_id.clone();
+            chan.caller.id.number.number = caller_id.to_string();
             chan.caller.id.number.valid = true;
         }
         for (k, v) in &variables {
@@ -409,17 +643,15 @@ fn handle_originate(
         chan_uid = chan.unique_id.0.clone();
     }
 
-    // Create a fresh Channel for pbx_run with tokio::sync::Mutex.
-    // We copy over the relevant fields from the store channel.
     let pbx_channel = {
         let mut ch = asterisk_core::Channel::new(&chan_name);
         ch.unique_id = asterisk_core::ChannelId(chan_uid.clone());
-        ch.context = context;
-        ch.exten = exten;
+        ch.context = context.to_string();
+        ch.exten = exten.to_string();
         ch.priority = priority;
         ch.linkedid = chan_uid.clone();
         if !caller_id.is_empty() {
-            ch.caller.id.number.number = caller_id;
+            ch.caller.id.number.number = caller_id.to_string();
             ch.caller.id.number.valid = true;
         }
         for (k, v) in variables {
@@ -428,7 +660,6 @@ fn handle_originate(
         std::sync::Arc::new(tokio::sync::Mutex::new(ch))
     };
 
-    // Spawn pbx_run on a background task so the dialplan actually executes.
     let chan_name_for_task = chan_name.clone();
     let chan_uid_for_task = chan_uid.clone();
     tokio::spawn(async move {
@@ -436,19 +667,17 @@ fn handle_originate(
         let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
         info!("Originate: pbx_run finished for channel {} result={:?}", chan_name_for_task, result);
 
-        // Emit OriginateResponse event
         let response_str = match result {
             asterisk_core::PbxRunResult::Success => "Success",
             _ => "Failure",
         };
         crate::event_bus::publish_event(
-            crate::protocol::AmiEvent::new("OriginateResponse", 0x02) // CALL category
+            crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
                 .with_header("Response", response_str)
                 .with_header("Channel", &chan_name_for_task)
                 .with_header("Uniqueid", &chan_uid_for_task),
         );
 
-        // Remove from the global channel store now that the call is done
         asterisk_core::channel_store::deregister(&chan_uid_for_task);
     });
 
@@ -461,7 +690,7 @@ fn handle_redirect(
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
-    let channel = match action.get_header("Channel") {
+    let channel_name = match action.get_header("Channel") {
         Some(c) => c,
         None => return AmiResponse::error("Channel is required"),
     };
@@ -479,17 +708,21 @@ fn handle_redirect(
 
     info!(
         "AMI Redirect: channel={} to {}@{} priority {}",
-        channel, exten, redirect_context, priority
+        channel_name, exten, redirect_context, priority
     );
 
-    // In a real implementation:
-    //   let chan = ChannelRegistry::find_by_name(channel)?;
-    //   chan.context = context.to_string();
-    //   chan.exten = exten.to_string();
-    //   chan.priority = priority;
-    //   pbx_async_goto(chan).await?;
-
-    AmiResponse::success("Redirect successful")
+    // Look up the channel and change its dialplan location
+    if let Some(chan_arc) = asterisk_core::channel_store::find_by_name(channel_name) {
+        let mut chan = chan_arc.lock();
+        chan.context = redirect_context.to_string();
+        chan.exten = exten.to_string();
+        chan.priority = priority;
+        // Set AsyncGoto flag so pbx_run picks up the new location
+        chan.softhangup(asterisk_core::channel::softhangup::AST_SOFTHANGUP_ASYNCGOTO);
+        AmiResponse::success("Redirect successful")
+    } else {
+        AmiResponse::error(format!("Channel not found: {}", channel_name))
+    }
 }
 
 /// Handle the Hangup action.
@@ -498,23 +731,36 @@ fn handle_hangup(
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
-    let channel = match action.get_header("Channel") {
+    let channel_name = match action.get_header("Channel") {
         Some(c) => c,
         None => return AmiResponse::error("Channel is required"),
     };
 
-    let cause = action
+    let cause_code = action
         .get_header("Cause")
         .and_then(|c| c.parse::<u32>().ok())
         .unwrap_or(16); // Normal clearing
 
-    info!("AMI Hangup: channel={} cause={}", channel, cause);
+    info!("AMI Hangup: channel={} cause={}", channel_name, cause_code);
 
-    // In a real implementation:
-    //   let chan = ChannelRegistry::find_by_name(channel)?;
-    //   chan.hangup(HangupCause::from(cause));
-
-    AmiResponse::success("Channel Hungup")
+    // Look up the channel in the global store and request a soft hangup
+    if let Some(chan_arc) = asterisk_core::channel_store::find_by_name(channel_name) {
+        let mut chan = chan_arc.lock();
+        // Map common Q.850 cause codes to HangupCause enum variants
+        chan.hangup_cause = match cause_code {
+            0 => asterisk_types::HangupCause::NotDefined,
+            16 => asterisk_types::HangupCause::NormalClearing,
+            17 => asterisk_types::HangupCause::UserBusy,
+            18 => asterisk_types::HangupCause::NoUserResponse,
+            19 => asterisk_types::HangupCause::NoAnswer,
+            21 => asterisk_types::HangupCause::CallRejected,
+            _ => asterisk_types::HangupCause::NormalClearing,
+        };
+        chan.softhangup(asterisk_core::channel::softhangup::AST_SOFTHANGUP_EXPLICIT);
+        AmiResponse::success("Channel Hungup")
+    } else {
+        AmiResponse::error(format!("Channel not found: {}", channel_name))
+    }
 }
 
 /// Handle the Bridge action.
@@ -540,7 +786,43 @@ fn handle_bridge(
 
     info!("AMI Bridge: {} <-> {}", channel1, channel2);
 
+    // Verify both channels exist in the global store
+    if asterisk_core::channel_store::find_by_name(channel1).is_none() {
+        return AmiResponse::error(format!("Channel not found: {}", channel1));
+    }
+    if asterisk_core::channel_store::find_by_name(channel2).is_none() {
+        return AmiResponse::error(format!("Channel not found: {}", channel2));
+    }
+
+    // Generate a bridge ID and emit BridgeCreate + BridgeEnter events.
+    // The actual bridge audio path is handled asynchronously by the bridge subsystem.
+    let bridge_id = format!("bridge-{}", chrono_timestamp());
+
+    crate::event_bus::publish_event(
+        crate::protocol::AmiEvent::new("BridgeCreate", 0x02)
+            .with_header("BridgeUniqueid", &bridge_id)
+            .with_header("BridgeType", "basic")
+            .with_header("BridgeTechnology", "simple_bridge")
+            .with_header("BridgeNumChannels", "0"),
+    );
+
+    // Emit BridgeEnter events for both channels
+    for ch_name in &[channel1, channel2] {
+        if let Some(chan_arc) = asterisk_core::channel_store::find_by_name(ch_name) {
+            let chan = chan_arc.lock();
+            crate::event_bus::publish_event(
+                crate::protocol::AmiEvent::new("BridgeEnter", 0x02)
+                    .with_header("BridgeUniqueid", &bridge_id)
+                    .with_header("BridgeType", "basic")
+                    .with_header("Channel", &chan.name)
+                    .with_header("Uniqueid", &chan.unique_id.0)
+                    .with_header("Linkedid", &chan.linkedid),
+            );
+        }
+    }
+
     AmiResponse::success("Bridge created")
+        .with_header("BridgeUniqueid", bridge_id)
 }
 
 /// Handle the Park action.
@@ -616,7 +898,7 @@ fn execute_cli_command(command: &str) -> Vec<String> {
         lines.push(format!("{} active channel(s)", count));
         lines
     } else if cmd_lower.starts_with("core show version") {
-        vec!["Asterisk-RS 0.1.0 (Rust rewrite of Asterisk)".to_string()]
+        vec!["Asterisk 22.0.0-rs".to_string()]
     } else if cmd_lower.starts_with("core show uptime") {
         vec!["System uptime: 00:00:00".to_string()]
     } else {
@@ -723,18 +1005,54 @@ fn handle_status(
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
-    let _channel = action.get_header("Channel"); // Optional
+    let specific_channel = action.get_header("Channel");
+    let action_id = action.action_id.clone().unwrap_or_default();
 
-    // In a real implementation, send status events for each channel:
-    //   if let Some(specific_channel) = channel {
-    //       // Send status for just that channel
-    //   } else {
-    //       // Send status for all channels
-    //   }
-    //   Then send StatusComplete event
+    let mut resp = AmiResponse::success("Channel status will follow");
+    let mut count = 0u32;
 
-    AmiResponse::success("Channel status will follow")
-        .with_header("Items", "0")
+    let channels = asterisk_core::channel_store::all_channels();
+    for chan_arc in &channels {
+        let chan = chan_arc.lock();
+
+        // If a specific channel was requested, only return that one
+        if let Some(specific) = specific_channel {
+            if chan.name != specific {
+                continue;
+            }
+        }
+
+        let state_num = (chan.state as u8).to_string();
+        let priority_str = chan.priority.to_string();
+
+        let mut event = AmiEvent::new("Status", 0x02);
+        if !action_id.is_empty() {
+            event.add_header("ActionID", &action_id);
+        }
+        event.add_header("Channel", &chan.name);
+        event.add_header("Uniqueid", &chan.unique_id.0);
+        event.add_header("Linkedid", &chan.linkedid);
+        event.add_header("CallerIDNum", &chan.caller.id.number.number);
+        event.add_header("CallerIDName", &chan.caller.id.name.name);
+        event.add_header("Context", &chan.context);
+        event.add_header("Extension", &chan.exten);
+        event.add_header("Priority", &priority_str);
+        event.add_header("ChannelState", &state_num);
+        event.add_header("ChannelStateDesc", &chan.state.to_string());
+        event.add_header("AccountCode", &chan.accountcode);
+
+        resp.add_followup_event(event);
+        count += 1;
+    }
+
+    let mut complete = AmiEvent::new("StatusComplete", 0x02);
+    if !action_id.is_empty() {
+        complete.add_header("ActionID", &action_id);
+    }
+    complete.add_header("Items", &count.to_string());
+    resp.add_followup_event(complete);
+
+    resp
 }
 
 /// Handle ShowDialPlan action.
@@ -875,6 +1193,635 @@ fn handle_queue_pause(
     } else {
         "Interface unpaused"
     })
+}
+
+// ---------------------------------------------------------------------------
+// GetVar / SetVar
+// ---------------------------------------------------------------------------
+
+/// Handle the GetVar action.
+fn handle_getvar(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let channel = action.get_header("Channel").unwrap_or("");
+    let variable = match action.get_header("Variable") {
+        Some(v) => v,
+        None => return AmiResponse::error("Variable is required"),
+    };
+
+    let value = if channel.is_empty() {
+        // Global variable
+        asterisk_core::pbx::get_global_variable(variable).unwrap_or_default()
+    } else {
+        // Channel variable -- try to look up in channel store
+        if let Some(chan) = asterisk_core::channel_store::find_by_name(channel) {
+            let ch = chan.lock();
+            ch.get_variable(variable).unwrap_or("").to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    AmiResponse::success("Result will follow")
+        .with_header("Variable", variable.to_string())
+        .with_header("Value", value)
+}
+
+/// Handle the SetVar action.
+fn handle_setvar(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let channel = action.get_header("Channel").unwrap_or("");
+    let variable = match action.get_header("Variable") {
+        Some(v) => v,
+        None => return AmiResponse::error("Variable is required"),
+    };
+    let value = action.get_header("Value").unwrap_or("");
+
+    if channel.is_empty() {
+        asterisk_core::pbx::set_global_variable(variable.to_string(), value.to_string());
+    } else {
+        if let Some(chan) = asterisk_core::channel_store::find_by_name(channel) {
+            let mut ch = chan.lock();
+            ch.set_variable(variable.to_string(), value.to_string());
+        } else {
+            return AmiResponse::error("Channel not found");
+        }
+    }
+
+    AmiResponse::success("Variable Set")
+}
+
+// ---------------------------------------------------------------------------
+// PJSIP AMI actions
+// ---------------------------------------------------------------------------
+
+/// Handle PJSIPShowEndpoints AMI action.
+///
+/// Returns a list of all configured PJSIP endpoints from pjsip.conf.
+fn handle_pjsip_show_endpoints(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let action_id = action.action_id.clone().unwrap_or_default();
+    let pjsip_config = asterisk_sip::get_global_pjsip_config();
+
+    let mut resp = AmiResponse::success("Following are Events for each Endpoint on each Transport");
+
+    if let Some(cfg) = pjsip_config {
+        let ep_count = cfg.endpoints.len();
+
+        for ep in &cfg.endpoints {
+            let transport = ep.transport.as_deref().unwrap_or("");
+            let aor_name = ep.aors.as_deref().unwrap_or("");
+            let auth_name = ep.auth.as_deref().unwrap_or("");
+
+            // Build contacts string: aor_name/contact_uri
+            let contacts = if let Some(aor) = cfg.find_aor(aor_name) {
+                aor.contact
+                    .iter()
+                    .map(|c| format!("{}/{}", aor_name, c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                String::new()
+            };
+
+            let mut event = AmiEvent::new("EndpointList", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "endpoint");
+            event.add_header("ObjectName", &ep.name);
+            event.add_header("Transport", transport);
+            event.add_header("Aor", aor_name);
+            event.add_header("Auths", auth_name);
+            event.add_header("OutboundAuths", "");
+            event.add_header("Contacts", &contacts);
+            event.add_header("DeviceState", "Unavailable");
+            event.add_header("ActiveChannels", "");
+
+            resp.add_followup_event(event);
+        }
+
+        // Complete event
+        let mut complete = AmiEvent::new("EndpointListComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("ListItems", &ep_count.to_string());
+        resp.add_followup_event(complete);
+    } else {
+        let mut complete = AmiEvent::new("EndpointListComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("ListItems", "0");
+        resp.add_followup_event(complete);
+    }
+
+    resp
+}
+
+/// Handle PJSIPShowEndpoint (singular) AMI action.
+///
+/// Returns detailed information about a specific endpoint.
+fn handle_pjsip_show_endpoint(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let endpoint_name = match action.get_header("Endpoint") {
+        Some(e) => e,
+        None => return AmiResponse::error("Endpoint is required"),
+    };
+    let action_id = action.action_id.clone().unwrap_or_default();
+    let pjsip_config = asterisk_sip::get_global_pjsip_config();
+
+    let cfg = match pjsip_config {
+        Some(cfg) => cfg,
+        None => return AmiResponse::error("PJSIP not configured"),
+    };
+
+    let ep = match cfg.find_endpoint(endpoint_name) {
+        Some(ep) => ep.clone(),
+        None => return AmiResponse::error(format!("Endpoint {} not found", endpoint_name)),
+    };
+
+    let mut resp = AmiResponse::success("Following are Events for each object associated with the Endpoint");
+    let mut list_items = 0u32;
+
+    // EndpointDetail event
+    {
+        let transport = ep.transport.as_deref().unwrap_or("");
+        let aor_name = ep.aors.as_deref().unwrap_or("");
+        let auth_name = ep.auth.as_deref().unwrap_or("");
+
+        let mut event = AmiEvent::new("EndpointDetail", 0x01);
+        if !action_id.is_empty() {
+            event.add_header("ActionID", &action_id);
+        }
+        event.add_header("ObjectType", "endpoint");
+        event.add_header("ObjectName", &ep.name);
+        event.add_header("Context", &ep.context);
+        event.add_header("Transport", transport);
+        event.add_header("Aors", aor_name);
+        event.add_header("Auth", auth_name);
+        event.add_header("OutboundAuth", "");
+        event.add_header("DeviceState", "Unavailable");
+        event.add_header("ActiveChannels", "");
+        event.add_header("DtmfMode", &ep.dtmf_mode);
+        event.add_header("DirectMedia", if ep.direct_media { "true" } else { "false" });
+        event.add_header("RtpSymmetric", if ep.rtp_symmetric { "true" } else { "false" });
+        event.add_header("RtpIpv6", "false");
+        event.add_header("IceSupport", if ep.ice_support { "true" } else { "false" });
+        event.add_header("UsePtime", "false");
+        event.add_header("ForceRport", if ep.force_rport { "true" } else { "false" });
+        event.add_header("RewriteContact", if ep.rewrite_contact { "true" } else { "false" });
+        event.add_header("MediaEncryption", &ep.media_encryption);
+        event.add_header("UseAvpf", "false");
+        event.add_header("InbandProgress", "false");
+        event.add_header("CallGroup", "");
+        event.add_header("PickupGroup", "");
+        event.add_header("NamedCallGroup", "");
+        event.add_header("NamedPickupGroup", "");
+        event.add_header("DeviceStateBusyAt", "0");
+        event.add_header("T38Udptl", "false");
+        event.add_header("T38UdptlEc", "none");
+        event.add_header("T38UdptlMaxdatagram", "0");
+        event.add_header("FaxDetect", "false");
+        event.add_header("T38UdptlNat", "false");
+        event.add_header("T38UdptlIpv6", "false");
+        event.add_header("ToneZone", "");
+        event.add_header("Language", "");
+        event.add_header("RecordOnFeature", "automixmon");
+        event.add_header("RecordOffFeature", "automixmon");
+        event.add_header("AllowTransfer", if ep.allow_transfer { "true" } else { "false" });
+        event.add_header("SdpOwner", "-");
+        event.add_header("SdpSession", "Asterisk");
+        event.add_header("TosAudio", "0");
+        event.add_header("TosVideo", "0");
+        event.add_header("CosAudio", "0");
+        event.add_header("CosVideo", "0");
+        event.add_header("AllowSubscribe", "true");
+        event.add_header("SubMinExpiry", "0");
+        event.add_header("FromUser", ep.from_user.as_deref().unwrap_or(""));
+        event.add_header("FromDomain", ep.from_domain.as_deref().unwrap_or(""));
+        event.add_header("MwiFromUser", "");
+        event.add_header("RtpEngine", "asterisk");
+        event.add_header("DtlsVerify", "No");
+        event.add_header("DtlsRekey", "0");
+        event.add_header("DtlsCertFile", "");
+        event.add_header("DtlsPrivateKey", "");
+        event.add_header("DtlsCipher", "");
+        event.add_header("DtlsCaFile", "");
+        event.add_header("DtlsCaPath", "");
+        event.add_header("DtlsSetup", "active");
+        event.add_header("SrtpTag32", "false");
+        event.add_header("OneTouchRecording", "false");
+        event.add_header("Mailboxes", "");
+        event.add_header("AggregateMwi", "true");
+        event.add_header("SendDiversion", "true");
+        event.add_header("SendRpid", if ep.send_rpid { "true" } else { "false" });
+        event.add_header("SendPai", if ep.send_pai { "true" } else { "false" });
+        event.add_header("TrustIdInbound", if ep.trust_id_inbound { "true" } else { "false" });
+        event.add_header("TrustIdOutbound", "false");
+        event.add_header("CalleridTag", "");
+        event.add_header("CalleridPrivacy", "allowed_not_screened");
+        event.add_header("Callerid", ep.callerid.as_deref().unwrap_or("<unknown>"));
+        event.add_header("DisableDirectMediaOnNat", "false");
+        event.add_header("DirectMediaGlareMitigation", "none");
+        event.add_header("ConnectedLineMethod", "invite");
+        event.add_header("DirectMediaMethod", "invite");
+        event.add_header("IdentifyBy", "username");
+        event.add_header("MediaAddress", "");
+        event.add_header("OutboundProxy", "");
+        event.add_header("MohSuggest", "default");
+        event.add_header("100rel", "yes");
+        event.add_header("Timers", "yes");
+        event.add_header("TimersMinSe", "90");
+        event.add_header("TimersSessExpires", "1800");
+
+        resp.add_followup_event(event);
+        list_items += 1;
+    }
+
+    // AorDetail event
+    let aor_name = ep.aors.as_deref().unwrap_or("");
+    if !aor_name.is_empty() {
+        if let Some(aor) = cfg.find_aor(aor_name) {
+            let contacts = aor
+                .contact
+                .iter()
+                .map(|c| format!("{}/{}", aor_name, c))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let mut event = AmiEvent::new("AorDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "aor");
+            event.add_header("ObjectName", &aor.name);
+            event.add_header("Mailboxes", "");
+            event.add_header("RemoveExisting", if aor.remove_existing { "true" } else { "false" });
+            event.add_header("MaxContacts", &aor.max_contacts.to_string());
+            event.add_header("AuthenticateQualify", "false");
+            event.add_header("QualifyFrequency", &aor.qualify_frequency.to_string());
+            event.add_header("DefaultExpiration", &aor.default_expiration.to_string());
+            event.add_header("MaximumExpiration", &aor.maximum_expiration.to_string());
+            event.add_header("MinimumExpiration", &aor.minimum_expiration.to_string());
+            event.add_header("Contacts", &contacts);
+            event.add_header("TotalContacts", &aor.contact.len().to_string());
+            event.add_header("ContactsRegistered", "0");
+            event.add_header("EndpointName", endpoint_name);
+
+            resp.add_followup_event(event);
+            list_items += 1;
+        }
+    }
+
+    // AuthDetail event
+    let auth_name = ep.auth.as_deref().unwrap_or("");
+    if !auth_name.is_empty() {
+        if let Some(auth) = cfg.find_auth(auth_name) {
+            let mut event = AmiEvent::new("AuthDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "auth");
+            event.add_header("ObjectName", &auth.name);
+            event.add_header("AuthType", &auth.auth_type);
+            event.add_header("NonceLifetime", "32");
+            event.add_header("Realm", auth.realm.as_deref().unwrap_or(""));
+            event.add_header("Md5Cred", auth.md5_cred.as_deref().unwrap_or(""));
+            event.add_header("Password", &auth.password);
+            event.add_header("Username", &auth.username);
+            event.add_header("EndpointName", endpoint_name);
+
+            resp.add_followup_event(event);
+            list_items += 1;
+        }
+    }
+
+    // TransportDetail event
+    let transport_name = ep.transport.as_deref().unwrap_or("");
+    if !transport_name.is_empty() {
+        if let Some(transport) = cfg.find_transport(transport_name) {
+            let mut event = AmiEvent::new("TransportDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "transport");
+            event.add_header("ObjectName", &transport.name);
+            event.add_header("Protocol", &transport.protocol);
+            event.add_header("Bind", &transport.bind.to_string());
+            event.add_header("AsyncOperations", "1");
+            event.add_header("CaListFile", "");
+            event.add_header("CertFile", transport.cert_file.as_deref().unwrap_or(""));
+            event.add_header("PrivKeyFile", transport.priv_key_file.as_deref().unwrap_or(""));
+            event.add_header("Password", "");
+            event.add_header("ExternalSignalingAddress", transport.external_signaling_address.as_deref().unwrap_or(""));
+            event.add_header("ExternalSignalingPort", "0");
+            event.add_header("ExternalMediaAddress", transport.external_media_address.as_deref().unwrap_or(""));
+            event.add_header("Domain", "");
+            event.add_header("VerifyServer", "No");
+            event.add_header("VerifyClient", "No");
+            event.add_header("RequireClientCert", "No");
+            event.add_header("Method", "unspecified");
+            event.add_header("Cipher", "");
+            event.add_header("LocalNet", &transport.local_net.join(","));
+            event.add_header("Tos", "0");
+            event.add_header("Cos", "0");
+            event.add_header("EndpointName", endpoint_name);
+
+            resp.add_followup_event(event);
+            list_items += 1;
+        }
+    }
+
+    // IdentifyDetail events
+    for identify in &cfg.identifies {
+        if identify.endpoint.eq_ignore_ascii_case(endpoint_name) {
+            let mut event = AmiEvent::new("IdentifyDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "identify");
+            event.add_header("ObjectName", &identify.name);
+            event.add_header("Endpoint", &identify.endpoint);
+            // Format match entries: bare IPs get /255.255.255.255 suffix
+            let formatted_matches: Vec<String> = identify.matches.iter().map(|m| {
+                if m.contains('/') {
+                    m.clone()
+                } else {
+                    format!("{}/255.255.255.255", m)
+                }
+            }).collect();
+            event.add_header("Match", &formatted_matches.join(","));
+
+            resp.add_followup_event(event);
+            list_items += 1;
+        }
+    }
+
+    // ContactStatusDetail events for each static contact
+    if !aor_name.is_empty() {
+        if let Some(aor) = cfg.find_aor(aor_name) {
+            for contact_uri in &aor.contact {
+                let mut event = AmiEvent::new("ContactStatusDetail", 0x01);
+                if !action_id.is_empty() {
+                    event.add_header("ActionID", &action_id);
+                }
+                event.add_header("AOR", aor_name);
+                event.add_header("URI", contact_uri);
+                event.add_header("Status", "NonQualified");
+                event.add_header("RoundtripUsec", "N/A");
+                event.add_header("EndpointName", endpoint_name);
+
+                resp.add_followup_event(event);
+                list_items += 1;
+            }
+        }
+    }
+
+    // EndpointDetailComplete
+    let mut complete = AmiEvent::new("EndpointDetailComplete", 0x01);
+    if !action_id.is_empty() {
+        complete.add_header("ActionID", &action_id);
+    }
+    complete.add_header("EventList", "Complete");
+    complete.add_header("ListItems", &list_items.to_string());
+    resp.add_followup_event(complete);
+
+    resp
+}
+
+/// Handle PJSIPShowRegistrationsInbound AMI action.
+fn handle_pjsip_show_registrations_inbound(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let action_id = action.action_id.clone().unwrap_or_default();
+    let pjsip_config = asterisk_sip::get_global_pjsip_config();
+
+    let mut resp = AmiResponse::success("Following are Events for each Inbound registration");
+
+    if let Some(cfg) = pjsip_config {
+        let aor_count = cfg.aors.len();
+
+        for aor in &cfg.aors {
+            let contacts = aor
+                .contact
+                .iter()
+                .map(|c| format!("{}/{}", aor.name, c))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let mut event = AmiEvent::new("InboundRegistrationDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "aor");
+            event.add_header("ObjectName", &aor.name);
+            event.add_header("Mailboxes", "");
+            event.add_header("RemoveExisting", if aor.remove_existing { "true" } else { "false" });
+            event.add_header("MaxContacts", &aor.max_contacts.to_string());
+            event.add_header("AuthenticateQualify", "false");
+            event.add_header("QualifyFrequency", &aor.qualify_frequency.to_string());
+            event.add_header("DefaultExpiration", &aor.default_expiration.to_string());
+            event.add_header("MaximumExpiration", &aor.maximum_expiration.to_string());
+            event.add_header("MinimumExpiration", &aor.minimum_expiration.to_string());
+            event.add_header("Contacts", &contacts);
+
+            resp.add_followup_event(event);
+        }
+
+        let mut complete = AmiEvent::new("InboundRegistrationDetailComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("ListItems", &aor_count.to_string());
+        resp.add_followup_event(complete);
+    } else {
+        let mut complete = AmiEvent::new("InboundRegistrationDetailComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("ListItems", "0");
+        resp.add_followup_event(complete);
+    }
+
+    resp
+}
+
+/// Handle PJSIPShowRegistrationsOutbound AMI action.
+fn handle_pjsip_show_registrations_outbound(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let action_id = action.action_id.clone().unwrap_or_default();
+    let pjsip_config = asterisk_sip::get_global_pjsip_config();
+
+    let mut resp = AmiResponse::success("Following are Events for each Outbound registration");
+    let mut registered_count = 0u32;
+    let mut not_registered_count = 0u32;
+
+    if let Some(cfg) = pjsip_config {
+        let reg_count = cfg.registrations.len();
+
+        for reg in &cfg.registrations {
+            let mut event = AmiEvent::new("OutboundRegistrationDetail", 0x01);
+            if !action_id.is_empty() {
+                event.add_header("ActionID", &action_id);
+            }
+            event.add_header("ObjectType", "registration");
+            event.add_header("ObjectName", &reg.name);
+            event.add_header("OutboundAuth", reg.outbound_auth.as_deref().unwrap_or(""));
+            event.add_header("AuthRejectionPermanent", "true");
+            event.add_header("MaxRetries", "10");
+            event.add_header("ForbiddenRetryInterval", "0");
+            event.add_header("RetryInterval", &reg.retry_interval.to_string());
+            event.add_header("Expiration", &reg.expiration.to_string());
+            event.add_header("OutboundProxy", reg.outbound_proxy.as_deref().unwrap_or(""));
+            event.add_header("Transport", reg.transport.as_deref().unwrap_or(""));
+            event.add_header("ContactUser", reg.contact_user.as_deref().unwrap_or(""));
+            event.add_header("ClientUri", &reg.client_uri);
+            event.add_header("ServerUri", &reg.server_uri);
+            event.add_header("Status", "Unregistered");
+            event.add_header("NextReg", "0");
+
+            not_registered_count += 1;
+
+            // Also emit the auth detail if outbound_auth is set
+            if let Some(ref auth_name) = reg.outbound_auth {
+                if let Some(auth) = cfg.find_auth(auth_name) {
+                    let mut auth_event = AmiEvent::new("AuthDetail", 0x01);
+                    if !action_id.is_empty() {
+                        auth_event.add_header("ActionID", &action_id);
+                    }
+                    auth_event.add_header("ObjectType", "auth");
+                    auth_event.add_header("ObjectName", &auth.name);
+                    auth_event.add_header("AuthType", &auth.auth_type);
+                    auth_event.add_header("NonceLifetime", "32");
+                    auth_event.add_header("Realm", auth.realm.as_deref().unwrap_or(""));
+                    auth_event.add_header("Md5Cred", auth.md5_cred.as_deref().unwrap_or(""));
+                    auth_event.add_header("Password", &auth.password);
+                    auth_event.add_header("Username", &auth.username);
+
+                    resp.add_followup_event(event);
+                    resp.add_followup_event(auth_event);
+                    continue;
+                }
+            }
+            resp.add_followup_event(event);
+        }
+
+        let mut complete = AmiEvent::new("OutboundRegistrationDetailComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("Registered", &registered_count.to_string());
+        complete.add_header("NotRegistered", &not_registered_count.to_string());
+        resp.add_followup_event(complete);
+    } else {
+        let mut complete = AmiEvent::new("OutboundRegistrationDetailComplete", 0x01);
+        if !action_id.is_empty() {
+            complete.add_header("ActionID", &action_id);
+        }
+        complete.add_header("EventList", "Complete");
+        complete.add_header("Registered", "0");
+        complete.add_header("NotRegistered", "0");
+        resp.add_followup_event(complete);
+    }
+
+    resp
+}
+
+/// Handle PJSIPNotify AMI action.
+fn handle_pjsip_notify(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let _endpoint = action.get_header("Endpoint");
+    let _uri = action.get_header("URI");
+    let _variable = action.get_header("Variable");
+
+    info!("AMI PJSIPNotify: endpoint={:?}", _endpoint);
+
+    AmiResponse::success("PJSIPNotify accepted")
+}
+
+/// Handle PJSIPQualify AMI action.
+fn handle_pjsip_qualify(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let endpoint = match action.get_header("Endpoint") {
+        Some(e) => e,
+        None => return AmiResponse::error("Endpoint is required"),
+    };
+
+    info!("AMI PJSIPQualify: endpoint={}", endpoint);
+
+    AmiResponse::success("PJSIPQualify sent")
+}
+
+/// Format an epoch timestamp as a date string (YYYY-MM-DD).
+fn format_epoch_date(epoch: u64) -> String {
+    let days = (epoch / 86400) as u32;
+    let mut year = 1970u32;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if is_leap_year_ami(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap_year_ami(year);
+    let month_days: [u32; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1u32;
+    for &md in &month_days {
+        if remaining < md {
+            return format!("{:04}-{:02}-{:02}", year, month, remaining + 1);
+        }
+        remaining -= md;
+        month += 1;
+    }
+    format!("{:04}-{:02}-{:02}", year, 12, remaining + 1)
+}
+
+/// Format an epoch timestamp as a time string (HH:MM:SS).
+fn format_epoch_time(epoch: u64) -> String {
+    let secs_in_day = (epoch % 86400) as u32;
+    let h = secs_in_day / 3600;
+    let m = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+fn is_leap_year_ami(y: u32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// Get a simple timestamp string (seconds since epoch).
@@ -1073,15 +2020,36 @@ mod tests {
     }
 
     #[test]
-    fn test_hangup_action() {
+    fn test_hangup_action_not_found() {
         let (ctx, _reg) = make_context();
         let (mut session, _rx) = make_authenticated_session();
         let registry = ActionRegistry::new(ctx.user_registry.clone());
 
+        // Hangup on a non-existent channel should return an error
         let mut action = AmiAction::new("Hangup");
         action.set_header("Channel", "SIP/100-00000001");
         let resp = registry.dispatch(&action, &mut session, &ctx);
-        assert!(resp.success);
+        assert!(!resp.success, "Hangup of non-existent channel should fail");
+    }
+
+    #[test]
+    fn test_hangup_action_existing_channel() {
+        let (ctx, _reg) = make_context();
+        let (mut session, _rx) = make_authenticated_session();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+
+        // Allocate a real channel in the global store so Hangup can find it
+        let chan_arc = asterisk_core::channel_store::alloc_channel("SIP/test-hangup-001");
+        let chan_name = chan_arc.lock().name.clone();
+        let chan_uid = chan_arc.lock().unique_id.0.clone();
+
+        let mut action = AmiAction::new("Hangup");
+        action.set_header("Channel", &chan_name);
+        let resp = registry.dispatch(&action, &mut session, &ctx);
+        assert!(resp.success, "Hangup of existing channel should succeed");
+
+        // Clean up
+        asterisk_core::channel_store::deregister(&chan_uid);
     }
 
     #[test]

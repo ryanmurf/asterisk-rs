@@ -1,0 +1,15 @@
+[package]
+name = "pjsip-shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pjsip_rs"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+asterisk-sip = { path = "../asterisk-sip" }
+asterisk-types = { path = "../asterisk-types" }
+asterisk-codecs = { path = "../asterisk-codecs" }
+parking_lot = { workspace = true }
+libc = "0.2"

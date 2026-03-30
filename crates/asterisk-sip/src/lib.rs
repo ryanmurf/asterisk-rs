@@ -128,7 +128,7 @@ pub use ice::{IceAgent, IceCandidate, IceState, IceRole, IceMode, CandidateType,
 pub use stun::StunMessage;
 pub use turn::TurnClient;
 pub use rtp::ice_transport::IceRtpTransport;
-pub use pjsip_config::{PjsipConfig, TransportConfig, EndpointConfig, AorConfig, AuthConfig, IdentifyConfig, RegistrationConfig};
+pub use pjsip_config::{PjsipConfig, TransportConfig, EndpointConfig, AorConfig, AuthConfig, IdentifyConfig, RegistrationConfig, set_global_pjsip_config, get_global_pjsip_config};
 pub use rtp::mos::{MosEstimator, CallQuality, QualityRating, CodecType, RtpMetrics};
 pub use stir_shaken::{
     AttestationLevel, StirIdentity, PASSporT, PASSporTHeader, PASSporTPayload,

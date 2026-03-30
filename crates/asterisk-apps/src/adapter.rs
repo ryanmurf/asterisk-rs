@@ -148,13 +148,16 @@ pub fn register_all_apps() {
     use crate::answer::AppAnswer;
     use crate::dial::AppDial;
     use crate::echo::AppEcho;
+    use crate::exec::{AppExec, AppExecIf, AppTryExec};
     use crate::goto::AppGoto;
     use crate::hangup::AppHangup;
+    use crate::if_::{AppGotoIf, AppGotoIfTime, AppIf, AppElseIf, AppElse, AppEndIf};
     use crate::playback::AppPlayback;
     use crate::set::{AppMSet, AppSet};
     use crate::stack::{AppGoSub, AppGoSubIf, AppReturn, AppStackPop};
     use crate::verbose::{AppLog, AppNoOp, AppVerbose};
     use crate::wait::{AppWait, AppWaitDigit, AppWaitExten, AppWaitUntil};
+    use crate::while_::{AppWhile, AppEndWhile, AppExitWhile, AppContinueWhile};
 
     // -----------------------------------------------------------------------
     // Synchronous apps (exec takes &mut Channel / &Channel and &str)
@@ -309,6 +312,81 @@ pub fn register_all_apps() {
         "UserEvent",
         "Send a custom AMI user event",
         |channel, args| Box::pin(crate::userevent::AppUserEvent::exec(channel, args)),
+    )));
+
+    // GotoIf - async exec (conditional dialplan jump)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "GotoIf",
+        "Conditional goto",
+        |channel, args| Box::pin(AppGotoIf::exec(channel, args)),
+    )));
+
+    // GotoIfTime - async exec (time-based conditional jump)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "GotoIfTime",
+        "Time-based conditional goto",
+        |channel, args| Box::pin(AppGotoIfTime::exec(channel, args)),
+    )));
+
+    // If/ElseIf/Else/EndIf - async exec (conditional blocks)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "If",
+        "Start a conditional block",
+        |channel, args| Box::pin(AppIf::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ElseIf",
+        "Else-if block",
+        |channel, args| Box::pin(AppElseIf::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "Else",
+        "Else block",
+        |channel, args| Box::pin(AppElse::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "EndIf",
+        "End conditional block",
+        |channel, args| Box::pin(AppEndIf::exec(channel, args)),
+    )));
+
+    // While/EndWhile/ExitWhile/ContinueWhile - async exec (loop constructs)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "While",
+        "Start a while loop",
+        |channel, args| Box::pin(AppWhile::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "EndWhile",
+        "End a while loop",
+        |channel, args| Box::pin(AppEndWhile::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ExitWhile",
+        "Exit a while loop",
+        |channel, args| Box::pin(AppExitWhile::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ContinueWhile",
+        "Continue a while loop",
+        |channel, args| Box::pin(AppContinueWhile::exec(channel, args)),
+    )));
+
+    // Exec/TryExec/ExecIf - async exec (dynamic app execution)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "Exec",
+        "Executes dialplan application",
+        |channel, args| Box::pin(AppExec::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "TryExec",
+        "Executes dialplan application (non-fatal)",
+        |channel, args| Box::pin(AppTryExec::exec(channel, args)),
+    )));
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ExecIf",
+        "Conditionally execute a dialplan application",
+        |channel, args| Box::pin(AppExecIf::exec(channel, args)),
     )));
 
     // Register the remaining apps as stubs (these will be wired incrementally)

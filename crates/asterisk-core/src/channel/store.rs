@@ -118,6 +118,42 @@ pub fn alloc_channel(name: impl Into<String>) -> Arc<Mutex<Channel>> {
     arc
 }
 
+/// Register an existing `Channel` in the global store.
+///
+/// This is used when a channel was created by a channel driver (e.g.
+/// `LocalChannelDriver::request_pair()`) and needs to be registered in the
+/// global store.  Assigns a unique ID if the channel still has its default
+/// UUID-based ID, then emits a `Newchannel` AMI event.
+///
+/// Returns the `Arc<Mutex<Channel>>` that is now tracked in the store.
+pub fn register_existing_channel(mut channel: Channel) -> Arc<Mutex<Channel>> {
+    // Assign a proper epoch.counter unique ID (overwrite the UUID default)
+    let uid = generate_uniqueid();
+    let name = channel.name.clone();
+    channel.unique_id = super::ChannelId(uid.clone());
+    channel.linkedid = uid.clone();
+
+    let state_num = (channel.state as u8).to_string();
+    let state_desc = channel.state.to_string();
+    let caller_num = channel.caller.id.number.number.clone();
+
+    let arc = Arc::new(Mutex::new(channel));
+    CHANNEL_STORE.register(Arc::clone(&arc));
+    tracing::debug!(channel = %name, unique_id = %uid, "existing channel registered");
+
+    // Emit Newchannel AMI event
+    super::publish_channel_event("Newchannel", &[
+        ("Channel", &name),
+        ("ChannelState", &state_num),
+        ("ChannelStateDesc", &state_desc),
+        ("CallerIDNum", &caller_num),
+        ("Uniqueid", &uid),
+        ("Linkedid", &uid),
+    ]);
+
+    arc
+}
+
 /// Look up a channel by its channel name (e.g. `SIP/alice-00000001`).
 pub fn find_by_name(name: &str) -> Option<Arc<Mutex<Channel>>> {
     CHANNEL_STORE.find_by_name(name)

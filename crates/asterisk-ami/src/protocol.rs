@@ -118,6 +118,13 @@ pub struct AmiResponse {
     pub headers: HashMap<String, String>,
     /// Multi-line output data (for actions like "Command").
     pub output: Vec<String>,
+    /// Custom value for the Response header (e.g., "Goodbye" for Logoff).
+    /// When `None`, defaults to "Success" or "Error" based on `self.success`.
+    pub response_value: Option<String>,
+    /// Events to emit after this response is sent.
+    /// These are serialized and sent to the client immediately after the
+    /// response message, enabling list-style AMI actions.
+    pub followup_events: Vec<AmiEvent>,
 }
 
 impl AmiResponse {
@@ -129,6 +136,8 @@ impl AmiResponse {
             action_id: None,
             headers: HashMap::new(),
             output: Vec::new(),
+            response_value: None,
+            followup_events: Vec::new(),
         }
     }
 
@@ -140,7 +149,29 @@ impl AmiResponse {
             action_id: None,
             headers: HashMap::new(),
             output: Vec::new(),
+            response_value: None,
+            followup_events: Vec::new(),
         }
+    }
+
+    /// Set a custom value for the `Response:` header.
+    ///
+    /// By default, responses use "Success" or "Error". This allows
+    /// special responses like "Goodbye" for Logoff.
+    pub fn with_response_value(mut self, value: impl Into<String>) -> Self {
+        self.response_value = Some(value.into());
+        self
+    }
+
+    /// Attach followup events to be sent after this response.
+    pub fn with_followup_events(mut self, events: Vec<AmiEvent>) -> Self {
+        self.followup_events = events;
+        self
+    }
+
+    /// Add a single followup event.
+    pub fn add_followup_event(&mut self, event: AmiEvent) {
+        self.followup_events.push(event);
     }
 
     /// Set the action ID on the response.
@@ -163,7 +194,9 @@ impl AmiResponse {
 
     /// Serialize this response to AMI wire format.
     pub fn serialize(&self) -> String {
-        let mut buf = if self.success {
+        let mut buf = if let Some(ref custom) = self.response_value {
+            format!("Response: {}\r\n", custom)
+        } else if self.success {
             "Response: Success\r\n".to_string()
         } else {
             "Response: Error\r\n".to_string()
@@ -192,6 +225,12 @@ impl AmiResponse {
         }
 
         buf.push_str("\r\n");
+
+        // Append any followup events (for list-style actions like PJSIPShowEndpoints)
+        for event in &self.followup_events {
+            buf.push_str(&event.serialize());
+        }
+
         buf
     }
 }

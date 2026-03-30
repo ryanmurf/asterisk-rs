@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 asterisk-types = { workspace = true }
 asterisk-core = { workspace = true }
+asterisk-sip = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }

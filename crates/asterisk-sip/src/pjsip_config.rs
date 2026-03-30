@@ -382,6 +382,27 @@ pub fn load_pjsip_config_from_str(content: &str) -> Result<PjsipConfig, asterisk
 }
 
 // ---------------------------------------------------------------------------
+// Global PJSIP config store
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, LazyLock};
+use parking_lot::RwLock;
+
+/// Global PJSIP configuration, set at startup and read by AMI actions.
+static GLOBAL_PJSIP_CONFIG: LazyLock<RwLock<Option<Arc<PjsipConfig>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Store the loaded PJSIP config globally so AMI handlers can read it.
+pub fn set_global_pjsip_config(config: PjsipConfig) {
+    *GLOBAL_PJSIP_CONFIG.write() = Some(Arc::new(config));
+}
+
+/// Retrieve the global PJSIP config (if loaded).
+pub fn get_global_pjsip_config() -> Option<Arc<PjsipConfig>> {
+    GLOBAL_PJSIP_CONFIG.read().clone()
+}
+
+// ---------------------------------------------------------------------------
 // Section parsers
 // ---------------------------------------------------------------------------
 
@@ -525,7 +546,13 @@ fn parse_aor(cat: &asterisk_config::Category) -> AorConfig {
     aor.support_path = parse_bool(get_last_variable(cat,"support_path"), false);
 
     for val in get_all_variables(cat,"contact") {
-        aor.contact.push(val.to_string());
+        // Contact values can be comma-separated (e.g., "sip:a@1.2.3.4,sip:b@5.6.7.8")
+        for contact in val.split(',') {
+            let contact = contact.trim();
+            if !contact.is_empty() {
+                aor.contact.push(contact.to_string());
+            }
+        }
     }
 
     aor

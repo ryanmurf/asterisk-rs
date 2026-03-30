@@ -296,8 +296,23 @@ impl CliCommand for CmdCoreShowChannels {
             "Channel", "Location", "State", "Application(Data)"
         ));
         lines.push("-".repeat(95));
-        lines.push("0 active channel(s)".to_string());
-        lines.push("0 active call(s)".to_string());
+
+        let channels = asterisk_core::channel_store::all_channels();
+        for chan_arc in &channels {
+            let chan = chan_arc.lock();
+            let location = format!("{}@{}:{}", chan.exten, chan.context, chan.priority);
+            lines.push(format!(
+                "{:<40} {:<20} {:<15} {:<20}",
+                chan.name,
+                location,
+                chan.state,
+                ""
+            ));
+        }
+
+        let count = channels.len();
+        lines.push(format!("{} active channel(s)", count));
+        lines.push(format!("{} active call(s)", count));
         lines.push("0 call(s) processed".to_string());
         lines
     }
@@ -314,7 +329,8 @@ impl CliCommand for CmdCoreShowBridges {
             "Bridge-ID", "Type", "Channels", "Technology"
         ));
         lines.push("-".repeat(95));
-        lines.push("0 active bridge(s)".to_string());
+        let count = asterisk_core::bridge_count();
+        lines.push(format!("{} active bridge(s)", count));
         lines
     }
 }
@@ -358,12 +374,54 @@ impl CliCommand for CmdDialplanShow {
     fn command(&self) -> &str { "dialplan show" }
     fn description(&self) -> &str { "Show loaded dialplan" }
     fn execute(&self, _args: &[&str], _state: &ServerState) -> Vec<String> {
-        vec![
-            "[ Context 'default' created by 'pbx_config' ]".to_string(),
-            "  (no extensions loaded)".to_string(),
-            String::new(),
-            "-= 0 extension(s) in 1 context(s). =-".to_string(),
-        ]
+        let mut lines = Vec::new();
+        let mut total_ext = 0u32;
+        let mut total_ctx = 0u32;
+
+        if let Some(dialplan) = asterisk_core::get_global_dialplan() {
+            let mut ctx_names: Vec<&String> = dialplan.contexts.keys().collect();
+            ctx_names.sort();
+            for ctx_name in ctx_names {
+                let ctx = &dialplan.contexts[ctx_name];
+                total_ctx += 1;
+                lines.push(format!("[ Context '{}' created by 'pbx_config' ]", ctx.name));
+                if ctx.extensions.is_empty() {
+                    lines.push("  (no extensions loaded)".to_string());
+                } else {
+                    let mut ext_names: Vec<&String> = ctx.extensions.keys().collect();
+                    ext_names.sort();
+                    for ext_name in ext_names {
+                        let ext = &ctx.extensions[ext_name];
+                        total_ext += 1;
+                        let mut prio_nums: Vec<i32> = ext.priorities.keys().cloned().collect();
+                        prio_nums.sort();
+                        for prio_num in prio_nums {
+                            let prio = &ext.priorities[&prio_num];
+                            let label_str = prio.label.as_deref().unwrap_or("");
+                            if label_str.is_empty() {
+                                lines.push(format!(
+                                    "  '{}' =>        {}. {}({})",
+                                    ext.name, prio.priority, prio.app, prio.app_data,
+                                ));
+                            } else {
+                                lines.push(format!(
+                                    "  '{}' =>        {}. [{}] {}({})",
+                                    ext.name, prio.priority, label_str, prio.app, prio.app_data,
+                                ));
+                            }
+                        }
+                    }
+                }
+                lines.push(String::new());
+            }
+        } else {
+            lines.push("[ Context 'default' created by 'pbx_config' ]".to_string());
+            lines.push("  (no extensions loaded)".to_string());
+            lines.push(String::new());
+        }
+
+        lines.push(format!("-= {} extension(s) in {} context(s). =-", total_ext, total_ctx));
+        lines
     }
 }
 
@@ -733,6 +791,7 @@ async fn handle_control_connection(
 /// Connect to a running instance via the Unix control socket and execute a command.
 ///
 /// This is used when `-r -x "command"` is passed.
+/// Retries up to 3 times with 500ms delay if the socket is not yet ready.
 async fn remote_execute(
     config_file: Option<&str>,
     command: &str,
@@ -740,27 +799,51 @@ async fn remote_execute(
     let dirs = resolve_dirs(config_file);
     let socket_path = std::path::Path::new(&dirs.run_dir).join("asterisk.ctl");
 
-    let stream = tokio::net::UnixStream::connect(&socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
+    // Retry connection up to 10 times with exponential backoff starting at 200ms.
+    // The daemon may not have created the socket file yet if it was just started.
+    let mut last_err = None;
+    let max_attempts = 10;
+    let mut delay_ms = 200u64;
+    for attempt in 0..max_attempts {
+        match tokio::net::UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                let (reader, mut writer) = stream.into_split();
 
-    // Send the command
-    writer.write_all(command.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+                // Send the command
+                writer.write_all(command.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
 
-    // Read the response
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(_) => break,
+                // Read the response
+                let mut buf_reader = BufReader::new(reader);
+                let mut response = String::new();
+                loop {
+                    let mut line = String::new();
+                    match buf_reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => response.push_str(&line),
+                        Err(_) => break,
+                    }
+                }
+
+                print!("{}", response);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < max_attempts - 1 {
+                    debug!(
+                        "Unix socket connect attempt {} failed, retrying in {}ms...",
+                        attempt + 1,
+                        delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms = (delay_ms * 2).min(2000); // cap at 2s
+                }
+            }
         }
     }
 
-    print!("{}", response);
-    Ok(())
+    Err(Box::new(last_err.unwrap()))
 }
 
 // ============================================================================
@@ -1277,6 +1360,11 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
             None
         }
     };
+
+    // Store PJSIP config globally so AMI actions can read it
+    if let Some(ref cfg) = pjsip_config {
+        asterisk_sip::set_global_pjsip_config(cfg.clone());
+    }
 
     // Determine SIP bind address from pjsip.conf transports or use default
     let sip_bind: SocketAddr = pjsip_config

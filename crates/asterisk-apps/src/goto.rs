@@ -86,8 +86,30 @@ impl AppGoto {
             target.priority,
         );
 
-        // In a real implementation:
-        // ast_explicit_goto(channel, context, extension, priority)
+        // Set the channel's dialplan location so pbx_run continues
+        // from the new position.
+        if let Some(ctx) = &target.context {
+            channel.context = ctx.clone();
+        }
+        if let Some(ext) = &target.extension {
+            channel.exten = ext.clone();
+        }
+
+        // Parse priority: can be a number or a label like "n" (next)
+        let priority: i32 = match target.priority.parse::<i32>() {
+            Ok(p) => p,
+            Err(_) => {
+                // Label-based priority -- "n" means next, for now treat
+                // unknown labels as priority 1
+                if target.priority.eq_ignore_ascii_case("n") {
+                    channel.priority + 1
+                } else {
+                    warn!("Goto: unknown priority label '{}', using 1", target.priority);
+                    1
+                }
+            }
+        };
+        channel.priority = priority;
 
         PbxExecResult::Success
     }

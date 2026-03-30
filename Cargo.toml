@@ -17,6 +17,7 @@ members = [
     "crates/asterisk-test-framework",
     "crates/asterisk-integration-tests",
     "crates/asterisk-utils",
+    "crates/pjsip-shim",
 ]
 resolver = "2"
 

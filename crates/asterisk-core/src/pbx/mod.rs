@@ -36,6 +36,24 @@ pub fn get_global_dialplan() -> Option<Arc<Dialplan>> {
     GLOBAL_DIALPLAN.read().clone()
 }
 
+// ---------------------------------------------------------------------------
+// Global channel variables (like GLOBAL() function in Asterisk)
+// ---------------------------------------------------------------------------
+
+/// Global channel variables accessible via GetVar/SetVar AMI actions.
+static GLOBAL_VARIABLES: LazyLock<parking_lot::RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+/// Set a global variable.
+pub fn set_global_variable(name: String, value: String) {
+    GLOBAL_VARIABLES.write().insert(name, value);
+}
+
+/// Get a global variable.
+pub fn get_global_variable(name: &str) -> Option<String> {
+    GLOBAL_VARIABLES.read().get(name).cloned()
+}
+
 /// Result of dialplan application execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PbxResult {
