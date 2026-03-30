@@ -274,3 +274,46 @@ pub unsafe extern "C" fn pj_timer_heap_set_max_timed_out_per_poll(
     let inner = &mut *(heap as *mut TimerHeapInner);
     inner.max_timed_out = count;
 }
+
+// ---------------------------------------------------------------------------
+// Additional timer heap functions needed by pjlib-test
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_timer_heap_mem_size(_count: usize) -> usize {
+    // Return a reasonable fixed size
+    std::mem::size_of::<TimerHeapInner>() + 256
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_timer_heap_schedule_dbg(
+    heap: *mut pj_timer_heap_t,
+    entry: *mut pj_timer_entry,
+    delay: *const pj_time_val,
+    _src_file: *const libc::c_char,
+    _src_line: i32,
+) -> pj_status_t {
+    pj_timer_heap_schedule(heap, entry, delay)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_timer_heap_schedule_w_grp_lock_dbg(
+    heap: *mut pj_timer_heap_t,
+    entry: *mut pj_timer_entry,
+    delay: *const pj_time_val,
+    id_val: i32,
+    grp_lock: *mut libc::c_void,
+    _src_file: *const libc::c_char,
+    _src_line: i32,
+) -> pj_status_t {
+    pj_timer_heap_schedule_w_grp_lock(heap, entry, delay, id_val, grp_lock)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_timer_heap_set_lock(
+    _heap: *mut pj_timer_heap_t,
+    _lock: *mut libc::c_void,
+    _auto_del: i32,
+) {
+    // no-op: our timer heap doesn't need an external lock
+}

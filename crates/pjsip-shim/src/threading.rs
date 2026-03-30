@@ -195,6 +195,54 @@ pub unsafe extern "C" fn pj_thread_sleep(msec: u32) -> pj_status_t {
     PJ_SUCCESS
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pj_thread_resume(_thread: *mut pj_thread_t) -> pj_status_t {
+    // pjproject threads are not suspendable in our implementation -- no-op
+    PJ_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_thread_attach(
+    _pool: *mut pj_pool_t,
+    name: *const libc::c_char,
+    p_thread: *mut *mut pj_thread_t,
+) -> pj_status_t {
+    if p_thread.is_null() {
+        return PJ_EINVAL;
+    }
+    let name_str = if name.is_null() {
+        "attached".to_string()
+    } else {
+        std::ffi::CStr::from_ptr(name)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let inner = Box::new(ThreadInner {
+        name: name_str,
+        handle: None,
+        _registered: true,
+    });
+    let ptr = Box::into_raw(inner) as *mut pj_thread_t;
+    CURRENT_THREAD.with(|c| {
+        c.set(ptr as usize);
+    });
+    *p_thread = ptr;
+    PJ_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_thread_unregister() -> pj_status_t {
+    CURRENT_THREAD.with(|c| {
+        let ptr = c.get();
+        if ptr != 0 {
+            // Don't free -- the thread descriptor memory may be stack-allocated
+            // by the caller. Just clear the thread-local.
+            c.set(0);
+        }
+    });
+    PJ_SUCCESS
+}
+
 // ============================================================================
 // Mutex
 // ============================================================================

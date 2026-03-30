@@ -760,3 +760,126 @@ pub unsafe extern "C" fn pj_sockaddr_synthesize(
     pj_sockaddr_cp(dst, src);
     PJ_SUCCESS
 }
+
+// ---------------------------------------------------------------------------
+// pj_sock_bind_in -- convenience bind with addr/port as u32/u16
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_sock_bind_in(
+    sock: pj_sock_t,
+    addr: u32,
+    port: u16,
+) -> pj_status_t {
+    if sock < 0 {
+        return PJ_EINVAL;
+    }
+    let mut sa: libc::sockaddr_in = std::mem::zeroed();
+    sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    sa.sin_family = libc::AF_INET as u8;
+    sa.sin_port = port.to_be();
+    sa.sin_addr.s_addr = addr;
+    let rc = libc::bind(
+        sock as i32,
+        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+    );
+    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+}
+
+// ---------------------------------------------------------------------------
+// pj_sock_socketpair
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_sock_socketpair(
+    family: i32,
+    type_: i32,
+    protocol: i32,
+    sv: *mut [pj_sock_t; 2],
+) -> pj_status_t {
+    if sv.is_null() {
+        return PJ_EINVAL;
+    }
+    let mut raw_sv: [i32; 2] = [0; 2];
+    let rc = libc::socketpair(family, type_, protocol, raw_sv.as_mut_ptr());
+    if rc != 0 {
+        return PJ_EINVAL;
+    }
+    (*sv)[0] = raw_sv[0] as pj_sock_t;
+    (*sv)[1] = raw_sv[1] as pj_sock_t;
+    PJ_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Byte-order helpers
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_ntohs(v: u16) -> u16 {
+    u16::from_be(v)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_htons(v: u16) -> u16 {
+    v.to_be()
+}
+
+// ---------------------------------------------------------------------------
+// pj_inet_addr / pj_inet_addr2 -- shorthand for parsing dotted-quad
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_inet_addr(cp: *const pj_str_t) -> pj_in_addr {
+    let mut result = pj_in_addr { s_addr: 0 };
+    if !cp.is_null() {
+        let _ = pj_inet_aton(cp, &mut result);
+    }
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_inet_addr2(cp: *const libc::c_char) -> pj_in_addr {
+    let mut result = pj_in_addr { s_addr: 0 };
+    if !cp.is_null() {
+        let len = libc::strlen(cp);
+        let s = pj_str_t { ptr: cp as *mut _, slen: len as isize };
+        let _ = pj_inet_aton(&s, &mut result);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// OS error helpers
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_get_os_error() -> pj_status_t {
+    let e = *libc::__error(); // macOS errno
+    if e == 0 { PJ_SUCCESS } else { 120000 + e }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_get_netos_error() -> pj_status_t {
+    pj_get_os_error()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_set_os_error(code: pj_status_t) {
+    if code == PJ_SUCCESS {
+        *libc::__error() = 0;
+    } else if code >= 120000 {
+        *libc::__error() = code - 120000;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pj_ioqueue_get_os_handle
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_ioqueue_get_os_handle(
+    _key: *mut libc::c_void,
+) -> pj_sock_t {
+    -1
+}

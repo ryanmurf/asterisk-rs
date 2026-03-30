@@ -78,6 +78,27 @@ pub unsafe extern "C" fn pj_log_add_indent(indent: i32) {
     LOG_INDENT.fetch_add(indent, Ordering::Relaxed);
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn pj_log_get_indent() -> i32 {
+    LOG_INDENT.load(Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_log_set_indent(indent: i32) {
+    LOG_INDENT.store(indent, Ordering::Relaxed);
+}
+
+/// Generic pj_perror (non-level-specific).  C signature is variadic.
+#[no_mangle]
+pub unsafe extern "C" fn pj_perror(
+    level: i32,
+    sender: *const libc::c_char,
+    _status: i32,
+    fmt: *const libc::c_char,
+) {
+    do_log(level, sender, fmt);
+}
+
 // ---------------------------------------------------------------------------
 // pj_log_1 .. pj_log_5
 //

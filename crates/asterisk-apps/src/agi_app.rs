@@ -167,42 +167,115 @@ impl AppAgi {
     ) -> PbxExecResult {
         info!("AGI: executing standard AGI script '{}'", request);
 
-        // Build the AGI environment
-        let env = AgiEnvironment::from_channel(channel, request, args);
+        // Resolve the script path.
+        // Check common AGI search paths.
+        let script_path = if request.starts_with('/') {
+            std::path::PathBuf::from(request)
+        } else {
+            // Search in the channel's AGI directory (astagidir)
+            // or the current working directory
+            let agi_dir = channel.get_variable("ASTAGIDIR")
+                .map(|s| std::path::PathBuf::from(s))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            agi_dir.join(request)
+        };
 
-        // In a full implementation, we would:
-        // 1. Spawn the script as a child process
-        // 2. Pipe stdin/stdout to the AGI session
-        // 3. Run the command loop
-        //
-        // For the test suite, we simulate the session:
-
-        // Create a simulated session using in-memory buffers
-        let input_data = Vec::new();
-        let reader = std::io::BufReader::new(std::io::Cursor::new(input_data));
-        let mut output_data = Vec::new();
-
-        {
-            let mut session = AgiSession::new(
-                reader,
-                &mut output_data,
-                env,
-                AgiMode::Standard,
-            );
-
-            // Send environment
-            if let Err(e) = session.send_environment() {
-                error!("AGI: failed to send environment: {}", e);
-                return PbxExecResult::Failed;
-            }
-
-            // In a real implementation, we would loop reading commands
-            // from the child process. Since there's no actual script,
-            // we just finish.
+        // Check if the script exists
+        if !script_path.exists() {
+            warn!("AGI: script '{}' not found at '{}'", request, script_path.display());
+            channel.set_variable("AGISTATUS", "NOTFOUND");
+            return PbxExecResult::Failed;
         }
 
-        debug!("AGI: standard AGI script '{}' completed", request);
-        PbxExecResult::Success
+        // Try to spawn the script as a child process
+        let _env = AgiEnvironment::from_channel(channel, request, args);
+
+        match tokio::process::Command::new(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Send AGI environment to the script's stdin
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let env_lines = _env.to_protocol_lines();
+                    let _ = stdin.write_all(env_lines.as_bytes()).await;
+                    let _ = stdin.write_all(b"\n").await;
+                    // Drop stdin to signal EOF if script doesn't read commands
+                    drop(stdin);
+                }
+
+                // Read commands from the script's stdout and execute them
+                if let Some(stdout) = child.stdout.take() {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    let mut reader = BufReader::new(stdout);
+                    let registry = AgiCommandRegistry::new();
+
+                    loop {
+                        let mut line = String::new();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            reader.read_line(&mut line),
+                        ).await {
+                            Ok(Ok(0)) => {
+                                debug!("AGI: script EOF");
+                                break;
+                            }
+                            Ok(Ok(_)) => {
+                                let line = line.trim().to_string();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                debug!("AGI: script command: {}", line);
+                                let (cmd, cmd_args) = parse_agi_command(&line, &registry);
+                                let _response = handle_agi_command(&cmd, &cmd_args, channel, &registry);
+                                // In a full implementation, we'd write the response back
+                                if cmd.eq_ignore_ascii_case("HANGUP") {
+                                    break;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                error!("AGI: script read error: {}", e);
+                                break;
+                            }
+                            Err(_) => {
+                                warn!("AGI: script command timeout");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Wait for the child process to finish
+                match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(status)) => {
+                        debug!("AGI: script exited with status {}", status);
+                        if status.success() {
+                            PbxExecResult::Success
+                        } else {
+                            PbxExecResult::Failed
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        error!("AGI: failed to wait for script: {}", e);
+                        PbxExecResult::Failed
+                    }
+                    Err(_) => {
+                        warn!("AGI: script did not exit in time, killing");
+                        let _ = child.kill().await;
+                        PbxExecResult::Failed
+                    }
+                }
+            }
+            Err(e) => {
+                error!("AGI: failed to spawn script '{}': {}", request, e);
+                // For permission errors or interpreter issues, set FAILURE
+                channel.set_variable("AGISTATUS", "FAILURE");
+                PbxExecResult::Failed
+            }
+        }
     }
 
     /// Execute an AsyncAGI session (controlled via AMI).

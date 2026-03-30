@@ -172,6 +172,31 @@ pub unsafe extern "C" fn pj_strdup2(
     (*dst).slen = len as isize;
 }
 
+/// Duplicate a C string into pool memory as a pj_str_t with a trailing null byte.
+#[no_mangle]
+pub unsafe extern "C" fn pj_strdup2_with_null(
+    pool: *mut pj_pool_t,
+    dst: *mut pj_str_t,
+    src: *const libc::c_char,
+) {
+    if dst.is_null() || src.is_null() {
+        if !dst.is_null() {
+            (*dst).ptr = std::ptr::null_mut();
+            (*dst).slen = 0;
+        }
+        return;
+    }
+    let len = libc::strlen(src);
+    let buf = pj_pool_alloc(pool, len + 1) as *mut libc::c_char;
+    if buf.is_null() {
+        return;
+    }
+    libc::memcpy(buf as *mut _, src as *const _, len);
+    *buf.add(len) = 0;
+    (*dst).ptr = buf;
+    (*dst).slen = len as isize;
+}
+
 /// Duplicate a pj_str_t into pool memory with a trailing null byte.
 #[no_mangle]
 pub unsafe extern "C" fn pj_strdup_with_null(

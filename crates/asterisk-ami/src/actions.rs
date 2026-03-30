@@ -441,6 +441,8 @@ fn handle_originate(
         .get_header("Async")
         .map(|a| a.eq_ignore_ascii_case("true") || a == "1" || a.eq_ignore_ascii_case("yes"))
         .unwrap_or(false);
+    let application = action.get_header("Application").map(|a| a.to_string());
+    let app_data = action.get_header("Data").unwrap_or("").to_string();
 
     // Collect any Variable headers (key=value pairs)
     let variables: Vec<(String, String)> = action
@@ -568,7 +570,7 @@ fn handle_originate(
             ch.state = call_channel.state;
         }
 
-        // Create a tokio::sync::Mutex copy for pbx_run on ;1
+        // Create a tokio::sync::Mutex copy for execution on ;1
         let pbx_channel = {
             let guard = store_chan.lock();
             let mut ch = asterisk_core::Channel::new(&guard.name);
@@ -584,14 +586,31 @@ fn handle_originate(
             std::sync::Arc::new(tokio::sync::Mutex::new(ch))
         };
 
-        info!("Originate: starting pbx_run for ;1 channel {}", chan_name);
-        let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
-        info!("Originate: pbx_run finished for channel {} result={:?}", chan_name, result);
-
-        // Emit OriginateResponse event
-        let response_str = match result {
-            asterisk_core::PbxRunResult::Success => "Success",
-            _ => "Failure",
+        let response_str = if let Some(ref app_name) = application {
+            // Application mode: execute the application directly instead of dialplan
+            info!("Originate: running app '{}({})' on ;1 channel {}", app_name, app_data, chan_name);
+            use asterisk_core::pbx::app_registry::APP_REGISTRY;
+            if let Some(app) = APP_REGISTRY.find(app_name) {
+                let mut ch = pbx_channel.lock().await;
+                let result = app.execute(&mut ch, &app_data).await;
+                info!("Originate: app '{}' finished for channel {} result={:?}", app_name, chan_name, result);
+                match result {
+                    asterisk_core::pbx::PbxResult::Success => "Success",
+                    _ => "Failure",
+                }
+            } else {
+                warn!("Originate: application '{}' not found", app_name);
+                "Failure"
+            }
+        } else {
+            // Context/Exten mode: run through the dialplan
+            info!("Originate: starting pbx_run for ;1 channel {}", chan_name);
+            let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
+            info!("Originate: pbx_run finished for channel {} result={:?}", chan_name, result);
+            match result {
+                asterisk_core::PbxRunResult::Success => "Success",
+                _ => "Failure",
+            }
         };
         crate::event_bus::publish_event(
             crate::protocol::AmiEvent::new("OriginateResponse", 0x02)

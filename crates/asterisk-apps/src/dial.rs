@@ -1094,24 +1094,24 @@ impl AppDial {
             use asterisk_core::channel::tech_registry::TECH_REGISTRY;
             let driver = TECH_REGISTRY.find(&dest.technology);
 
-            let mut outbound = if let Some(ref _driver) = driver {
+            let mut outbound = if let Some(ref driver) = driver {
                 // Driver found -- use driver.request() to create the channel.
-                // The driver's request() is async and needs &self + &caller, but
-                // caller is already &mut-borrowed for us. Create the channel with
-                // the proper tech/resource name so the driver is associated.
-                //
-                // In a fully-wired implementation this becomes:
-                //   _driver.request(&dest.resource, Some(caller)).await
-                //       .unwrap_or_else(|_| Channel::new(chan_name.clone()));
-                //
-                // For now create the channel directly -- the driver lookup proves
-                // the technology is registered and available.
-                let mut ch = Channel::new(chan_name.clone());
-                debug!(
-                    "Dial: channel technology '{}' found in TECH_REGISTRY",
-                    dest.technology
-                );
-                ch
+                match driver.request(&dest.resource, Some(caller)).await {
+                    Ok(ch) => {
+                        debug!(
+                            "Dial: channel technology '{}' created channel via request()",
+                            dest.technology
+                        );
+                        ch
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Dial: driver.request() failed for {}/{}: {}, creating channel directly",
+                            dest.technology, dest.resource, e
+                        );
+                        Channel::new(chan_name.clone())
+                    }
+                }
             } else {
                 warn!(
                     "Dial: channel technology '{}' not found in TECH_REGISTRY, creating channel directly",
@@ -1155,21 +1155,27 @@ impl AppDial {
                 // ast_app_exec_sub(Some(caller), &mut outbound, &loc.to_gosub_args(), true)
             }
 
-            // Publish DialBegin AMI event
+            // Publish DialBegin AMI event (Asterisk 13+ format)
             {
                 let dest_chan = outbound.lock().await;
                 let dest_name = dest_chan.name.clone();
                 let dest_uid = dest_chan.unique_id.0.clone();
+                let dest_linkedid = dest_chan.linkedid.clone();
                 drop(dest_chan);
-                asterisk_core::channel::publish_channel_event("Dial", &[
-                    ("SubEvent", "Begin"),
+                let caller_connected_num = caller.connected.id.number.number.clone();
+                let caller_connected_name = caller.connected.id.name.name.clone();
+                asterisk_core::channel::publish_channel_event("DialBegin", &[
                     ("Channel", &caller.name),
-                    ("Destination", &dest_name),
+                    ("DestChannel", &dest_name),
                     ("CallerIDNum", &caller.caller.id.number.number),
                     ("CallerIDName", &caller.caller.id.name.name),
+                    ("ConnectedLineNum", &caller_connected_num),
+                    ("ConnectedLineName", &caller_connected_name),
                     ("Uniqueid", &caller.unique_id.0),
+                    ("Linkedid", &caller.linkedid),
                     ("DestUniqueid", &dest_uid),
-                    ("Dialstring", &chan_name),
+                    ("DestLinkedid", &dest_linkedid),
+                    ("DialString", &dest.resource),
                 ]);
             }
             debug!(
@@ -1191,17 +1197,42 @@ impl AppDial {
             return (PbxExecResult::Failed, DialStatus::ChanUnavail);
         }
 
-        // Initiate calls on all outbound channels
-        //
-        // In a full implementation, this would call driver.call() for each:
-        //   driver.call(&mut outbound_chan, &dest.resource, timeout_ms).await;
-        for leg in &mut legs {
-            let mut chan = leg.channel.lock().await;
-            chan.state = ChannelState::Dialing;
-            debug!(
-                "Dial: initiated call to {}/{}",
-                leg.destination.technology, leg.destination.resource
-            );
+        // Initiate calls on all outbound channels via their channel drivers
+        {
+            use asterisk_core::channel::tech_registry::TECH_REGISTRY;
+            for leg in &mut legs {
+                let driver = TECH_REGISTRY.find(&leg.destination.technology);
+                let timeout_ms = dial_args.timeout.as_millis() as i32;
+
+                if let Some(ref driver) = driver {
+                    let mut chan = leg.channel.lock().await;
+                    match driver.call(&mut chan, &leg.destination.resource, timeout_ms).await {
+                        Ok(()) => {
+                            debug!(
+                                "Dial: driver.call() succeeded for {}/{}",
+                                leg.destination.technology, leg.destination.resource
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Dial: driver.call() failed for {}/{}: {}",
+                                leg.destination.technology, leg.destination.resource, e
+                            );
+                            chan.hangup_cause = HangupCause::SubscriberAbsent;
+                            chan.state = ChannelState::Down;
+                            drop(chan);
+                            leg.state = DialLegState::HungUp;
+                        }
+                    }
+                } else {
+                    let mut chan = leg.channel.lock().await;
+                    chan.state = ChannelState::Dialing;
+                    debug!(
+                        "Dial: no driver for {}/{}, setting state to Dialing",
+                        leg.destination.technology, leg.destination.resource
+                    );
+                }
+            }
         }
 
         // If caller requested ringing indication or music on hold, set it up
@@ -1405,19 +1436,27 @@ impl AppDial {
             }
         };
 
-        // Publish Dial SubEvent: End for all legs
+        // Publish DialEnd event for all legs (Asterisk 13+ format)
         for leg in &legs {
             let chan = leg.channel.lock().await;
             let dest_name = chan.name.clone();
             let dest_uid = chan.unique_id.0.clone();
+            let dest_linkedid = chan.linkedid.clone();
+            let connected_num = chan.connected.id.number.number.clone();
+            let connected_name = chan.connected.id.name.name.clone();
             drop(chan);
-            asterisk_core::channel::publish_channel_event("Dial", &[
-                ("SubEvent", "End"),
+            asterisk_core::channel::publish_channel_event("DialEnd", &[
                 ("Channel", &caller.name),
-                ("Destination", &dest_name),
-                ("DialStatus", dial_status.as_str()),
+                ("DestChannel", &dest_name),
+                ("CallerIDNum", &caller.caller.id.number.number),
+                ("CallerIDName", &caller.caller.id.name.name),
+                ("ConnectedLineNum", &connected_num),
+                ("ConnectedLineName", &connected_name),
                 ("Uniqueid", &caller.unique_id.0),
+                ("Linkedid", &caller.linkedid),
                 ("DestUniqueid", &dest_uid),
+                ("DestLinkedid", &dest_linkedid),
+                ("DialStatus", dial_status.as_str()),
             ]);
         }
 

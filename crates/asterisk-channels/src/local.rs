@@ -100,9 +100,9 @@ impl LocalChannelDriver {
         let (extension, context) = match ext_context.split_once('@') {
             Some((ext, ctx)) => (ext.to_string(), ctx.to_string()),
             None => {
-                return Err(AsteriskError::InvalidArgument(
-                    "Local channel destination must be extension@context".into(),
-                ))
+                // No @context specified -- default to "default" context
+                // This matches C Asterisk behavior
+                (ext_context.to_string(), "default".to_string())
             }
         };
 

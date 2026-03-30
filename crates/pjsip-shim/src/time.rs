@@ -241,3 +241,31 @@ pub unsafe extern "C" fn pj_get_timestamp_freq(freq: *mut pj_timestamp) -> pj_st
     (*freq).u64_val = 1_000_000_000; // nanosecond frequency
     PJ_SUCCESS
 }
+
+// ---------------------------------------------------------------------------
+// Additional time functions needed by pjlib-test
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_elapsed_cycle(
+    start: *const pj_timestamp,
+    stop: *const pj_timestamp,
+) -> u32 {
+    if start.is_null() || stop.is_null() {
+        return 0;
+    }
+    ((*stop).u64_val.wrapping_sub((*start).u64_val)) as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_gettickcount(tv: *mut pj_time_val) -> pj_status_t {
+    if tv.is_null() {
+        return PJ_EINVAL;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (*tv).sec = now.as_secs() as libc::c_long;
+    (*tv).msec = now.subsec_millis() as libc::c_long;
+    PJ_SUCCESS
+}

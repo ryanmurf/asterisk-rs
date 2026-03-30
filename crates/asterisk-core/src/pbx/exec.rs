@@ -103,13 +103,15 @@ pub async fn pbx_run(
                 error = true;
                 break 'outer;
             }
-            let (context, exten, priority, channel_name) = {
+            let (context, exten, priority, channel_name, channel_uid, channel_linkedid) = {
                 let chan = channel.lock().await;
                 (
                     chan.context.clone(),
                     chan.exten.clone(),
                     chan.priority,
                     chan.name.clone(),
+                    chan.unique_id.0.clone(),
+                    chan.linkedid.clone(),
                 )
             };
 
@@ -145,7 +147,7 @@ pub async fn pbx_run(
                 "Executing dialplan priority"
             );
 
-            // Emit Newexten AMI event
+            // Emit Newexten AMI event with full channel snapshot
             {
                 let priority_str = priority.to_string();
                 crate::channel::publish_channel_event("Newexten", &[
@@ -155,6 +157,8 @@ pub async fn pbx_run(
                     ("Priority", &priority_str),
                     ("Application", &app_name),
                     ("AppData", &app_data),
+                    ("Uniqueid", &channel_uid),
+                    ("Linkedid", &channel_linkedid),
                 ]);
             }
 

@@ -1431,3 +1431,645 @@ pub unsafe extern "C" fn pj_sockaddr_get_family(addr: *const pj_sockaddr) -> u16
 pub unsafe extern "C" fn pj_sockaddr_set_len(_addr: *mut pj_sockaddr, _len: i32) {
     // no-op
 }
+
+// ============================================================================
+// pj_dump_config
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_dump_config() {
+    eprintln!("pjlib config: Rust shim");
+}
+
+// ============================================================================
+// FIFO buffer -- additional functions
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_fifobuf_available_size(fb: *const pj_fifobuf_t) -> u32 {
+    if fb.is_null() {
+        return 0;
+    }
+    let fb = &*fb;
+    if fb.full != 0 {
+        return 0;
+    }
+    // Simplified: available = total - used
+    let total = fb.last.offset_from(fb.first) as u32;
+    let used = fb.uend.offset_from(fb.ubegin) as u32;
+    if used > total { 0 } else { total - used }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_fifobuf_capacity(fb: *const pj_fifobuf_t) -> u32 {
+    if fb.is_null() {
+        return 0;
+    }
+    (*fb).last.offset_from((*fb).first) as u32
+}
+
+// ============================================================================
+// Pool extensions
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_pool_aligned_create(
+    factory: *mut libc::c_void,
+    name: *const libc::c_char,
+    initial_size: usize,
+    increment_size: usize,
+    callback: *mut libc::c_void,
+    _alignment: usize,
+) -> *mut pj_pool_t {
+    crate::pool::pj_pool_create(factory, name, initial_size, increment_size, callback)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_pool_create_on_buf(
+    _name: *const libc::c_char,
+    buf: *mut libc::c_void,
+    size: usize,
+) -> *mut pj_pool_t {
+    // We can't truly create a pool on an existing buffer with our allocator.
+    // Just create a regular pool and ignore the buffer.
+    let _ = buf;
+    let _ = size;
+    crate::pool::pj_pool_create(
+        std::ptr::null_mut(),
+        _name,
+        size,
+        256,
+        std::ptr::null_mut(),
+    )
+}
+
+// ============================================================================
+// Exception handling -- underscore-suffixed variants
+// ============================================================================
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_throw_exception_(id: i32) {
+    pj_throw_exception(id);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_push_exception_handler_(rec: *mut pj_exception_state_t) {
+    pj_push_exception_handler(rec);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_pop_exception_handler_(_rec: *mut pj_exception_state_t) {
+    // Pop the top of the exception stack regardless of which record is passed
+    if !EXCEPTION_STACK.is_null() {
+        EXCEPTION_STACK = (*EXCEPTION_STACK).prev;
+    }
+}
+
+// ============================================================================
+// Red-black tree
+// ============================================================================
+
+/// Red-black tree node.
+#[repr(C)]
+pub struct pj_rbtree_node {
+    pub prev: *mut pj_rbtree_node,
+    pub next: *mut pj_rbtree_node,
+    pub left: *mut pj_rbtree_node,
+    pub right: *mut pj_rbtree_node,
+    pub parent: *mut pj_rbtree_node,
+    pub key: *const libc::c_void,
+    pub user_data: *mut libc::c_void,
+    pub color: i32,
+}
+
+/// Red-black tree.
+#[repr(C)]
+pub struct pj_rbtree {
+    pub null_node: pj_rbtree_node,
+    pub size: u32,
+    pub root: *mut pj_rbtree_node,
+    pub comp: Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> i32>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_init(
+    tree: *mut pj_rbtree,
+    comp: Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> i32>,
+) {
+    if tree.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(tree as *mut u8, 0, std::mem::size_of::<pj_rbtree>());
+    let null_node = &mut (*tree).null_node as *mut pj_rbtree_node;
+    (*null_node).left = null_node;
+    (*null_node).right = null_node;
+    (*null_node).parent = null_node;
+    (*null_node).prev = null_node;
+    (*null_node).next = null_node;
+    (*null_node).color = 0; // BLACK
+    (*tree).root = null_node;
+    (*tree).comp = comp;
+    (*tree).size = 0;
+}
+
+// Internal helpers for rbtree
+unsafe fn rbtree_null(tree: *mut pj_rbtree) -> *mut pj_rbtree_node {
+    &mut (*tree).null_node as *mut pj_rbtree_node
+}
+
+unsafe fn rbtree_rotate_left(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
+    let null = rbtree_null(tree);
+    let right = (*node).right;
+    (*node).right = (*right).left;
+    if (*right).left != null {
+        (*(*right).left).parent = node;
+    }
+    (*right).parent = (*node).parent;
+    if (*node).parent == null {
+        (*tree).root = right;
+    } else if node == (*(*node).parent).left {
+        (*(*node).parent).left = right;
+    } else {
+        (*(*node).parent).right = right;
+    }
+    (*right).left = node;
+    (*node).parent = right;
+}
+
+unsafe fn rbtree_rotate_right(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
+    let null = rbtree_null(tree);
+    let left = (*node).left;
+    (*node).left = (*left).right;
+    if (*left).right != null {
+        (*(*left).right).parent = node;
+    }
+    (*left).parent = (*node).parent;
+    if (*node).parent == null {
+        (*tree).root = left;
+    } else if node == (*(*node).parent).right {
+        (*(*node).parent).right = left;
+    } else {
+        (*(*node).parent).left = left;
+    }
+    (*left).right = node;
+    (*node).parent = left;
+}
+
+unsafe fn rbtree_insert_fixup(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) {
+    let null = rbtree_null(tree);
+    while (*(*node).parent).color == 1 { // parent is RED
+        if (*node).parent == (*(*(*node).parent).parent).left {
+            let uncle = (*(*(*node).parent).parent).right;
+            if (*uncle).color == 1 { // uncle RED
+                (*(*node).parent).color = 0;
+                (*uncle).color = 0;
+                (*(*(*node).parent).parent).color = 1;
+                node = (*(*node).parent).parent;
+            } else {
+                if node == (*(*node).parent).right {
+                    node = (*node).parent;
+                    rbtree_rotate_left(tree, node);
+                }
+                (*(*node).parent).color = 0;
+                (*(*(*node).parent).parent).color = 1;
+                rbtree_rotate_right(tree, (*(*node).parent).parent);
+            }
+        } else {
+            let uncle = (*(*(*node).parent).parent).left;
+            if (*uncle).color == 1 {
+                (*(*node).parent).color = 0;
+                (*uncle).color = 0;
+                (*(*(*node).parent).parent).color = 1;
+                node = (*(*node).parent).parent;
+            } else {
+                if node == (*(*node).parent).left {
+                    node = (*node).parent;
+                    rbtree_rotate_right(tree, node);
+                }
+                (*(*node).parent).color = 0;
+                (*(*(*node).parent).parent).color = 1;
+                rbtree_rotate_left(tree, (*(*node).parent).parent);
+            }
+        }
+        if (*node).parent == null {
+            break;
+        }
+    }
+    (*(*tree).root).color = 0; // root is BLACK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_insert(
+    tree: *mut pj_rbtree,
+    node: *mut pj_rbtree_node,
+) -> i32 {
+    if tree.is_null() || node.is_null() {
+        return -1;
+    }
+    let null = rbtree_null(tree);
+    let comp = match (*tree).comp {
+        Some(f) => f,
+        None => return -1,
+    };
+
+    // BST insertion
+    let mut parent = null;
+    let mut current = (*tree).root;
+    while current != null {
+        parent = current;
+        let cmp = comp((*node).key, (*current).key);
+        if cmp < 0 {
+            current = (*current).left;
+        } else {
+            current = (*current).right;
+        }
+    }
+
+    (*node).parent = parent;
+    (*node).left = null;
+    (*node).right = null;
+    (*node).color = 1; // RED
+
+    if parent == null {
+        (*tree).root = node;
+    } else {
+        let cmp = comp((*node).key, (*parent).key);
+        if cmp < 0 {
+            (*parent).left = node;
+        } else {
+            (*parent).right = node;
+        }
+    }
+
+    // Maintain linked list (sorted order)
+    // Find predecessor and successor
+    let pred = rbtree_prev_node(tree, node);
+    let succ = if pred != null { (*pred).next } else { rbtree_min(tree, (*tree).root) };
+
+    if pred != null {
+        (*pred).next = node;
+    }
+    (*node).prev = pred;
+    (*node).next = succ;
+    if succ != null {
+        (*succ).prev = node;
+    }
+
+    rbtree_insert_fixup(tree, node);
+    (*tree).size += 1;
+    0
+}
+
+unsafe fn rbtree_min(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) -> *mut pj_rbtree_node {
+    let null = rbtree_null(tree);
+    while (*node).left != null {
+        node = (*node).left;
+    }
+    node
+}
+
+unsafe fn rbtree_prev_node(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) -> *mut pj_rbtree_node {
+    let null = rbtree_null(tree);
+    if (*node).left != null {
+        // Rightmost node in left subtree
+        let mut n = (*node).left;
+        while (*n).right != null {
+            n = (*n).right;
+        }
+        return n;
+    }
+    // Walk up to find predecessor
+    let mut n = node;
+    let mut p = (*n).parent;
+    while p != null && n == (*p).left {
+        n = p;
+        p = (*p).parent;
+    }
+    if p == null { null } else { p }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_find(
+    tree: *mut pj_rbtree,
+    key: *const libc::c_void,
+) -> *mut pj_rbtree_node {
+    if tree.is_null() {
+        return std::ptr::null_mut();
+    }
+    let null = rbtree_null(tree);
+    let comp = match (*tree).comp {
+        Some(f) => f,
+        None => return std::ptr::null_mut(),
+    };
+    let mut current = (*tree).root;
+    while current != null {
+        let cmp = comp(key, (*current).key);
+        if cmp == 0 {
+            return current;
+        } else if cmp < 0 {
+            current = (*current).left;
+        } else {
+            current = (*current).right;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_first(
+    tree: *mut pj_rbtree,
+) -> *mut pj_rbtree_node {
+    if tree.is_null() {
+        return std::ptr::null_mut();
+    }
+    let null = rbtree_null(tree);
+    if (*tree).root == null {
+        return std::ptr::null_mut();
+    }
+    let node = rbtree_min(tree, (*tree).root);
+    if node == null { std::ptr::null_mut() } else { node }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_next(
+    tree: *mut pj_rbtree,
+    node: *mut pj_rbtree_node,
+) -> *mut pj_rbtree_node {
+    if tree.is_null() || node.is_null() {
+        return std::ptr::null_mut();
+    }
+    let null = rbtree_null(tree);
+    // Use the linked list next pointer
+    let next = (*node).next;
+    if next == null || next.is_null() {
+        std::ptr::null_mut()
+    } else {
+        next
+    }
+}
+
+unsafe fn rbtree_transplant(tree: *mut pj_rbtree, u: *mut pj_rbtree_node, v: *mut pj_rbtree_node) {
+    let null = rbtree_null(tree);
+    if (*u).parent == null {
+        (*tree).root = v;
+    } else if u == (*(*u).parent).left {
+        (*(*u).parent).left = v;
+    } else {
+        (*(*u).parent).right = v;
+    }
+    (*v).parent = (*u).parent;
+}
+
+unsafe fn rbtree_erase_fixup(tree: *mut pj_rbtree, mut x: *mut pj_rbtree_node) {
+    let null = rbtree_null(tree);
+    while x != (*tree).root && (*x).color == 0 {
+        if x == (*(*x).parent).left {
+            let mut w = (*(*x).parent).right;
+            if (*w).color == 1 {
+                (*w).color = 0;
+                (*(*x).parent).color = 1;
+                rbtree_rotate_left(tree, (*x).parent);
+                w = (*(*x).parent).right;
+            }
+            if (*(*w).left).color == 0 && (*(*w).right).color == 0 {
+                (*w).color = 1;
+                x = (*x).parent;
+            } else {
+                if (*(*w).right).color == 0 {
+                    (*(*w).left).color = 0;
+                    (*w).color = 1;
+                    rbtree_rotate_right(tree, w);
+                    w = (*(*x).parent).right;
+                }
+                (*w).color = (*(*x).parent).color;
+                (*(*x).parent).color = 0;
+                (*(*w).right).color = 0;
+                rbtree_rotate_left(tree, (*x).parent);
+                x = (*tree).root;
+            }
+        } else {
+            let mut w = (*(*x).parent).left;
+            if (*w).color == 1 {
+                (*w).color = 0;
+                (*(*x).parent).color = 1;
+                rbtree_rotate_right(tree, (*x).parent);
+                w = (*(*x).parent).left;
+            }
+            if (*(*w).right).color == 0 && (*(*w).left).color == 0 {
+                (*w).color = 1;
+                x = (*x).parent;
+            } else {
+                if (*(*w).left).color == 0 {
+                    (*(*w).right).color = 0;
+                    (*w).color = 1;
+                    rbtree_rotate_left(tree, w);
+                    w = (*(*x).parent).left;
+                }
+                (*w).color = (*(*x).parent).color;
+                (*(*x).parent).color = 0;
+                (*(*w).left).color = 0;
+                rbtree_rotate_right(tree, (*x).parent);
+                x = (*tree).root;
+            }
+        }
+    }
+    (*x).color = 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_rbtree_erase(
+    tree: *mut pj_rbtree,
+    node: *mut pj_rbtree_node,
+) -> *mut pj_rbtree_node {
+    if tree.is_null() || node.is_null() {
+        return std::ptr::null_mut();
+    }
+    let null = rbtree_null(tree);
+
+    // Remove from linked list
+    let prev = (*node).prev;
+    let next = (*node).next;
+    if prev != null && !prev.is_null() {
+        (*prev).next = next;
+    }
+    if next != null && !next.is_null() {
+        (*next).prev = prev;
+    }
+
+    let mut y = node;
+    let mut y_original_color = (*y).color;
+    let x;
+
+    if (*node).left == null {
+        x = (*node).right;
+        rbtree_transplant(tree, node, (*node).right);
+    } else if (*node).right == null {
+        x = (*node).left;
+        rbtree_transplant(tree, node, (*node).left);
+    } else {
+        y = rbtree_min(tree, (*node).right);
+        y_original_color = (*y).color;
+        let x_inner = (*y).right;
+        if (*y).parent == node {
+            (*x_inner).parent = y;
+        } else {
+            rbtree_transplant(tree, y, (*y).right);
+            (*y).right = (*node).right;
+            (*(*y).right).parent = y;
+        }
+        rbtree_transplant(tree, node, y);
+        (*y).left = (*node).left;
+        (*(*y).left).parent = y;
+        (*y).color = (*node).color;
+        x = x_inner;
+    }
+
+    if y_original_color == 0 {
+        rbtree_erase_fixup(tree, x);
+    }
+
+    (*tree).size -= 1;
+    node
+}
+
+// ============================================================================
+// Atomic singly-linked list (lock-free stack)
+// ============================================================================
+
+/// Opaque atomic slist.
+#[repr(C)]
+pub struct pj_atomic_slist_t {
+    _opaque: [u8; 0],
+}
+
+/// Atomic slist node -- must be the first field in user's struct.
+#[repr(C)]
+pub struct pj_atomic_slist_node_t {
+    pub next: *mut pj_atomic_slist_node_t,
+}
+
+struct AtomicSlistInner {
+    head: *mut pj_atomic_slist_node_t,
+    count: usize,
+    lock: parking_lot::Mutex<()>,
+}
+
+// The raw pointer in head is managed by the caller.
+unsafe impl Send for AtomicSlistInner {}
+unsafe impl Sync for AtomicSlistInner {}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_create(
+    _pool: *mut pj_pool_t,
+    p_slist: *mut *mut pj_atomic_slist_t,
+) -> pj_status_t {
+    if p_slist.is_null() {
+        return PJ_EINVAL;
+    }
+    let inner = Box::new(AtomicSlistInner {
+        head: std::ptr::null_mut(),
+        count: 0,
+        lock: parking_lot::Mutex::new(()),
+    });
+    *p_slist = Box::into_raw(inner) as *mut pj_atomic_slist_t;
+    PJ_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_destroy(slist: *mut pj_atomic_slist_t) -> pj_status_t {
+    if !slist.is_null() {
+        let _ = Box::from_raw(slist as *mut AtomicSlistInner);
+    }
+    PJ_SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_push(
+    slist: *mut pj_atomic_slist_t,
+    node: *mut pj_atomic_slist_node_t,
+) {
+    if slist.is_null() || node.is_null() {
+        return;
+    }
+    let inner = &mut *(slist as *mut AtomicSlistInner);
+    let _guard = inner.lock.lock();
+    (*node).next = inner.head;
+    inner.head = node;
+    inner.count += 1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_pop(
+    slist: *mut pj_atomic_slist_t,
+) -> *mut pj_atomic_slist_node_t {
+    if slist.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = &mut *(slist as *mut AtomicSlistInner);
+    let _guard = inner.lock.lock();
+    if inner.head.is_null() {
+        return std::ptr::null_mut();
+    }
+    let node = inner.head;
+    inner.head = (*node).next;
+    (*node).next = std::ptr::null_mut();
+    inner.count -= 1;
+    node
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_size(
+    slist: *mut pj_atomic_slist_t,
+) -> usize {
+    if slist.is_null() {
+        return 0;
+    }
+    let inner = &*(slist as *const AtomicSlistInner);
+    let _guard = inner.lock.lock();
+    inner.count
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_atomic_slist_calloc(
+    pool: *mut pj_pool_t,
+    count: usize,
+    elem_size: usize,
+) -> *mut libc::c_void {
+    // Allocate count * elem_size from pool, zero-filled
+    crate::pool::pj_pool_calloc(pool, count, elem_size)
+}
+
+// ============================================================================
+// I/O Queue extensions
+// ============================================================================
+
+/// I/O queue configuration.
+#[repr(C)]
+pub struct pj_ioqueue_cfg {
+    pub max_fd: u32,
+    pub default_concurrency: i32,
+    _pad: [u8; 56],
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_ioqueue_cfg_default(cfg: *mut pj_ioqueue_cfg) {
+    if cfg.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(cfg as *mut u8, 0, std::mem::size_of::<pj_ioqueue_cfg>());
+    (*cfg).max_fd = 64;
+    (*cfg).default_concurrency = -1;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_ioqueue_create2(
+    _pool: *mut pj_pool_t,
+    _cfg: *const pj_ioqueue_cfg,
+    p_ioqueue: *mut *mut pj_ioqueue_t,
+) -> pj_status_t {
+    if p_ioqueue.is_null() {
+        return PJ_EINVAL;
+    }
+    *p_ioqueue = Box::into_raw(Box::new(0u64)) as *mut pj_ioqueue_t;
+    PJ_SUCCESS
+}

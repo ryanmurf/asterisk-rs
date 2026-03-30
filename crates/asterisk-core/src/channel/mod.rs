@@ -291,15 +291,30 @@ impl Channel {
         tracing::debug!(channel = %self.name, old = %self.state, new = %state, "state change");
         self.state = state;
 
-        // Emit Newstate AMI event
+        // Emit Newstate AMI event with full channel snapshot fields
         let state_num = state as u8;
         let state_num_str = state_num.to_string();
         let state_desc = state.to_string();
+        let priority_str = self.priority.to_string();
+        let caller_num = self.caller.id.number.number.clone();
+        let caller_name = self.caller.id.name.name.clone();
+        let connected_num = self.connected.id.number.number.clone();
+        let connected_name = self.connected.id.name.name.clone();
         publish_channel_event("Newstate", &[
             ("Channel", &self.name),
             ("ChannelState", &state_num_str),
             ("ChannelStateDesc", &state_desc),
+            ("CallerIDNum", &caller_num),
+            ("CallerIDName", &caller_name),
+            ("ConnectedLineNum", &connected_num),
+            ("ConnectedLineName", &connected_name),
+            ("Language", &self.language),
+            ("AccountCode", &self.accountcode),
+            ("Context", &self.context),
+            ("Exten", &self.exten),
+            ("Priority", &priority_str),
             ("Uniqueid", &self.unique_id.0),
+            ("Linkedid", &self.linkedid),
         ]);
     }
 
@@ -328,12 +343,31 @@ impl Channel {
         // Fire hangup callbacks for CDR and other subsystems
         fire_hangup_callbacks(&self.unique_id.0, &self.hangup_cause);
 
-        // Emit Hangup AMI event
+        // Emit Hangup AMI event with full channel snapshot fields
         let cause_str = (self.hangup_cause as u32).to_string();
         let cause_txt = self.hangup_cause.to_string();
+        let state_num = (self.state as u8).to_string();
+        let state_desc = self.state.to_string();
+        let priority_str = self.priority.to_string();
+        let caller_num = self.caller.id.number.number.clone();
+        let caller_name = self.caller.id.name.name.clone();
+        let connected_num = self.connected.id.number.number.clone();
+        let connected_name = self.connected.id.name.name.clone();
         publish_channel_event("Hangup", &[
             ("Channel", &self.name),
+            ("ChannelState", &state_num),
+            ("ChannelStateDesc", &state_desc),
+            ("CallerIDNum", &caller_num),
+            ("CallerIDName", &caller_name),
+            ("ConnectedLineNum", &connected_num),
+            ("ConnectedLineName", &connected_name),
+            ("Language", &self.language),
+            ("AccountCode", &self.accountcode),
+            ("Context", &self.context),
+            ("Exten", &self.exten),
+            ("Priority", &priority_str),
             ("Uniqueid", &self.unique_id.0),
+            ("Linkedid", &self.linkedid),
             ("Cause", &cause_str),
             ("Cause-txt", &cause_txt),
         ]);

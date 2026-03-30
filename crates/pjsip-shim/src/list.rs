@@ -194,6 +194,34 @@ pub unsafe extern "C" fn pj_list_size(list: *const pj_list_node) -> usize {
 // pj_list_merge_first
 // ---------------------------------------------------------------------------
 
+/// Merge list2 into list1, inserting all elements of list2 at the end
+/// of list1.
+#[no_mangle]
+pub unsafe extern "C" fn pj_list_merge_last(
+    list1: *mut pj_list_node,
+    list2: *mut pj_list_node,
+) {
+    if list1.is_null() || list2.is_null() {
+        return;
+    }
+    if (*list2).next == list2 {
+        return; // list2 is empty
+    }
+    let first2 = (*list2).next;
+    let last2 = (*list2).prev;
+    let last1 = (*list1).prev;
+
+    // Splice list2 at the end of list1
+    (*last1).next = first2;
+    (*first2).prev = last1;
+    (*last2).next = list1;
+    (*list1).prev = last2;
+
+    // Reset list2 to empty
+    (*list2).next = list2;
+    (*list2).prev = list2;
+}
+
 /// Merge list2 into list1, inserting all elements of list2 at the beginning
 /// of list1.
 #[no_mangle]

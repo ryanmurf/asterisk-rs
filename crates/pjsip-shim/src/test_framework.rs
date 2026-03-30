@@ -249,3 +249,61 @@ pub unsafe extern "C" fn pj_test_destroy_runner(runner: *mut pj_test_runner) {
 pub unsafe extern "C" fn pj_test_runner_destroy(runner: *mut pj_test_runner) {
     pj_test_destroy_runner(runner);
 }
+
+// ---------------------------------------------------------------------------
+// Additional test framework functions needed by pjlib-test
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_display_log_messages(
+    _suite: *const pj_test_suite,
+    _level: i32,
+) {
+    // no-op
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_init_basic_runner(
+    runner: *mut pj_test_runner,
+    _param: *const pj_test_runner_param,
+) {
+    // no-op -- runner is already initialized
+    let _ = runner;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_is_under_test() -> i32 {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_runner_param_default(
+    param: *mut pj_test_runner_param,
+) {
+    if param.is_null() {
+        return;
+    }
+    std::ptr::write_bytes(param as *mut u8, 0, std::mem::size_of::<pj_test_runner_param>());
+    (*param).log_level = 3;
+    (*param).nthreads = 0;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_suite_init(
+    suite: *mut pj_test_suite,
+) {
+    if suite.is_null() {
+        return;
+    }
+    (*suite).tests.prev = &mut (*suite).tests as *mut _ as *mut _;
+    (*suite).tests.next = &mut (*suite).tests as *mut _ as *mut _;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pj_test_suite_shuffle(
+    suite: *mut pj_test_suite,
+    _seed: u32,
+) {
+    // no-op: we don't shuffle
+    let _ = suite;
+}
