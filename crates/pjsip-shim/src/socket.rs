@@ -527,10 +527,13 @@ pub unsafe extern "C" fn pj_getdefaultipinterface(
     pj_gethostip(af, addr)
 }
 
-/// Simplified pj_getaddrinfo.
+/// pj_addrinfo -- matches the C layout: char ai_canonname[PJ_MAX_HOSTNAME]
+/// followed by pj_sockaddr ai_addr.  PJ_MAX_HOSTNAME is 254.
+const PJ_MAX_HOSTNAME: usize = 254;
+
 #[repr(C)]
 pub struct pj_addrinfo {
-    pub ai_canonname: pj_str_t,
+    pub ai_canonname: [u8; PJ_MAX_HOSTNAME],
     pub ai_addr: pj_sockaddr,
 }
 
@@ -552,7 +555,10 @@ pub unsafe extern "C" fn pj_getaddrinfo(
             std::ptr::write_bytes(ai as *mut u8, 0, std::mem::size_of::<pj_addrinfo>());
             (*ai).ai_addr.addr.sin_family = PJ_AF_INET;
             (*ai).ai_addr.addr.sin_addr.s_addr = ipv4;
-            (*ai).ai_canonname = *name;
+            // Copy name into ai_canonname buffer
+            let name_bytes = (*name).as_str().as_bytes();
+            let copy_len = name_bytes.len().min(PJ_MAX_HOSTNAME - 1);
+            std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), (*ai).ai_canonname.as_mut_ptr(), copy_len);
             *count = 1;
             return PJ_SUCCESS;
         }
@@ -561,7 +567,10 @@ pub unsafe extern "C" fn pj_getaddrinfo(
     std::ptr::write_bytes(ai as *mut u8, 0, std::mem::size_of::<pj_addrinfo>());
     (*ai).ai_addr.addr.sin_family = PJ_AF_INET;
     (*ai).ai_addr.addr.sin_addr.s_addr = 0x0100007f; // 127.0.0.1
-    (*ai).ai_canonname = *name;
+    // Copy name into ai_canonname buffer
+    let name_bytes = (*name).as_str().as_bytes();
+    let copy_len = name_bytes.len().min(PJ_MAX_HOSTNAME - 1);
+    std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), (*ai).ai_canonname.as_mut_ptr(), copy_len);
     *count = 1;
     PJ_SUCCESS
 }
@@ -713,7 +722,7 @@ pub unsafe extern "C" fn pj_sockaddr_get_addr(addr: *const pj_sockaddr) -> *mut 
     }
 }
 
-/// Compare two sockaddrs.
+/// Compare two sockaddrs (family, address, port -- ignoring padding/sin_len).
 #[no_mangle]
 pub unsafe extern "C" fn pj_sockaddr_cmp(
     addr1: *const pj_sockaddr,
@@ -724,15 +733,37 @@ pub unsafe extern "C" fn pj_sockaddr_cmp(
     }
     let f1 = (*addr1).addr.sin_family;
     let f2 = (*addr2).addr.sin_family;
-    if f1 != f2 {
-        return (f1 as i32) - (f2 as i32);
+
+    // Compare address family
+    if f1 < f2 {
+        return -1;
+    } else if f1 > f2 {
+        return 1;
     }
-    let len = if f1 == PJ_AF_INET {
-        std::mem::size_of::<pj_sockaddr_in>()
+
+    // Compare the address part only (sin_addr or sin6_addr)
+    let a1 = pj_sockaddr_get_addr(addr1);
+    let a2 = pj_sockaddr_get_addr(addr2);
+    let addr_len = if f1 == PJ_AF_INET {
+        std::mem::size_of::<pj_in_addr>()  // 4 bytes
     } else {
-        std::mem::size_of::<pj_sockaddr_in6>()
+        std::mem::size_of::<pj_in6_addr>() // 16 bytes
     };
-    libc::memcmp(addr1 as *const _, addr2 as *const _, len)
+    let result = libc::memcmp(a1, a2, addr_len);
+    if result != 0 {
+        return result;
+    }
+
+    // Compare port
+    let p1 = crate::sockaddr::pj_sockaddr_get_port(addr1) as i32;
+    let p2 = crate::sockaddr::pj_sockaddr_get_port(addr2) as i32;
+    if p1 < p2 {
+        return -1;
+    } else if p1 > p2 {
+        return 1;
+    }
+
+    0
 }
 
 /// Copy a sockaddr.
@@ -806,13 +837,140 @@ pub unsafe extern "C" fn pj_sock_socketpair(
     if sv.is_null() {
         return PJ_EINVAL;
     }
+
+    // First try the OS socketpair
     let mut raw_sv: [i32; 2] = [0; 2];
     let rc = libc::socketpair(family, type_, protocol, raw_sv.as_mut_ptr());
-    if rc != 0 {
-        return PJ_EINVAL;
+    if rc == 0 {
+        (*sv)[0] = raw_sv[0] as pj_sock_t;
+        (*sv)[1] = raw_sv[1] as pj_sock_t;
+        return PJ_SUCCESS;
     }
-    (*sv)[0] = raw_sv[0] as pj_sock_t;
-    (*sv)[1] = raw_sv[1] as pj_sock_t;
+
+    // Fallback: manually create a connected socket pair (needed for AF_INET)
+    socketpair_imp(family, type_, protocol, sv)
+}
+
+/// Manual socketpair implementation: create two sockets, bind/connect them.
+/// This handles AF_INET (and AF_INET6) which libc::socketpair doesn't support.
+unsafe fn socketpair_imp(
+    family: i32,
+    type_: i32,
+    protocol: i32,
+    sv: *mut [pj_sock_t; 2],
+) -> pj_status_t {
+    use crate::sockaddr::*;
+
+    let mut lfd: pj_sock_t = -1;
+    let mut cfd: pj_sock_t = -1;
+    let mut sa: pj_sockaddr = std::mem::zeroed();
+    let mut status: pj_status_t;
+
+    // Create listen/server socket
+    status = pj_sock_socket(family, type_, protocol, &mut lfd);
+    if status != PJ_SUCCESS {
+        return status;
+    }
+
+    // Init loopback address on port 0 (OS picks port)
+    let loopback_str = b"127.0.0.1\0";
+    let loopback = pj_str_t {
+        ptr: loopback_str.as_ptr() as *mut _,
+        slen: 9,
+    };
+    status = pj_sockaddr_init(family, &mut sa, &loopback, 0);
+    if status != PJ_SUCCESS {
+        pj_sock_close(lfd);
+        return status;
+    }
+
+    let salen = pj_sockaddr_get_len(&sa);
+    status = pj_sock_bind(lfd, &sa, salen);
+    if status != PJ_SUCCESS {
+        pj_sock_close(lfd);
+        return status;
+    }
+
+    // Get the actual bound address (to learn the port)
+    let mut salen_mut = salen;
+    status = pj_sock_getsockname(lfd, &mut sa, &mut salen_mut);
+    if status != PJ_SUCCESS {
+        pj_sock_close(lfd);
+        return status;
+    }
+
+    let sock_type_masked = type_ & 0xF;
+
+    if sock_type_masked == libc::SOCK_STREAM {
+        // TCP: listen, connect, accept
+        status = pj_sock_listen(lfd, 1);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            return status;
+        }
+
+        // Create client socket and connect
+        status = pj_sock_socket(family, type_, protocol, &mut cfd);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            return status;
+        }
+
+        status = pj_sock_connect(cfd, &sa, salen_mut);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            pj_sock_close(cfd);
+            return status;
+        }
+
+        // Accept the connection
+        let mut newfd: pj_sock_t = -1;
+        status = pj_sock_accept(lfd, &mut newfd, std::ptr::null_mut(), std::ptr::null_mut());
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            pj_sock_close(cfd);
+            return status;
+        }
+        pj_sock_close(lfd);
+        (*sv)[0] = newfd;
+        (*sv)[1] = cfd;
+    } else {
+        // UDP: connect both ends to each other
+        status = pj_sock_socket(family, type_, protocol, &mut cfd);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            return status;
+        }
+
+        status = pj_sock_connect(cfd, &sa, salen_mut);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            pj_sock_close(cfd);
+            return status;
+        }
+
+        // Get client's bound address
+        let mut client_sa: pj_sockaddr = std::mem::zeroed();
+        let mut client_salen = std::mem::size_of::<pj_sockaddr>() as i32;
+        status = pj_sock_getsockname(cfd, &mut client_sa, &mut client_salen);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            pj_sock_close(cfd);
+            return status;
+        }
+
+        // Connect server socket back to client
+        status = pj_sock_connect(lfd, &client_sa, client_salen);
+        if status != PJ_SUCCESS {
+            pj_sock_close(lfd);
+            pj_sock_close(cfd);
+            return status;
+        }
+
+        (*sv)[0] = lfd;
+        (*sv)[1] = cfd;
+    }
+
     PJ_SUCCESS
 }
 

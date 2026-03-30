@@ -1402,13 +1402,96 @@ pub unsafe extern "C" fn pj_unicode_to_ansi(
     std::ptr::null_mut()
 }
 
-/// Hostname for IP
+/// Resolve hostname via DNS.  Returns PJ_EINVAL for unresolvable names.
 #[no_mangle]
 pub unsafe extern "C" fn pj_gethostbyname(
-    _name: *const pj_str_t,
+    name: *const pj_str_t,
     he: *mut libc::c_void,
 ) -> pj_status_t {
-    let _ = he;
+    if name.is_null() || he.is_null() {
+        return PJ_EINVAL;
+    }
+
+    let text = (*name).as_str();
+    if text.is_empty() {
+        return PJ_EINVAL;
+    }
+
+    // Build a null-terminated hostname string
+    let mut host_buf: Vec<u8> = text.as_bytes().to_vec();
+    host_buf.push(0);
+
+    // Use libc::getaddrinfo to validate the hostname
+    let mut hints: libc::addrinfo = std::mem::zeroed();
+    hints.ai_family = libc::AF_INET;
+    hints.ai_socktype = libc::SOCK_STREAM;
+    // AI_NUMERICHOST would reject non-IP strings, but we want DNS resolution
+    // For clearly-invalid names, getaddrinfo will fail
+
+    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+    let rc = libc::getaddrinfo(
+        host_buf.as_ptr() as *const libc::c_char,
+        std::ptr::null(),
+        &hints,
+        &mut res,
+    );
+
+    if rc != 0 || res.is_null() {
+        if !res.is_null() {
+            libc::freeaddrinfo(res);
+        }
+        return PJ_EINVAL;
+    }
+
+    // We got a result -- fill in the pj_hostent struct.
+    // pj_hostent layout: { h_name: *char, h_aliases: **char, h_addrtype: int,
+    //                       h_length: int, h_addr_list: **char }
+    // We use thread-local static buffers for the pointers.
+    use std::cell::UnsafeCell;
+    thread_local! {
+        static ADDR_BUF: UnsafeCell<[u8; 4]> = const { UnsafeCell::new([0u8; 4]) };
+        static ADDR_LIST: UnsafeCell<[*mut u8; 2]> = const { UnsafeCell::new([std::ptr::null_mut(); 2]) };
+    }
+
+    // Extract the IPv4 address from the result
+    if !res.is_null() && (*res).ai_family == libc::AF_INET && !(*res).ai_addr.is_null() {
+        let sa_in = (*res).ai_addr as *const libc::sockaddr_in;
+        let addr_bytes = (*sa_in).sin_addr.s_addr.to_ne_bytes();
+
+        ADDR_BUF.with(|cell| {
+            let buf = &mut *cell.get();
+            buf.copy_from_slice(&addr_bytes);
+        });
+    }
+
+    libc::freeaddrinfo(res);
+
+    // Fill pj_hostent (same layout as struct hostent)
+    // We cast he as a raw pointer to the struct fields
+    #[repr(C)]
+    struct PjHostent {
+        h_name: *mut libc::c_char,
+        h_aliases: *mut *mut libc::c_char,
+        h_addrtype: i32,
+        h_length: i32,
+        h_addr_list: *mut *mut libc::c_char,
+    }
+    let hep = he as *mut PjHostent;
+
+    ADDR_BUF.with(|cell| {
+        let buf = &mut *cell.get();
+        ADDR_LIST.with(|list_cell| {
+            let list = &mut *list_cell.get();
+            list[0] = buf.as_mut_ptr();
+            list[1] = std::ptr::null_mut();
+            (*hep).h_addr_list = list.as_mut_ptr() as *mut *mut libc::c_char;
+        });
+    });
+    (*hep).h_name = host_buf.as_ptr() as *mut libc::c_char; // Note: points to temp
+    (*hep).h_aliases = std::ptr::null_mut();
+    (*hep).h_addrtype = libc::AF_INET;
+    (*hep).h_length = 4;
+
     PJ_SUCCESS
 }
 
