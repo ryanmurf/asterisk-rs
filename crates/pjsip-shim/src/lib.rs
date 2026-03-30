@@ -1110,7 +1110,7 @@ mod tests {
             );
             assert_eq!(misc::pj_hash_count(ht), 1);
 
-            let found = misc::pj_hash_get(ht, key.as_ptr() as *const _, -1, std::ptr::null_mut());
+            let found = misc::pj_hash_get(ht, key.as_ptr() as *const _, 0xFFFFFFFF, std::ptr::null_mut());
             assert_eq!(found as usize, 42);
 
             // Remove

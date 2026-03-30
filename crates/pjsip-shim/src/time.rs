@@ -173,48 +173,66 @@ pub unsafe extern "C" fn pj_time_gmt_to_local(tv: *mut pj_time_val) -> pj_status
 // Elapsed time
 // ---------------------------------------------------------------------------
 
+/// pj_elapsed_time returns a pj_time_val (sec/msec) from two pj_timestamps.
+/// C signature: pj_time_val pj_elapsed_time(const pj_timestamp *start,
+///                                          const pj_timestamp *stop);
+/// Returns by value (sec, msec struct).
 #[no_mangle]
 pub unsafe extern "C" fn pj_elapsed_time(
-    start: *const pj_time_val,
-    stop: *const pj_time_val,
-    elapsed: *mut pj_time_val,
-) -> pj_status_t {
-    if start.is_null() || stop.is_null() || elapsed.is_null() {
-        return PJ_EINVAL;
+    start: *const pj_timestamp,
+    stop: *const pj_timestamp,
+) -> pj_time_val {
+    if start.is_null() || stop.is_null() {
+        return pj_time_val { sec: 0, msec: 0 };
     }
-    (*elapsed).sec = (*stop).sec - (*start).sec;
-    (*elapsed).msec = (*stop).msec - (*start).msec;
-    pj_time_val_normalize(elapsed);
-    PJ_SUCCESS
+    let start_ns = (*start).u64_val;
+    let stop_ns = (*stop).u64_val;
+    let diff_ns = if stop_ns > start_ns { stop_ns - start_ns } else { 0 };
+    let sec = (diff_ns / 1_000_000_000) as libc::c_long;
+    let msec = ((diff_ns % 1_000_000_000) / 1_000_000) as libc::c_long;
+    pj_time_val { sec, msec }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_elapsed_msec(
-    start: *const pj_time_val,
-    stop: *const pj_time_val,
+    start: *const pj_timestamp,
+    stop: *const pj_timestamp,
 ) -> u32 {
     if start.is_null() || stop.is_null() {
         return 0;
     }
-    let dsec = (*stop).sec - (*start).sec;
-    let dmsec = (*stop).msec - (*start).msec;
-    (dsec * 1000 + dmsec) as u32
+    let start_ns = (*start).u64_val;
+    let stop_ns = (*stop).u64_val;
+    let diff_ns = if stop_ns > start_ns { stop_ns - start_ns } else { 0 };
+    (diff_ns / 1_000_000) as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_elapsed_usec(
-    start: *const pj_time_val,
-    stop: *const pj_time_val,
+    start: *const pj_timestamp,
+    stop: *const pj_timestamp,
 ) -> u32 {
-    pj_elapsed_msec(start, stop).saturating_mul(1000)
+    if start.is_null() || stop.is_null() {
+        return 0;
+    }
+    let start_ns = (*start).u64_val;
+    let stop_ns = (*stop).u64_val;
+    let diff_ns = if stop_ns > start_ns { stop_ns - start_ns } else { 0 };
+    (diff_ns / 1_000) as u32
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_elapsed_nanosec(
-    start: *const pj_time_val,
-    stop: *const pj_time_val,
+    start: *const pj_timestamp,
+    stop: *const pj_timestamp,
 ) -> u32 {
-    pj_elapsed_msec(start, stop).saturating_mul(1_000_000)
+    if start.is_null() || stop.is_null() {
+        return 0;
+    }
+    let start_ns = (*start).u64_val;
+    let stop_ns = (*stop).u64_val;
+    let diff_ns = if stop_ns > start_ns { stop_ns - start_ns } else { 0 };
+    diff_ns as u32
 }
 
 // ---------------------------------------------------------------------------

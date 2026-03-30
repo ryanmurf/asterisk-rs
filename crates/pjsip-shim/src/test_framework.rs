@@ -1,10 +1,11 @@
-//! pjlib test framework stubs.
+//! pjlib test framework implementation.
 //!
 //! pjproject's pjlib-test uses a test harness with runners, suites, and cases.
-//! We stub these so the test binary can link against our library.
+//! We implement these so the test binary can link against our library.
 
 use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Condvar};
 
 /// Tracks whether we are currently inside pj_test_run.
 static IS_UNDER_TEST: AtomicBool = AtomicBool::new(false);
@@ -38,21 +39,53 @@ static mut CAPTURED_LOGS: [CapturedLog; MAX_CAPTURED_LOGS] = [EMPTY_LOG; MAX_CAP
 static mut CAPTURED_LOG_COUNT: usize = 0;
 
 /// Currently running test case info (set during pj_test_run).
-static mut CURRENT_TC_NAME_BUF: [u8; MAX_TC_NAME] = [0u8; MAX_TC_NAME];
-static mut CURRENT_TC_NAME_LEN: usize = 0;
-static mut CURRENT_TC_LOG_BUF_SIZE: u32 = 0;
+/// Uses thread-local storage for proper per-thread tracking during
+/// parallel test execution.
+std::thread_local! {
+    static CURRENT_TC_NAME_BUF: std::cell::RefCell<[u8; MAX_TC_NAME]> =
+        std::cell::RefCell::new([0u8; MAX_TC_NAME]);
+    static CURRENT_TC_NAME_LEN: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static CURRENT_TC_LOG_BUF_SIZE: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+/// Set the current test case info on the current thread.
+unsafe fn set_current_tc(name: &[u8], log_buf_size: u32) {
+    CURRENT_TC_NAME_BUF.with(|buf| {
+        let mut b = buf.borrow_mut();
+        let copy_len = name.len().min(MAX_TC_NAME - 1);
+        b[..copy_len].copy_from_slice(&name[..copy_len]);
+        b[copy_len] = 0;
+    });
+    CURRENT_TC_NAME_LEN.with(|len| len.set(name.len().min(MAX_TC_NAME - 1)));
+    CURRENT_TC_LOG_BUF_SIZE.with(|sz| sz.set(log_buf_size));
+}
+
+/// Clear the current test case info on the current thread.
+unsafe fn clear_current_tc() {
+    CURRENT_TC_NAME_LEN.with(|len| len.set(0));
+    CURRENT_TC_LOG_BUF_SIZE.with(|sz| sz.set(0));
+}
+
+/// Global mutex for protecting CAPTURED_LOGS during parallel execution.
+static LOG_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Log intercept callback used during pj_test_run.
-/// Uses only static memory -- no heap allocation.
+/// Uses thread-local storage for test case tracking and a mutex for the global log buffer.
 unsafe extern "C" fn test_log_intercept(level: i32, data: *const libc::c_char, len: i32) {
     if data.is_null() || len <= 0 {
         return;
     }
 
     // Only capture if the test case has a log buffer configured
-    if CURRENT_TC_LOG_BUF_SIZE < 10 {
+    let buf_size = CURRENT_TC_LOG_BUF_SIZE.with(|sz| sz.get());
+    if buf_size < 10 {
         return;
     }
+
+    let name_len = CURRENT_TC_NAME_LEN.with(|l| l.get());
+
+    // Lock the global capture buffer for thread safety
+    let _guard = LOG_CAPTURE_LOCK.lock();
 
     let idx = CAPTURED_LOG_COUNT;
     if idx >= MAX_CAPTURED_LOGS {
@@ -66,14 +99,17 @@ unsafe extern "C" fn test_log_intercept(level: i32, data: *const libc::c_char, l
     CAPTURED_LOGS[idx].level = level;
     CAPTURED_LOGS[idx].result = 0;
 
-    let name_len = CURRENT_TC_NAME_LEN.min(MAX_TC_NAME - 1);
-    std::ptr::copy_nonoverlapping(
-        CURRENT_TC_NAME_BUF.as_ptr(),
-        CAPTURED_LOGS[idx].tc_name.as_mut_ptr(),
-        name_len,
-    );
-    CAPTURED_LOGS[idx].tc_name[name_len] = 0;
-    CAPTURED_LOGS[idx].tc_name_len = name_len;
+    CURRENT_TC_NAME_BUF.with(|buf| {
+        let b = buf.borrow();
+        let copy_len = name_len.min(MAX_TC_NAME - 1);
+        std::ptr::copy_nonoverlapping(
+            b.as_ptr(),
+            CAPTURED_LOGS[idx].tc_name.as_mut_ptr(),
+            copy_len,
+        );
+        CAPTURED_LOGS[idx].tc_name[copy_len] = 0;
+        CAPTURED_LOGS[idx].tc_name_len = copy_len;
+    });
 
     CAPTURED_LOG_COUNT = idx + 1;
 }
@@ -96,8 +132,12 @@ pub struct pj_test_suite {
 /// Test case callback type: `int (*test_func)(void *arg)`
 pub type pj_test_func = unsafe extern "C" fn(*mut libc::c_void) -> i32;
 
-/// PJ_TEST_FUNC_NO_ARG flag — call test_func with no argument.
+/// PJ_TEST_EXCLUSIVE flag -- run test exclusively (no parallel tests).
+const PJ_TEST_EXCLUSIVE: u32 = 1;
+/// PJ_TEST_FUNC_NO_ARG flag -- call test_func with no argument.
 const PJ_TEST_FUNC_NO_ARG: u32 = 2;
+/// PJ_EPENDING -- test result when test hasn't completed yet.
+const PJ_EPENDING: i32 = 70002;
 
 /// Test case -- must match C layout exactly (176 bytes).
 ///
@@ -256,18 +296,28 @@ pub unsafe extern "C" fn pj_test_get_root_suite() -> *mut pj_test_suite {
 // Runner creation
 // ---------------------------------------------------------------------------
 
-struct RunnerInner;
+/// Magic value to identify heap-allocated runners created by us.
+const RUNNER_MAGIC: u32 = 0x504A5452; // "PJTR"
+
+#[repr(C)]
+struct RunnerInner {
+    magic: u32,
+    nthreads: u32,
+    stop_on_error: bool,
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_test_create_text_runner(
     _pool: *mut pj_pool_t,
-    _prm: *const pj_test_runner_param,
+    prm: *const pj_test_runner_param,
     p_runner: *mut *mut pj_test_runner,
 ) -> pj_status_t {
     if p_runner.is_null() {
         return -1; // PJ_EINVAL
     }
-    let runner = Box::into_raw(Box::new(RunnerInner)) as *mut pj_test_runner;
+    let nthreads = if prm.is_null() { 0 } else { (*prm).nthreads };
+    let stop_on_error = if prm.is_null() { false } else { (*prm).stop_on_error != 0 };
+    let runner = Box::into_raw(Box::new(RunnerInner { magic: RUNNER_MAGIC, nthreads, stop_on_error })) as *mut pj_test_runner;
     *p_runner = runner;
     0 // PJ_SUCCESS
 }
@@ -276,21 +326,60 @@ pub unsafe extern "C" fn pj_test_create_text_runner(
 pub unsafe extern "C" fn pj_test_create_basic_runner(
     _pool: *mut pj_pool_t,
 ) -> *mut pj_test_runner {
-    Box::into_raw(Box::new(RunnerInner)) as *mut pj_test_runner
+    Box::into_raw(Box::new(RunnerInner { magic: RUNNER_MAGIC, nthreads: 0, stop_on_error: false })) as *mut pj_test_runner
 }
 
 // ---------------------------------------------------------------------------
 // pj_test_run
 // ---------------------------------------------------------------------------
 
+/// Data needed to run a single test case on a thread.
+/// Uses usize for pointer fields to satisfy Send requirement.
+struct TestCaseWork {
+    func: pj_test_func,
+    arg: usize,  // *mut c_void cast to usize for Send
+    flags: u32,
+}
+
+// SAFETY: test case pointers and function pointers are safe to send across
+// threads since pjlib's test framework is designed for multi-threaded use.
+unsafe impl Send for TestCaseWork {}
+
+/// Run a single test case and store the result.
+unsafe fn run_one_test_case(tc: *mut pj_test_case) {
+    if let Some(func) = (*tc).test_func {
+        if (*tc).flags & PJ_TEST_FUNC_NO_ARG != 0 {
+            let no_arg_func: unsafe extern "C" fn() -> i32 =
+                std::mem::transmute(func);
+            (*tc).result = no_arg_func();
+        } else {
+            (*tc).result = func((*tc).arg);
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pj_test_run(
-    _runner: *mut pj_test_runner,
+    runner: *mut pj_test_runner,
     suite: *mut pj_test_suite,
 ) {
     if suite.is_null() {
         return;
     }
+
+    // Determine nthreads from runner.
+    // Only read nthreads if the runner was created by us (has our magic number).
+    // Stack-allocated runners from pj_test_init_basic_runner won't have the magic.
+    let nthreads = if runner.is_null() {
+        0u32
+    } else {
+        let inner = runner as *const RunnerInner;
+        if (*inner).magic == RUNNER_MAGIC {
+            (*inner).nthreads
+        } else {
+            0u32 // basic runner (stack-allocated) -- run sequentially
+        }
+    };
 
     IS_UNDER_TEST.store(true, Ordering::SeqCst);
     crate::time::pj_get_timestamp(&mut (*suite).start_time);
@@ -302,41 +391,46 @@ pub unsafe extern "C" fn pj_test_run(
     let orig_writer = crate::logging::pj_log_get_log_func();
     crate::logging::pj_log_set_log_func(Some(test_log_intercept));
 
-    // Walk the test case list and run each one
+    // Mark all tests as pending
+    let sentinel = &mut (*suite).tests as *mut pj_test_case;
+    {
+        let mut tc = (*sentinel).next;
+        while tc != sentinel {
+            (*tc).result = PJ_EPENDING;
+            tc = (*tc).next;
+        }
+    }
+
+    if nthreads > 0 {
+        // Multi-threaded execution: respect PJ_TEST_EXCLUSIVE
+        run_tests_threaded(suite);
+    } else {
+        // Sequential execution
+        run_tests_sequential(suite);
+    }
+
+    // Clear current test info
+    clear_current_tc();
+
+    // Restore original log writer
+    crate::logging::pj_log_set_log_func(orig_writer);
+
+    crate::time::pj_get_timestamp(&mut (*suite).end_time);
+    IS_UNDER_TEST.store(false, Ordering::SeqCst);
+}
+
+/// Sequential test execution (basic runner, nthreads=0).
+unsafe fn run_tests_sequential(suite: *mut pj_test_suite) {
     let sentinel = &mut (*suite).tests as *mut pj_test_case;
     let mut cur = (*sentinel).next;
     while cur != sentinel {
-        // Get the test name
         let name = std::ffi::CStr::from_ptr((*cur).obj_name.as_ptr());
         let name_str = name.to_str().unwrap_or("<unknown>").to_string();
-
-        // Print to stderr directly (not through log system)
         eprintln!("[test_run] Running: {}", name_str);
 
-        // Set current test case info for log capture
-        {
-            let name_bytes = name_str.as_bytes();
-            let copy_len = name_bytes.len().min(MAX_TC_NAME - 1);
-            std::ptr::copy_nonoverlapping(
-                name_bytes.as_ptr(),
-                CURRENT_TC_NAME_BUF.as_mut_ptr(),
-                copy_len,
-            );
-            CURRENT_TC_NAME_BUF[copy_len] = 0;
-            CURRENT_TC_NAME_LEN = copy_len;
-            CURRENT_TC_LOG_BUF_SIZE = (*cur).log_buf_size;
-        }
+        set_current_tc(name_str.as_bytes(), (*cur).log_buf_size);
 
-        if let Some(func) = (*cur).test_func {
-            if (*cur).flags & PJ_TEST_FUNC_NO_ARG != 0 {
-                // Call as int (*)(void) — no argument
-                let no_arg_func: unsafe extern "C" fn() -> i32 =
-                    std::mem::transmute(func);
-                (*cur).result = no_arg_func();
-            } else {
-                (*cur).result = func((*cur).arg);
-            }
-        }
+        run_one_test_case(cur);
 
         // Patch the result into captured logs for this test case
         let result = (*cur).result;
@@ -357,16 +451,131 @@ pub unsafe extern "C" fn pj_test_run(
 
         cur = (*cur).next;
     }
+}
 
-    // Clear current test info
-    CURRENT_TC_NAME_LEN = 0;
-    CURRENT_TC_LOG_BUF_SIZE = 0;
+/// Multi-threaded test execution (text runner, nthreads>0).
+/// Groups consecutive tests by exclusivity:
+/// - PJ_TEST_EXCLUSIVE tests run one at a time sequentially
+/// - Non-exclusive tests run in parallel using OS threads
+unsafe fn run_tests_threaded(suite: *mut pj_test_suite) {
+    let sentinel = &mut (*suite).tests as *mut pj_test_case;
 
-    // Restore original log writer
-    crate::logging::pj_log_set_log_func(orig_writer);
+    // Collect all test cases into an ordered vec
+    let mut all_tests: Vec<*mut pj_test_case> = Vec::new();
+    let mut cur = (*sentinel).next;
+    while cur != sentinel {
+        all_tests.push(cur);
+        cur = (*cur).next;
+    }
 
-    crate::time::pj_get_timestamp(&mut (*suite).end_time);
-    IS_UNDER_TEST.store(false, Ordering::SeqCst);
+    let mut i = 0;
+    while i < all_tests.len() {
+        let tc = all_tests[i];
+        if (*tc).flags & PJ_TEST_EXCLUSIVE != 0 {
+            // Run this exclusive test sequentially
+            let name = std::ffi::CStr::from_ptr((*tc).obj_name.as_ptr());
+            let name_str = name.to_str().unwrap_or("<unknown>").to_string();
+            eprintln!("[test_run] Running: {} (exclusive)", name_str);
+
+            set_current_tc(name_str.as_bytes(), (*tc).log_buf_size);
+            run_one_test_case(tc);
+
+            // Patch result into captured logs
+            let result = (*tc).result;
+            {
+                let name_bytes = name_str.as_bytes();
+                for j in 0..CAPTURED_LOG_COUNT {
+                    let log = &mut CAPTURED_LOGS[j];
+                    if log.tc_name_len == name_bytes.len()
+                        && &log.tc_name[..log.tc_name_len] == name_bytes
+                    {
+                        log.result = result;
+                    }
+                }
+            }
+
+            let status = if result == 0 { "OK" } else { "FAILED" };
+            eprintln!("[test_run]   {} => {} (rc={})", name_str, status, result);
+            i += 1;
+        } else {
+            // Collect consecutive non-exclusive tests
+            let start = i;
+            while i < all_tests.len() && (*all_tests[i]).flags & PJ_TEST_EXCLUSIVE == 0 {
+                i += 1;
+            }
+            let parallel_group = &all_tests[start..i];
+
+            eprintln!(
+                "[test_run] Running {} parallel tests",
+                parallel_group.len()
+            );
+
+            // Run parallel tests on OS threads.
+            // Each thread sets its own thread-local test case info for log capture.
+            let mut handles: Vec<(usize, std::thread::JoinHandle<i32>)> = Vec::new();
+
+            for (idx, &tc_ptr) in parallel_group.iter().enumerate() {
+                let func = (*tc_ptr).test_func;
+                let arg = (*tc_ptr).arg as usize;
+                let flags = (*tc_ptr).flags;
+                let log_buf_size = (*tc_ptr).log_buf_size;
+                // Copy test name for the thread
+                let mut tc_name_buf = [0u8; MAX_TC_NAME];
+                let tc_name = std::ffi::CStr::from_ptr((*tc_ptr).obj_name.as_ptr());
+                let tc_name_bytes = tc_name.to_bytes();
+                let copy_len = tc_name_bytes.len().min(MAX_TC_NAME - 1);
+                tc_name_buf[..copy_len].copy_from_slice(&tc_name_bytes[..copy_len]);
+
+                if let Some(f) = func {
+                    let work = TestCaseWork {
+                        func: f,
+                        arg,
+                        flags,
+                    };
+                    let handle = std::thread::spawn(move || {
+                        // Set thread-local test case info for log capture
+                        unsafe { set_current_tc(&tc_name_buf[..copy_len], log_buf_size) };
+                        let result = if work.flags & PJ_TEST_FUNC_NO_ARG != 0 {
+                            let no_arg_func: unsafe extern "C" fn() -> i32 =
+                                unsafe { std::mem::transmute(work.func) };
+                            unsafe { no_arg_func() }
+                        } else {
+                            unsafe { (work.func)(work.arg as *mut libc::c_void) }
+                        };
+                        unsafe { clear_current_tc() };
+                        result
+                    });
+                    handles.push((idx, handle));
+                } else {
+                    (*tc_ptr).result = 0;
+                }
+            }
+
+            // Wait for all threads and collect results
+            for (idx, handle) in handles {
+                if let Ok(result) = handle.join() {
+                    let tc_ptr = parallel_group[idx];
+                    (*tc_ptr).result = result;
+                    let name = std::ffi::CStr::from_ptr((*tc_ptr).obj_name.as_ptr());
+                    let name_str = name.to_str().unwrap_or("<unknown>");
+
+                    // Patch result into captured logs
+                    let name_bytes = name_str.as_bytes();
+                    for j in 0..CAPTURED_LOG_COUNT {
+                        let log = &mut CAPTURED_LOGS[j];
+                        if log.tc_name_len == name_bytes.len()
+                            && &log.tc_name[..log.tc_name_len] == name_bytes
+                        {
+                            log.result = result;
+                        }
+                    }
+
+                    let status = if result == 0 { "OK" } else { "FAILED" };
+                    eprintln!("[test_run]   {} => {} (rc={})", name_str, status, result);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,42 +756,97 @@ const PJ_TEST_KEEP_FIRST: u32 = 8;
 /// PJ_TEST_KEEP_LAST flag
 const PJ_TEST_KEEP_LAST: u32 = 16;
 
+/// LCG random number generator matching pjproject's rand_int().
+/// Returns (A * seed + C) % M where M = 2^31, A = 1103515245, C = 12345.
+fn rand_int(seed: u32) -> u32 {
+    const M: u32 = 1u32 << 31; // 2147483648
+    const A: u32 = 1103515245;
+    const C: u32 = 12345;
+    (A.wrapping_mul(seed).wrapping_add(C)) % M
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pj_test_suite_shuffle(
     suite: *mut pj_test_suite,
-    _seed: u32,
+    seed: i32,
 ) {
     if suite.is_null() {
         return;
     }
 
+    // Also call pj_srand for RNG consistency (like C does)
+    crate::misc::pj_srand(seed as u32);
+    let mut rand_val: u32 = if seed >= 0 { seed as u32 } else { crate::misc::pj_rand() as u32 };
+
     let sentinel = &mut (*suite).tests as *mut pj_test_case;
 
-    // Collect all test cases into separate lists
-    let mut keep_first: Vec<*mut pj_test_case> = Vec::new();
-    let mut keep_last: Vec<*mut pj_test_case> = Vec::new();
-    let mut normal: Vec<*mut pj_test_case> = Vec::new();
-
+    // Move all tests to a temporary source list
+    // (replicating pj_list_merge_last behavior)
+    let mut src_tests: Vec<*mut pj_test_case> = Vec::new();
     let mut cur = (*sentinel).next;
     while cur != sentinel {
         let next = (*cur).next;
-        if (*cur).flags & PJ_TEST_KEEP_FIRST != 0 {
-            keep_first.push(cur);
-        } else if (*cur).flags & PJ_TEST_KEEP_LAST != 0 {
-            keep_last.push(cur);
-        } else {
-            normal.push(cur);
-        }
+        src_tests.push(cur);
         cur = next;
     }
 
-    // Re-initialize the list as empty
+    // Re-initialize the suite list as empty
     (*sentinel).prev = sentinel;
     (*sentinel).next = sentinel;
 
-    // Re-add in order: keep_first, normal (no actual shuffling), keep_last
-    for tc in keep_first.iter().chain(normal.iter()).chain(keep_last.iter()) {
-        let tc = *tc;
+    // Move KEEP_FIRST tests to destination first (preserving order)
+    let mut i = 0;
+    while i < src_tests.len() {
+        if (*src_tests[i]).flags & PJ_TEST_KEEP_FIRST != 0 {
+            let tc = src_tests.remove(i);
+            let prev = (*sentinel).prev;
+            (*tc).prev = prev;
+            (*tc).next = sentinel;
+            (*prev).next = tc;
+            (*sentinel).prev = tc;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Count non-KEEP_LAST tests (these are the "movable" ones)
+    let total_initial = src_tests.len();
+    let mut movable = 0usize;
+    for &tc in &src_tests {
+        if (*tc).flags & PJ_TEST_KEEP_LAST == 0 {
+            movable += 1;
+        }
+    }
+
+    // Shuffle non-KEEP_LAST tests using random step selection
+    // This matches the C algorithm exactly
+    while movable > 0 {
+        let total = src_tests.len();
+        if total == 0 {
+            break;
+        }
+        rand_val = rand_int(rand_val);
+        let step = (rand_val as usize) % total;
+
+        let tc = src_tests[step];
+
+        // Skip KEEP_LAST tests (they stay in the source list)
+        if (*tc).flags & PJ_TEST_KEEP_LAST != 0 {
+            continue;
+        }
+
+        // Remove from source and add to destination
+        src_tests.remove(step);
+        let prev = (*sentinel).prev;
+        (*tc).prev = prev;
+        (*tc).next = sentinel;
+        (*prev).next = tc;
+        (*sentinel).prev = tc;
+        movable -= 1;
+    }
+
+    // Move remaining KEEP_LAST tests to destination (preserving order)
+    for tc in src_tests {
         let prev = (*sentinel).prev;
         (*tc).prev = prev;
         (*tc).next = sentinel;

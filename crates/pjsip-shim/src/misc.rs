@@ -222,23 +222,30 @@ pub unsafe extern "C" fn pj_hash_create(
     Box::into_raw(inner) as *mut pj_hash_table_t
 }
 
+/// PJ_HASH_KEY_STRING -- treat key as null-terminated string.
+const PJ_HASH_KEY_STRING: u32 = 0xFFFFFFFF;
+
+fn hash_resolve_keylen(key: *const libc::c_void, keylen: u32) -> usize {
+    if keylen == PJ_HASH_KEY_STRING {
+        unsafe { libc::strlen(key as *const _) }
+    } else {
+        keylen as usize
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pj_hash_get(
     ht: *mut pj_hash_table_t,
     key: *const libc::c_void,
-    keylen: i32,
+    keylen: u32,
     _hval: *mut u32,
 ) -> *mut libc::c_void {
     if ht.is_null() || key.is_null() {
         return std::ptr::null_mut();
     }
     let inner = &*(ht as *const HashInner);
-    let keylen = if keylen < 0 {
-        libc::strlen(key as *const _)
-    } else {
-        keylen as usize
-    };
-    let key_bytes = std::slice::from_raw_parts(key as *const u8, keylen).to_vec();
+    let klen = hash_resolve_keylen(key, keylen);
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, klen).to_vec();
     match inner.map.get(&key_bytes) {
         Some(&(val, _)) => val,
         None => std::ptr::null_mut(),
@@ -250,7 +257,7 @@ pub unsafe extern "C" fn pj_hash_set(
     _pool: *mut pj_pool_t,
     ht: *mut pj_hash_table_t,
     key: *const libc::c_void,
-    keylen: i32,
+    keylen: u32,
     hval: u32,
     value: *mut libc::c_void,
 ) {
@@ -258,12 +265,8 @@ pub unsafe extern "C" fn pj_hash_set(
         return;
     }
     let inner = &mut *(ht as *mut HashInner);
-    let keylen = if keylen < 0 {
-        libc::strlen(key as *const _)
-    } else {
-        keylen as usize
-    };
-    let key_bytes = std::slice::from_raw_parts(key as *const u8, keylen).to_vec();
+    let klen = hash_resolve_keylen(key, keylen);
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, klen).to_vec();
     if value.is_null() {
         inner.map.remove(&key_bytes);
     } else {
@@ -275,7 +278,7 @@ pub unsafe extern "C" fn pj_hash_set(
 pub unsafe extern "C" fn pj_hash_set_np(
     ht: *mut pj_hash_table_t,
     key: *const libc::c_void,
-    keylen: i32,
+    keylen: u32,
     hval: u32,
     value: *mut libc::c_void,
 ) {
@@ -326,44 +329,42 @@ pub unsafe extern "C" fn pj_hash_next(
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_hash_this(
-    _ht: *mut pj_hash_table_t,
+    ht: *mut pj_hash_table_t,
     it: *mut pj_hash_iterator_t,
-    key: *mut *const libc::c_void,
-    keylen: *mut i32,
-    value: *mut *mut libc::c_void,
-) {
-    // Stub: set all to null
-    if !key.is_null() {
-        *key = std::ptr::null();
+) -> *mut libc::c_void {
+    if ht.is_null() || it.is_null() {
+        return std::ptr::null_mut();
     }
-    if !keylen.is_null() {
-        *keylen = 0;
+    let inner = &*(ht as *const HashInner);
+    let idx = (*it)._index as usize;
+    if let Some((_, &(v, _))) = inner.map.iter().nth(idx) {
+        v
+    } else {
+        std::ptr::null_mut()
     }
-    if !value.is_null() {
-        *value = std::ptr::null_mut();
-    }
-    let _ = it;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_hash_calc(
-    _hval: u32,
+    hval: u32,
     key: *const libc::c_void,
-    keylen: i32,
+    keylen: u32,
 ) -> u32 {
     if key.is_null() {
-        return 0;
+        return hval;
     }
-    let len = if keylen < 0 {
-        libc::strlen(key as *const _)
+    let mut hash = hval;
+    if keylen == PJ_HASH_KEY_STRING {
+        let mut p = key as *const u8;
+        while *p != 0 {
+            hash = hash.wrapping_mul(33).wrapping_add(*p as u32);
+            p = p.add(1);
+        }
     } else {
-        keylen as usize
-    };
-    let bytes = std::slice::from_raw_parts(key as *const u8, len);
-    // Simple hash (DJB2)
-    let mut hash = 5381u32;
-    for &b in bytes {
-        hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+        let bytes = std::slice::from_raw_parts(key as *const u8, keylen as usize);
+        for &b in bytes {
+            hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+        }
     }
     hash
 }
@@ -372,18 +373,14 @@ pub unsafe extern "C" fn pj_hash_calc(
 // Random
 // ============================================================================
 
-static mut RANDOM_SEED: u32 = 12345;
-
 #[no_mangle]
 pub unsafe extern "C" fn pj_srand(seed: u32) {
-    RANDOM_SEED = seed;
+    libc::srand(seed as libc::c_uint);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_rand() -> i32 {
-    // Simple LCG
-    RANDOM_SEED = RANDOM_SEED.wrapping_mul(1103515245).wrapping_add(12345);
-    ((RANDOM_SEED >> 16) & 0x7FFF) as i32
+    libc::rand() as i32
 }
 
 // ============================================================================
@@ -1620,23 +1617,24 @@ pub unsafe extern "C" fn pj_pool_create_on_buf(
 /// Red-black tree node.
 #[repr(C)]
 pub struct pj_rbtree_node {
-    pub prev: *mut pj_rbtree_node,
-    pub next: *mut pj_rbtree_node,
-    pub left: *mut pj_rbtree_node,
-    pub right: *mut pj_rbtree_node,
-    pub parent: *mut pj_rbtree_node,
-    pub key: *const libc::c_void,
-    pub user_data: *mut libc::c_void,
-    pub color: i32,
+    pub parent: *mut pj_rbtree_node,  // offset 0
+    pub left: *mut pj_rbtree_node,    // offset 8
+    pub right: *mut pj_rbtree_node,   // offset 16
+    pub key: *const libc::c_void,     // offset 24
+    pub user_data: *mut libc::c_void, // offset 32
+    pub color: i32,                   // offset 40 (pj_rbcolor_t = enum = int)
+    _pad: i32,                        // offset 44 (alignment padding)
 }
 
 /// Red-black tree.
 #[repr(C)]
 pub struct pj_rbtree {
-    pub null_node: pj_rbtree_node,
-    pub size: u32,
-    pub root: *mut pj_rbtree_node,
-    pub comp: Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> i32>,
+    pub null_node: pj_rbtree_node,   // offset 0 (48 bytes)
+    pub null: *mut pj_rbtree_node,   // offset 48
+    pub root: *mut pj_rbtree_node,   // offset 56
+    pub size: u32,                   // offset 64
+    _pad: u32,                       // offset 68
+    pub comp: Option<unsafe extern "C" fn(*const libc::c_void, *const libc::c_void) -> i32>,  // offset 72
 }
 
 #[no_mangle]
@@ -1647,193 +1645,161 @@ pub unsafe extern "C" fn pj_rbtree_init(
     if tree.is_null() {
         return;
     }
-    std::ptr::write_bytes(tree as *mut u8, 0, std::mem::size_of::<pj_rbtree>());
     let null_node = &mut (*tree).null_node as *mut pj_rbtree_node;
+    (*tree).null = null_node;
+    (*tree).root = null_node;
+    (*null_node).key = std::ptr::null();
+    (*null_node).user_data = std::ptr::null_mut();
     (*null_node).left = null_node;
     (*null_node).right = null_node;
     (*null_node).parent = null_node;
-    (*null_node).prev = null_node;
-    (*null_node).next = null_node;
     (*null_node).color = 0; // BLACK
-    (*tree).root = null_node;
-    (*tree).comp = comp;
     (*tree).size = 0;
+    (*tree).comp = comp;
 }
 
-// Internal helpers for rbtree
-unsafe fn rbtree_null(tree: *mut pj_rbtree) -> *mut pj_rbtree_node {
-    &mut (*tree).null_node as *mut pj_rbtree_node
-}
-
-unsafe fn rbtree_rotate_left(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
-    let null = rbtree_null(tree);
-    let right = (*node).right;
-    (*node).right = (*right).left;
-    if (*right).left != null {
-        (*(*right).left).parent = node;
+// Rotation helpers matching pjproject's rbtree.c exactly.
+unsafe fn left_rotate(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
+    let rnode = (*node).right;
+    if rnode == (*tree).null {
+        return;
     }
-    (*right).parent = (*node).parent;
-    if (*node).parent == null {
-        (*tree).root = right;
-    } else if node == (*(*node).parent).left {
-        (*(*node).parent).left = right;
+    (*node).right = (*rnode).left;
+    if (*rnode).left != (*tree).null {
+        (*(*rnode).left).parent = node;
+    }
+    let parent = (*node).parent;
+    (*rnode).parent = parent;
+    if parent != (*tree).null {
+        if (*parent).left == node {
+            (*parent).left = rnode;
+        } else {
+            (*parent).right = rnode;
+        }
     } else {
-        (*(*node).parent).right = right;
+        (*tree).root = rnode;
     }
-    (*right).left = node;
-    (*node).parent = right;
+    (*rnode).left = node;
+    (*node).parent = rnode;
 }
 
-unsafe fn rbtree_rotate_right(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
-    let null = rbtree_null(tree);
-    let left = (*node).left;
-    (*node).left = (*left).right;
-    if (*left).right != null {
-        (*(*left).right).parent = node;
+unsafe fn right_rotate(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) {
+    let lnode = (*node).left;
+    if lnode == (*tree).null {
+        return;
     }
-    (*left).parent = (*node).parent;
-    if (*node).parent == null {
-        (*tree).root = left;
-    } else if node == (*(*node).parent).right {
-        (*(*node).parent).right = left;
+    (*node).left = (*lnode).right;
+    if (*lnode).right != (*tree).null {
+        (*(*lnode).right).parent = node;
+    }
+    let parent = (*node).parent;
+    (*lnode).parent = parent;
+    if parent != (*tree).null {
+        if (*parent).left == node {
+            (*parent).left = lnode;
+        } else {
+            (*parent).right = lnode;
+        }
     } else {
-        (*(*node).parent).left = left;
+        (*tree).root = lnode;
     }
-    (*left).right = node;
-    (*node).parent = left;
+    (*lnode).right = node;
+    (*node).parent = lnode;
 }
 
-unsafe fn rbtree_insert_fixup(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) {
-    let null = rbtree_null(tree);
-    while (*(*node).parent).color == 1 { // parent is RED
-        if (*node).parent == (*(*(*node).parent).parent).left {
-            let uncle = (*(*(*node).parent).parent).right;
-            if (*uncle).color == 1 { // uncle RED
-                (*(*node).parent).color = 0;
-                (*uncle).color = 0;
-                (*(*(*node).parent).parent).color = 1;
-                node = (*(*node).parent).parent;
+unsafe fn insert_fixup(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) {
+    while node != (*tree).root && (*(*node).parent).color == 1 {
+        let parent = (*node).parent;
+        if parent == (*(*parent).parent).left {
+            let temp = (*(*parent).parent).right;
+            if (*temp).color == 1 {
+                (*temp).color = 0;
+                node = parent;
+                (*node).color = 0;
+                node = (*node).parent;
+                (*node).color = 1;
             } else {
-                if node == (*(*node).parent).right {
-                    node = (*node).parent;
-                    rbtree_rotate_left(tree, node);
+                if node == (*parent).right {
+                    node = parent;
+                    left_rotate(tree, node);
                 }
-                (*(*node).parent).color = 0;
-                (*(*(*node).parent).parent).color = 1;
-                rbtree_rotate_right(tree, (*(*node).parent).parent);
+                let temp2 = (*node).parent;
+                (*temp2).color = 0;
+                let temp3 = (*temp2).parent;
+                (*temp3).color = 1;
+                right_rotate(tree, temp3);
             }
         } else {
-            let uncle = (*(*(*node).parent).parent).left;
-            if (*uncle).color == 1 {
-                (*(*node).parent).color = 0;
-                (*uncle).color = 0;
-                (*(*(*node).parent).parent).color = 1;
-                node = (*(*node).parent).parent;
+            let temp = (*(*parent).parent).left;
+            if (*temp).color == 1 {
+                (*temp).color = 0;
+                node = parent;
+                (*node).color = 0;
+                node = (*node).parent;
+                (*node).color = 1;
             } else {
-                if node == (*(*node).parent).left {
-                    node = (*node).parent;
-                    rbtree_rotate_right(tree, node);
+                if node == (*parent).left {
+                    node = parent;
+                    right_rotate(tree, node);
                 }
-                (*(*node).parent).color = 0;
-                (*(*(*node).parent).parent).color = 1;
-                rbtree_rotate_left(tree, (*(*node).parent).parent);
+                let temp2 = (*node).parent;
+                (*temp2).color = 0;
+                let temp3 = (*temp2).parent;
+                (*temp3).color = 1;
+                left_rotate(tree, temp3);
             }
         }
-        if (*node).parent == null {
-            break;
-        }
     }
-    (*(*tree).root).color = 0; // root is BLACK
+    (*(*tree).root).color = 0;
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_rbtree_insert(
     tree: *mut pj_rbtree,
-    node: *mut pj_rbtree_node,
+    element: *mut pj_rbtree_node,
 ) -> i32 {
-    if tree.is_null() || node.is_null() {
+    if tree.is_null() || element.is_null() {
         return -1;
     }
-    let null = rbtree_null(tree);
+    let null = (*tree).null;
     let comp = match (*tree).comp {
         Some(f) => f,
         None => return -1,
     };
 
-    // BST insertion
+    let mut rv = 0i32;
     let mut parent = null;
     let mut current = (*tree).root;
     while current != null {
+        rv = comp((*element).key, (*current).key);
+        if rv == 0 {
+            // Duplicate key
+            return -1;
+        }
         parent = current;
-        let cmp = comp((*node).key, (*current).key);
-        if cmp < 0 {
-            current = (*current).left;
-        } else {
-            current = (*current).right;
-        }
+        current = if rv < 0 { (*current).left } else { (*current).right };
     }
 
-    (*node).parent = parent;
-    (*node).left = null;
-    (*node).right = null;
-    (*node).color = 1; // RED
+    (*element).color = 1; // RED
+    (*element).left = null;
+    (*element).right = null;
 
-    if parent == null {
-        (*tree).root = node;
+    if parent != null {
+        (*element).parent = parent;
+        if rv < 0 {
+            (*parent).left = element;
+        } else {
+            (*parent).right = element;
+        }
+        insert_fixup(tree, element);
     } else {
-        let cmp = comp((*node).key, (*parent).key);
-        if cmp < 0 {
-            (*parent).left = node;
-        } else {
-            (*parent).right = node;
-        }
+        (*tree).root = element;
+        (*element).parent = null;
+        (*element).color = 0; // BLACK
     }
 
-    // Maintain linked list (sorted order)
-    // Find predecessor and successor
-    let pred = rbtree_prev_node(tree, node);
-    let succ = if pred != null { (*pred).next } else { rbtree_min(tree, (*tree).root) };
-
-    if pred != null {
-        (*pred).next = node;
-    }
-    (*node).prev = pred;
-    (*node).next = succ;
-    if succ != null {
-        (*succ).prev = node;
-    }
-
-    rbtree_insert_fixup(tree, node);
     (*tree).size += 1;
     0
-}
-
-unsafe fn rbtree_min(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) -> *mut pj_rbtree_node {
-    let null = rbtree_null(tree);
-    while (*node).left != null {
-        node = (*node).left;
-    }
-    node
-}
-
-unsafe fn rbtree_prev_node(tree: *mut pj_rbtree, node: *mut pj_rbtree_node) -> *mut pj_rbtree_node {
-    let null = rbtree_null(tree);
-    if (*node).left != null {
-        // Rightmost node in left subtree
-        let mut n = (*node).left;
-        while (*n).right != null {
-            n = (*n).right;
-        }
-        return n;
-    }
-    // Walk up to find predecessor
-    let mut n = node;
-    let mut p = (*n).parent;
-    while p != null && n == (*p).left {
-        n = p;
-        p = (*p).parent;
-    }
-    if p == null { null } else { p }
 }
 
 #[no_mangle]
@@ -1844,7 +1810,7 @@ pub unsafe extern "C" fn pj_rbtree_find(
     if tree.is_null() {
         return std::ptr::null_mut();
     }
-    let null = rbtree_null(tree);
+    let null = (*tree).null;
     let comp = match (*tree).comp {
         Some(f) => f,
         None => return std::ptr::null_mut(),
@@ -1870,12 +1836,12 @@ pub unsafe extern "C" fn pj_rbtree_first(
     if tree.is_null() {
         return std::ptr::null_mut();
     }
-    let null = rbtree_null(tree);
-    if (*tree).root == null {
-        return std::ptr::null_mut();
+    let null = (*tree).null;
+    let mut node = (*tree).root;
+    while (*node).left != null {
+        node = (*node).left;
     }
-    let node = rbtree_min(tree, (*tree).root);
-    if node == null { std::ptr::null_mut() } else { node }
+    if node != null { node } else { std::ptr::null_mut() }
 }
 
 #[no_mangle]
@@ -1886,82 +1852,77 @@ pub unsafe extern "C" fn pj_rbtree_next(
     if tree.is_null() || node.is_null() {
         return std::ptr::null_mut();
     }
-    let null = rbtree_null(tree);
-    // Use the linked list next pointer
-    let next = (*node).next;
-    if next == null || next.is_null() {
-        std::ptr::null_mut()
+    let null = (*tree).null;
+    let mut n = node;
+    if (*n).right != null {
+        n = (*n).right;
+        while (*n).left != null {
+            n = (*n).left;
+        }
     } else {
-        next
+        let mut temp = (*n).parent;
+        while temp != null && (*temp).right == n {
+            n = temp;
+            temp = (*temp).parent;
+        }
+        n = temp;
     }
+    if n != null { n } else { std::ptr::null_mut() }
 }
 
-unsafe fn rbtree_transplant(tree: *mut pj_rbtree, u: *mut pj_rbtree_node, v: *mut pj_rbtree_node) {
-    let null = rbtree_null(tree);
-    if (*u).parent == null {
-        (*tree).root = v;
-    } else if u == (*(*u).parent).left {
-        (*(*u).parent).left = v;
-    } else {
-        (*(*u).parent).right = v;
-    }
-    (*v).parent = (*u).parent;
-}
-
-unsafe fn rbtree_erase_fixup(tree: *mut pj_rbtree, mut x: *mut pj_rbtree_node) {
-    let null = rbtree_null(tree);
-    while x != (*tree).root && (*x).color == 0 {
-        if x == (*(*x).parent).left {
-            let mut w = (*(*x).parent).right;
-            if (*w).color == 1 {
-                (*w).color = 0;
-                (*(*x).parent).color = 1;
-                rbtree_rotate_left(tree, (*x).parent);
-                w = (*(*x).parent).right;
+unsafe fn delete_fixup(tree: *mut pj_rbtree, mut node: *mut pj_rbtree_node) {
+    while node != (*tree).root && (*node).color == 0 {
+        if (*(*node).parent).left == node {
+            let mut temp = (*(*node).parent).right;
+            if (*temp).color == 1 {
+                (*temp).color = 0;
+                (*(*node).parent).color = 1;
+                left_rotate(tree, (*node).parent);
+                temp = (*(*node).parent).right;
             }
-            if (*(*w).left).color == 0 && (*(*w).right).color == 0 {
-                (*w).color = 1;
-                x = (*x).parent;
+            if (*(*temp).left).color == 0 && (*(*temp).right).color == 0 {
+                (*temp).color = 1;
+                node = (*node).parent;
             } else {
-                if (*(*w).right).color == 0 {
-                    (*(*w).left).color = 0;
-                    (*w).color = 1;
-                    rbtree_rotate_right(tree, w);
-                    w = (*(*x).parent).right;
+                if (*(*temp).right).color == 0 {
+                    (*(*temp).left).color = 0;
+                    (*temp).color = 1;
+                    right_rotate(tree, temp);
+                    temp = (*(*node).parent).right;
                 }
-                (*w).color = (*(*x).parent).color;
-                (*(*x).parent).color = 0;
-                (*(*w).right).color = 0;
-                rbtree_rotate_left(tree, (*x).parent);
-                x = (*tree).root;
+                (*temp).color = (*(*node).parent).color;
+                (*(*temp).right).color = 0;
+                (*(*node).parent).color = 0;
+                left_rotate(tree, (*node).parent);
+                node = (*tree).root;
             }
         } else {
-            let mut w = (*(*x).parent).left;
-            if (*w).color == 1 {
-                (*w).color = 0;
-                (*(*x).parent).color = 1;
-                rbtree_rotate_right(tree, (*x).parent);
-                w = (*(*x).parent).left;
+            let mut temp = (*(*node).parent).left;
+            if (*temp).color == 1 {
+                (*temp).color = 0;
+                (*(*node).parent).color = 1;
+                right_rotate(tree, (*node).parent);
+                temp = (*(*node).parent).left;
             }
-            if (*(*w).right).color == 0 && (*(*w).left).color == 0 {
-                (*w).color = 1;
-                x = (*x).parent;
+            if (*(*temp).right).color == 0 && (*(*temp).left).color == 0 {
+                (*temp).color = 1;
+                node = (*node).parent;
             } else {
-                if (*(*w).left).color == 0 {
-                    (*(*w).right).color = 0;
-                    (*w).color = 1;
-                    rbtree_rotate_left(tree, w);
-                    w = (*(*x).parent).left;
+                if (*(*temp).left).color == 0 {
+                    (*(*temp).right).color = 0;
+                    (*temp).color = 1;
+                    left_rotate(tree, temp);
+                    temp = (*(*node).parent).left;
                 }
-                (*w).color = (*(*x).parent).color;
-                (*(*x).parent).color = 0;
-                (*(*w).left).color = 0;
-                rbtree_rotate_right(tree, (*x).parent);
-                x = (*tree).root;
+                (*temp).color = (*(*node).parent).color;
+                (*(*node).parent).color = 0;
+                (*(*temp).left).color = 0;
+                right_rotate(tree, (*node).parent);
+                node = (*tree).root;
             }
         }
     }
-    (*x).color = 0;
+    (*node).color = 0;
 }
 
 #[no_mangle]
@@ -1972,48 +1933,63 @@ pub unsafe extern "C" fn pj_rbtree_erase(
     if tree.is_null() || node.is_null() {
         return std::ptr::null_mut();
     }
-    let null = rbtree_null(tree);
+    let null = (*tree).null;
 
-    // Remove from linked list
-    let prev = (*node).prev;
-    let next = (*node).next;
-    if prev != null && !prev.is_null() {
-        (*prev).next = next;
-    }
-    if next != null && !next.is_null() {
-        (*next).prev = prev;
-    }
-
-    let mut y = node;
-    let mut y_original_color = (*y).color;
-    let x;
-
-    if (*node).left == null {
-        x = (*node).right;
-        rbtree_transplant(tree, node, (*node).right);
-    } else if (*node).right == null {
-        x = (*node).left;
-        rbtree_transplant(tree, node, (*node).left);
+    let succ;
+    if (*node).left == null || (*node).right == null {
+        succ = node;
     } else {
-        y = rbtree_min(tree, (*node).right);
-        y_original_color = (*y).color;
-        let x_inner = (*y).right;
-        if (*y).parent == node {
-            (*x_inner).parent = y;
-        } else {
-            rbtree_transplant(tree, y, (*y).right);
-            (*y).right = (*node).right;
-            (*(*y).right).parent = y;
+        let mut s = (*node).right;
+        while (*s).left != null {
+            s = (*s).left;
         }
-        rbtree_transplant(tree, node, y);
-        (*y).left = (*node).left;
-        (*(*y).left).parent = y;
-        (*y).color = (*node).color;
-        x = x_inner;
+        succ = s;
     }
 
-    if y_original_color == 0 {
-        rbtree_erase_fixup(tree, x);
+    let child = if (*succ).left != null { (*succ).left } else { (*succ).right };
+    let parent = (*succ).parent;
+    (*child).parent = parent;
+
+    if parent != null {
+        if (*parent).left == succ {
+            (*parent).left = child;
+        } else {
+            (*parent).right = child;
+        }
+    } else {
+        (*tree).root = child;
+    }
+
+    if succ != node {
+        (*succ).parent = (*node).parent;
+        (*succ).left = (*node).left;
+        (*succ).right = (*node).right;
+        (*succ).color = (*node).color;
+
+        let parent2 = (*node).parent;
+        if parent2 != null {
+            if (*parent2).left == node {
+                (*parent2).left = succ;
+            } else {
+                (*parent2).right = succ;
+            }
+        }
+        if (*node).left != null {
+            (*(*node).left).parent = succ;
+        }
+        if (*node).right != null {
+            (*(*node).right).parent = succ;
+        }
+        if (*tree).root == node {
+            (*tree).root = succ;
+        }
+    }
+
+    if (*succ).color == 0 {
+        if child != null {
+            delete_fixup(tree, child);
+        }
+        (*(*tree).null).color = 0;
     }
 
     (*tree).size -= 1;
