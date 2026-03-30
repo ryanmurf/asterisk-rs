@@ -1106,7 +1106,7 @@ mod tests {
             let val = 42usize as *mut libc::c_void;
             misc::pj_hash_set(
                 std::ptr::null_mut(),
-                ht, key.as_ptr() as *const _, -1, 0, val,
+                ht, key.as_ptr() as *const _, u32::MAX, 0, val,
             );
             assert_eq!(misc::pj_hash_count(ht), 1);
 
@@ -1116,7 +1116,7 @@ mod tests {
             // Remove
             misc::pj_hash_set(
                 std::ptr::null_mut(),
-                ht, key.as_ptr() as *const _, -1, 0, std::ptr::null_mut(),
+                ht, key.as_ptr() as *const _, u32::MAX, 0, std::ptr::null_mut(),
             );
             assert_eq!(misc::pj_hash_count(ht), 0);
         }
@@ -1208,11 +1208,11 @@ mod tests {
             assert_eq!(atomic::pj_grp_lock_acquire(lock), PJ_SUCCESS);
             assert_eq!(atomic::pj_grp_lock_release(lock), PJ_SUCCESS);
 
+            // create starts at ref_count=0; add_ref brings it to 1
             atomic::pj_grp_lock_add_ref(lock);
+            assert_eq!(atomic::pj_grp_lock_get_ref(lock), 1);
+            // dec_ref brings it to 0, triggers destroy
             assert_eq!(atomic::pj_grp_lock_dec_ref(lock), PJ_SUCCESS);
-            // Still alive (ref_count was 2, now 1)
-            assert_eq!(atomic::pj_grp_lock_dec_ref(lock), PJ_SUCCESS);
-            // Now destroyed (ref_count was 1, now 0)
         }
     }
 

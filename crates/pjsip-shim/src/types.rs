@@ -12,14 +12,16 @@ use std::mem::ManuallyDrop;
 /// pj_status_t -- the universal return type for pjproject APIs.
 pub type pj_status_t = i32;
 pub const PJ_SUCCESS: pj_status_t = 0;
-pub const PJ_EINVAL: pj_status_t = 70014;
-pub const PJ_ENOMEM: pj_status_t = 70015;
-pub const PJ_ENOTFOUND: pj_status_t = 70018;
+pub const PJ_EPENDING: pj_status_t = 70002;
+pub const PJ_EINVAL: pj_status_t = 70004;
+pub const PJ_ENOTFOUND: pj_status_t = 70006;
+pub const PJ_ENOMEM: pj_status_t = 70007;
+pub const PJ_ETIMEDOUT: pj_status_t = 70009;
+pub const PJ_ETOOMANY: pj_status_t = 70010;
+pub const PJ_EBUSY: pj_status_t = 70011;
+pub const PJ_EINVALIDOP: pj_status_t = 70013;
+pub const PJ_EEOF: pj_status_t = 70016;
 pub const PJ_ETOOBIG: pj_status_t = 70017;
-pub const PJ_ETOOMANY: pj_status_t = 70027;
-pub const PJ_EEOF: pj_status_t = 70028;
-pub const PJ_EBUSY: pj_status_t = 70029;
-pub const PJ_EINVALIDOP: pj_status_t = 70030;
 
 /// Boolean type used by pjproject.
 pub type pj_bool_t = i32;
@@ -230,7 +232,10 @@ pub struct pjsip_endpoint {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct pj_sockaddr_in {
-    pub sin_family: u16,
+    /// On macOS (PJ_SOCKADDR_HAS_LEN=1), this is sin_zero_len (must be 0).
+    #[cfg(target_os = "macos")]
+    pub sin_zero_len: u8,
+    pub sin_family: pj_af_t,
     pub sin_port: u16,
     pub sin_addr: pj_in_addr,
     pub sin_zero: [u8; 8],
@@ -245,7 +250,9 @@ pub struct pj_in_addr {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct pj_sockaddr_in6 {
-    pub sin6_family: u16,
+    #[cfg(target_os = "macos")]
+    pub sin6_zero_len: u8,
+    pub sin6_family: pj_af_t,
     pub sin6_port: u16,
     pub sin6_flowinfo: u32,
     pub sin6_addr: pj_in6_addr,
@@ -264,9 +271,15 @@ pub union pj_sockaddr {
     pub ipv6: pj_sockaddr_in6,
 }
 
-/// Address family constants.
-pub const PJ_AF_INET: u16 = 2;
+/// sin_family field type: u8 on macOS (PJ_SOCKADDR_HAS_LEN=1), u16 on Linux.
 #[cfg(target_os = "macos")]
-pub const PJ_AF_INET6: u16 = 30;
+pub type pj_af_t = u8;
+#[cfg(not(target_os = "macos"))]
+pub type pj_af_t = u16;
+
+/// Address family constants.
+pub const PJ_AF_INET: pj_af_t = 2;
+#[cfg(target_os = "macos")]
+pub const PJ_AF_INET6: pj_af_t = 30;
 #[cfg(target_os = "linux")]
-pub const PJ_AF_INET6: u16 = 10;
+pub const PJ_AF_INET6: pj_af_t = 10;

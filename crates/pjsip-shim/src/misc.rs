@@ -62,10 +62,11 @@ pub unsafe extern "C" fn pj_file_read(
     let fd = handle as isize as i32;
     let n = libc::read(fd, buf, *size as usize);
     if n < 0 {
+        *size = -1;
         return PJ_EINVAL;
     }
     *size = n as isize;
-    if n == 0 { PJ_EEOF } else { PJ_SUCCESS }
+    PJ_SUCCESS
 }
 
 #[no_mangle]
@@ -173,19 +174,35 @@ pub unsafe extern "C" fn pj_file_move(
     if libc::rename(oldpath, newpath) == 0 { PJ_SUCCESS } else { PJ_EINVAL }
 }
 
+/// pj_file_stat layout: { pj_off_t size, pj_time_val atime, mtime, ctime }
+#[repr(C)]
+struct PjFileStat {
+    size: pj_off_t,
+    atime: crate::timer::pj_time_val,
+    mtime: crate::timer::pj_time_val,
+    ctime: crate::timer::pj_time_val,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pj_file_getstat(
     path: *const libc::c_char,
-    stat: *mut libc::c_void,
+    pj_stat: *mut PjFileStat,
 ) -> pj_status_t {
-    if path.is_null() || stat.is_null() {
+    if path.is_null() || pj_stat.is_null() {
         return PJ_EINVAL;
     }
-    if libc::stat(path, stat as *mut libc::stat) == 0 {
-        PJ_SUCCESS
-    } else {
-        PJ_EINVAL
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::stat(path, &mut st) != 0 {
+        return PJ_EINVAL;
     }
+    (*pj_stat).size = st.st_size as pj_off_t;
+    (*pj_stat).atime.sec = st.st_atime as libc::c_long;
+    (*pj_stat).atime.msec = 0;
+    (*pj_stat).mtime.sec = st.st_mtime as libc::c_long;
+    (*pj_stat).mtime.msec = 0;
+    (*pj_stat).ctime.sec = st.st_ctime as libc::c_long;
+    (*pj_stat).ctime.msec = 0;
+    PJ_SUCCESS
 }
 
 // ============================================================================
@@ -1512,7 +1529,7 @@ pub unsafe extern "C" fn pj_sockaddr_get_family(addr: *const pj_sockaddr) -> u16
     if addr.is_null() {
         return 0;
     }
-    (*addr).addr.sin_family
+    (*addr).addr.sin_family as u16
 }
 
 /// Set sockaddr length (no-op for us)

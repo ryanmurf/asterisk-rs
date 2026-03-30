@@ -400,36 +400,41 @@ fn parse_ipv4_simple(s: &str) -> Option<u32> {
 pub unsafe extern "C" fn pj_inet_aton(
     cp: *const pj_str_t,
     inp: *mut pj_in_addr,
-) -> pj_status_t {
+) -> i32 {
     if cp.is_null() || inp.is_null() {
-        return PJ_EINVAL;
+        return 0;
     }
     let text = (*cp).as_str();
     match parse_ipv4_simple(text) {
         Some(addr) => {
             (*inp).s_addr = addr;
-            PJ_SUCCESS
+            1 // nonzero = success
         }
-        None => PJ_EINVAL,
+        None => 0,
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_inet_ntoa(addr: pj_in_addr) -> *const libc::c_char {
-    // Use a thread-local buffer for the result
+    // Use a thread-local buffer. The UnsafeCell avoids RefCell overhead and
+    // allows returning a pointer directly.
+    use std::cell::UnsafeCell;
     thread_local! {
-        static BUF: std::cell::RefCell<[u8; 20]> = const { std::cell::RefCell::new([0u8; 20]) };
+        static BUF: UnsafeCell<[u8; 20]> = const { UnsafeCell::new([0u8; 20]) };
     }
     let ip = u32::from_be(addr.s_addr);
     let a = (ip >> 24) & 0xFF;
     let b = (ip >> 16) & 0xFF;
     let c = (ip >> 8) & 0xFF;
     let d = ip & 0xFF;
-    let s = format!("{}.{}.{}.{}\0", a, b, c, d);
-    BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        let len = s.len().min(buf.len());
-        buf[..len].copy_from_slice(&s.as_bytes()[..len]);
+    let s = format!("{}.{}.{}.{}", a, b, c, d);
+
+    BUF.with(|cell| {
+        let buf = &mut *cell.get();
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(buf.len() - 1);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        buf[len] = 0; // null terminator
         buf.as_ptr() as *const libc::c_char
     })
 }
@@ -683,7 +688,7 @@ pub unsafe extern "C" fn pj_sockaddr_set_str_addr(
     }
     let text = (*str_addr).as_str();
     let af = af as u16;
-    if af == PJ_AF_INET {
+    if af == PJ_AF_INET as u16 {
         if let Some(ipv4) = parse_ipv4_simple(text) {
             (*addr).addr.sin_addr.s_addr = ipv4;
             return PJ_SUCCESS;

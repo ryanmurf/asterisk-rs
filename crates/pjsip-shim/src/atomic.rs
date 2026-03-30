@@ -148,7 +148,7 @@ pub unsafe extern "C" fn pj_grp_lock_create(
     }
     let inner = Box::new(GrpLockInner {
         lock: parking_lot::ReentrantMutex::new(()),
-        ref_count: AtomicIsize::new(1),
+        ref_count: AtomicIsize::new(0),
         destroy_handlers: Vec::new(),
     });
     *p_lock = Box::into_raw(inner) as *mut pj_grp_lock_t;

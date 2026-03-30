@@ -35,24 +35,40 @@ pub unsafe extern "C" fn pj_sockaddr_parse(
     let af = af as u16;
 
     // Try IPv4
-    if af == 0 || af == PJ_AF_INET {
-        if let Some(ipv4) = parse_ipv4(host) {
+    if af == 0 || af == PJ_AF_INET as u16 {
+        // Empty host => 0.0.0.0
+        let ipv4 = if host.is_empty() {
+            Some(0u32)
+        } else {
+            parse_ipv4(host)
+        };
+        if let Some(ipv4) = ipv4 {
+            std::ptr::write_bytes(sockaddr as *mut u8, 0, std::mem::size_of::<pj_sockaddr_in>());
             (*sockaddr).addr.sin_family = PJ_AF_INET;
             (*sockaddr).addr.sin_port = (port as u16).to_be();
             (*sockaddr).addr.sin_addr.s_addr = ipv4;
-            (*sockaddr).addr.sin_zero = [0u8; 8];
             return PJ_SUCCESS;
         }
     }
 
     // Try IPv6
-    if af == 0 || af == PJ_AF_INET6 {
+    if af == 0 || af == PJ_AF_INET6 as u16 {
         if let Some(ipv6_bytes) = parse_ipv6(host) {
+            std::ptr::write_bytes(sockaddr as *mut u8, 0, std::mem::size_of::<pj_sockaddr_in6>());
             (*sockaddr).ipv6.sin6_family = PJ_AF_INET6;
             (*sockaddr).ipv6.sin6_port = (port as u16).to_be();
-            (*sockaddr).ipv6.sin6_flowinfo = 0;
             (*sockaddr).ipv6.sin6_addr.s6_addr = ipv6_bytes;
-            (*sockaddr).ipv6.sin6_scope_id = 0;
+            return PJ_SUCCESS;
+        }
+    }
+
+    // Try hostname resolution (localhost => 127.0.0.1)
+    if af == 0 || af == PJ_AF_INET as u16 {
+        if host.eq_ignore_ascii_case("localhost") {
+            std::ptr::write_bytes(sockaddr as *mut u8, 0, std::mem::size_of::<pj_sockaddr_in>());
+            (*sockaddr).addr.sin_family = PJ_AF_INET;
+            (*sockaddr).addr.sin_port = (port as u16).to_be();
+            (*sockaddr).addr.sin_addr.s_addr = 0x0100007fu32; // 127.0.0.1
             return PJ_SUCCESS;
         }
     }
@@ -174,7 +190,7 @@ pub unsafe extern "C" fn pj_sockaddr_init(
     std::ptr::write_bytes(addr as *mut u8, 0, std::mem::size_of::<pj_sockaddr>());
 
     let af = af as u16;
-    if af == PJ_AF_INET {
+    if af == PJ_AF_INET as u16 {
         (*addr).addr.sin_family = PJ_AF_INET;
         (*addr).addr.sin_port = port.to_be();
         if !host.is_null() {
@@ -183,7 +199,7 @@ pub unsafe extern "C" fn pj_sockaddr_init(
                 (*addr).addr.sin_addr.s_addr = ipv4;
             }
         }
-    } else if af == PJ_AF_INET6 {
+    } else if af == PJ_AF_INET6 as u16 {
         (*addr).ipv6.sin6_family = PJ_AF_INET6;
         (*addr).ipv6.sin6_port = port.to_be();
         if !host.is_null() {
@@ -211,7 +227,7 @@ fn parse_host_port_text(text: &str) -> (&str, u16) {
             let rest = &text[bracket_end + 1..];
             let port = rest
                 .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
+                .and_then(|p| if p.is_empty() { Some(0) } else { p.parse().ok() })
                 .unwrap_or(0u16);
             return (host, port);
         }
@@ -220,12 +236,32 @@ fn parse_host_port_text(text: &str) -> (&str, u16) {
     if let Some(colon) = text.rfind(':') {
         // Make sure it's not an IPv6 address (multiple colons)
         if text[..colon].contains(':') {
-            // IPv6 without brackets
+            // IPv6 without brackets -- check for trailing colon (e.g. ":::")
+            let stripped = text.trim_end_matches(':');
+            if stripped.is_empty() {
+                return ("::", 0);
+            }
+            // Check if last colon is a port separator (e.g. ":::80")
+            if let Some(last_colon) = stripped.rfind(':') {
+                let after = &text[last_colon + 1..].trim_end_matches(':');
+                if !after.is_empty() {
+                    if let Ok(port) = after.parse::<u16>() {
+                        return (&text[..last_colon], port);
+                    }
+                }
+            }
             return (text, 0);
         }
-        if let Ok(port) = text[colon + 1..].parse::<u16>() {
-            return (&text[..colon], port);
-        }
+        let port_str = &text[colon + 1..];
+        let port = if port_str.is_empty() {
+            0
+        } else if let Ok(p) = port_str.parse::<u16>() {
+            p
+        } else {
+            // Port is not a valid number -- return full text as host
+            return (text, 0);
+        };
+        return (&text[..colon], port);
     }
     (text, 0)
 }

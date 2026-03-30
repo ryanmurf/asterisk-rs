@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::atomic::{pj_grp_lock_add_ref, pj_grp_lock_dec_ref, pj_grp_lock_t};
 use crate::types::*;
 
 /// Timer entry callback.
@@ -51,7 +52,7 @@ pub struct pj_timer_heap_t {
 struct TimerData {
     entry_ptr: *mut pj_timer_entry,
     timer_value: pj_time_val,
-    grp_lock: *mut libc::c_void,
+    grp_lock: *mut pj_grp_lock_t,
 }
 
 struct TimerHeapInner {
@@ -85,6 +86,15 @@ pub unsafe extern "C" fn pj_timer_entry_init(
     (*entry).cb = cb;
 }
 
+/// Check if a timer entry is currently active/running.
+#[no_mangle]
+pub unsafe extern "C" fn pj_timer_entry_running(entry: *mut pj_timer_entry) -> pj_bool_t {
+    if entry.is_null() {
+        return PJ_FALSE;
+    }
+    if (*entry)._timer_id >= 1 { PJ_TRUE } else { PJ_FALSE }
+}
+
 // ---------------------------------------------------------------------------
 // Heap create / destroy
 // ---------------------------------------------------------------------------
@@ -112,7 +122,15 @@ pub unsafe extern "C" fn pj_timer_heap_create(
 #[no_mangle]
 pub unsafe extern "C" fn pj_timer_heap_destroy(heap: *mut pj_timer_heap_t) {
     if !heap.is_null() {
-        let _ = Box::from_raw(heap as *mut TimerHeapInner);
+        let inner = Box::from_raw(heap as *mut TimerHeapInner);
+        // Decrement group lock refs for any remaining entries
+        let data = inner.data.lock().unwrap();
+        for (_id, td) in data.entries.iter() {
+            if !td.grp_lock.is_null() {
+                pj_grp_lock_dec_ref(td.grp_lock);
+            }
+        }
+        drop(data);
     }
 }
 
@@ -131,6 +149,11 @@ pub unsafe extern "C" fn pj_timer_heap_schedule(
     }
     let inner = &*(heap as *const TimerHeapInner);
     let mut data = inner.data.lock().unwrap();
+
+    // Prevent same entry from being scheduled more than once (check under lock)
+    if (*entry)._timer_id >= 1 {
+        return PJ_EINVALIDOP;
+    }
 
     let id = data.next_id;
     data.next_id += 1;
@@ -163,13 +186,18 @@ pub unsafe extern "C" fn pj_timer_heap_schedule_w_grp_lock(
     entry: *mut pj_timer_entry,
     delay: *const pj_time_val,
     id_val: i32,
-    grp_lock: *mut libc::c_void,
+    grp_lock: *mut pj_grp_lock_t,
 ) -> pj_status_t {
     if heap.is_null() || entry.is_null() || delay.is_null() {
         return PJ_EINVAL;
     }
     let inner = &*(heap as *const TimerHeapInner);
     let mut data = inner.data.lock().unwrap();
+
+    // Prevent same entry from being scheduled more than once (check under lock)
+    if (*entry)._timer_id >= 1 {
+        return PJ_EINVALIDOP;
+    }
 
     let id = data.next_id;
     data.next_id += 1;
@@ -187,18 +215,23 @@ pub unsafe extern "C" fn pj_timer_heap_schedule_w_grp_lock(
         tv.msec %= 1000;
     }
 
-    let mut td = TimerData {
+    // Increment group lock ref count while the timer is scheduled
+    if !grp_lock.is_null() {
+        pj_grp_lock_add_ref(grp_lock);
+    }
+
+    // id_val sets the user-visible entry->id, not the internal _timer_id
+    if id_val != 0 {
+        (*entry).id = id_val;
+    }
+
+    let td = TimerData {
         entry_ptr: entry,
         timer_value: tv,
         grp_lock,
     };
 
-    if id_val != 0 {
-        (*entry)._timer_id = id_val;
-        data.entries.insert(id_val, td);
-    } else {
-        data.entries.insert(id, td);
-    }
+    data.entries.insert(id, td);
 
     PJ_SUCCESS
 }
@@ -214,8 +247,14 @@ pub unsafe extern "C" fn pj_timer_heap_cancel(
     let inner = &*(heap as *const TimerHeapInner);
     let mut data = inner.data.lock().unwrap();
     let id = (*entry)._timer_id;
-    if data.entries.remove(&id).is_some() {
+    if let Some(td) = data.entries.remove(&id) {
         (*entry)._timer_id = -1;
+        let grp_lock = td.grp_lock;
+        drop(data);
+        // Decrement group lock ref count since the timer is no longer scheduled
+        if !grp_lock.is_null() {
+            pj_grp_lock_dec_ref(grp_lock);
+        }
         1
     } else {
         0
@@ -237,8 +276,15 @@ pub unsafe extern "C" fn pj_timer_heap_cancel_if_active(
     let inner = &*(heap as *const TimerHeapInner);
     let mut data = inner.data.lock().unwrap();
     let id = (*entry)._timer_id;
-    if data.entries.remove(&id).is_some() {
-        (*entry)._timer_id = id_val;
+    if let Some(td) = data.entries.remove(&id) {
+        (*entry)._timer_id = -1;
+        (*entry).id = id_val;
+        let grp_lock = td.grp_lock;
+        drop(data);
+        // Decrement group lock ref count since the timer is no longer scheduled
+        if !grp_lock.is_null() {
+            pj_grp_lock_dec_ref(grp_lock);
+        }
         1
     } else {
         0
@@ -298,7 +344,7 @@ pub unsafe extern "C" fn pj_timer_heap_poll(
     let now_msec = now.subsec_millis() as libc::c_long;
 
     // Collect expired entries under the lock
-    let to_fire: Vec<(i32, *mut pj_timer_entry)>;
+    let to_fire: Vec<(i32, *mut pj_timer_entry, *mut pj_grp_lock_t)>;
     {
         let mut data = inner.data.lock().unwrap();
         let max = data.max_timed_out as i32;
@@ -317,16 +363,20 @@ pub unsafe extern "C" fn pj_timer_heap_poll(
         }
 
         to_fire = ids.iter().filter_map(|&id| {
-            data.entries.remove(&id).map(|td| (id, td.entry_ptr))
+            data.entries.remove(&id).map(|td| (id, td.entry_ptr, td.grp_lock))
         }).collect();
     }
     // Release the lock before calling callbacks to avoid deadlocks
 
     let fired = to_fire.len() as i32;
-    for (_id, entry_ptr) in to_fire {
+    for (_id, entry_ptr, grp_lock) in to_fire {
         (*entry_ptr)._timer_id = -1;
         if let Some(cb) = (*entry_ptr).cb {
             cb(heap, entry_ptr);
+        }
+        // Decrement group lock ref count after callback
+        if !grp_lock.is_null() {
+            pj_grp_lock_dec_ref(grp_lock);
         }
     }
 
@@ -377,7 +427,7 @@ pub unsafe extern "C" fn pj_timer_heap_schedule_w_grp_lock_dbg(
     entry: *mut pj_timer_entry,
     delay: *const pj_time_val,
     id_val: i32,
-    grp_lock: *mut libc::c_void,
+    grp_lock: *mut pj_grp_lock_t,
     _src_file: *const libc::c_char,
     _src_line: i32,
 ) -> pj_status_t {
