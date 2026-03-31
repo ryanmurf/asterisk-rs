@@ -14,6 +14,7 @@ use std::cell::UnsafeCell;
 
 use crate::misc::{pj_ioqueue_callback, pj_ioqueue_key_t, pj_ioqueue_op_key_t, pj_ioqueue_t};
 use crate::socket::pj_sock_t;
+use crate::threading::PthreadMutex;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -78,12 +79,12 @@ unsafe impl Send for PendingAccept {}
 // ---------------------------------------------------------------------------
 
 struct IoKey {
-    lock: parking_lot::ReentrantMutex<()>,
+    lock: PthreadMutex,
     /// When a group lock is provided via register_sock2, this points to
-    /// the group lock's internal ReentrantMutex.  key_lock/key_try_lock
+    /// the group lock's internal PthreadMutex.  key_lock/key_try_lock
     /// use this instead of `self.lock` so that the ioqueue dispatch
     /// acquires the SAME lock the test callbacks use, matching pjproject.
-    ext_lock: *const parking_lot::ReentrantMutex<()>,
+    ext_lock: *const PthreadMutex,
     inner: UnsafeCell<IoKeyInner>,
 }
 
@@ -129,22 +130,40 @@ fn is_wouldblock(err: i32) -> bool {
     err == libc::EAGAIN || err == libc::EWOULDBLOCK
 }
 
-/// Lock the key's reentrant mutex.  When an external group lock is
-/// set, we lock that instead (matching pjproject's behaviour where
-/// register_sock2's grp_lock replaces the per-key lock).
-unsafe fn key_lock(key: &IoKey) -> parking_lot::ReentrantMutexGuard<'_, ()> {
-    if !key.ext_lock.is_null() {
-        (*key.ext_lock).lock()
-    } else {
-        key.lock.lock()
+/// RAII guard for PthreadMutex -- calls unlock on drop.
+struct KeyLockGuard {
+    mutex: *const PthreadMutex,
+}
+
+impl Drop for KeyLockGuard {
+    fn drop(&mut self) {
+        unsafe { (*self.mutex).unlock(); }
     }
 }
 
-unsafe fn key_try_lock(key: &IoKey) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
-    if !key.ext_lock.is_null() {
-        (*key.ext_lock).try_lock()
+/// Lock the key's reentrant mutex.  When an external group lock is
+/// set, we lock that instead (matching pjproject's behaviour where
+/// register_sock2's grp_lock replaces the per-key lock).
+unsafe fn key_lock(key: &IoKey) -> KeyLockGuard {
+    let mutex = if !key.ext_lock.is_null() {
+        key.ext_lock
     } else {
-        key.lock.try_lock()
+        &key.lock as *const PthreadMutex
+    };
+    (*mutex).lock();
+    KeyLockGuard { mutex }
+}
+
+unsafe fn key_try_lock(key: &IoKey) -> Option<KeyLockGuard> {
+    let mutex = if !key.ext_lock.is_null() {
+        key.ext_lock
+    } else {
+        &key.lock as *const PthreadMutex
+    };
+    if (*mutex).try_lock() {
+        Some(KeyLockGuard { mutex })
+    } else {
+        None
     }
 }
 
@@ -245,7 +264,7 @@ pub unsafe fn ioqueue_register_impl(
     let ext = crate::atomic::grp_lock_inner_mutex(grp_lock);
 
     let key = Box::new(IoKey {
-        lock: parking_lot::ReentrantMutex::new(()),
+        lock: PthreadMutex::new(),
         ext_lock: ext,
         inner: UnsafeCell::new(IoKeyInner {
             fd: sock as i32, user_data, cb: callback,

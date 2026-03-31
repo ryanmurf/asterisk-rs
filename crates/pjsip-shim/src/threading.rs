@@ -8,6 +8,61 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ============================================================================
+// PthreadMutex -- raw pthread recursive mutex via libc FFI
+//
+// Uses the exact same syscalls and kernel semantics as pjproject's
+// PTHREAD_MUTEX_RECURSIVE mutexes, ensuring identical re-entrancy behaviour.
+// ============================================================================
+
+pub(crate) struct PthreadMutex {
+    /// Heap-allocated so the mutex is never moved after pthread_mutex_init.
+    inner: *mut libc::pthread_mutex_t,
+}
+
+impl PthreadMutex {
+    pub(crate) fn new() -> Self {
+        unsafe {
+            let ptr = Box::into_raw(Box::new(std::mem::zeroed::<libc::pthread_mutex_t>()));
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            libc::pthread_mutexattr_init(&mut attr);
+            libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_RECURSIVE);
+            libc::pthread_mutex_init(ptr, &attr);
+            libc::pthread_mutexattr_destroy(&mut attr);
+            Self { inner: ptr }
+        }
+    }
+
+    pub(crate) fn lock(&self) {
+        unsafe {
+            libc::pthread_mutex_lock(self.inner);
+        }
+    }
+
+    pub(crate) fn unlock(&self) {
+        unsafe {
+            libc::pthread_mutex_unlock(self.inner);
+        }
+    }
+
+    pub(crate) fn try_lock(&self) -> bool {
+        unsafe { libc::pthread_mutex_trylock(self.inner) == 0 }
+    }
+}
+
+impl Drop for PthreadMutex {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_mutex_destroy(self.inner);
+            let _ = Box::from_raw(self.inner);
+        }
+    }
+}
+
+// pthread mutexes are thread-safe by design.
+unsafe impl Send for PthreadMutex {}
+unsafe impl Sync for PthreadMutex {}
+
+// ============================================================================
 // Threads
 // ============================================================================
 
@@ -287,25 +342,23 @@ pub struct pj_mutex_t {
 
 enum MutexInner {
     Simple(parking_lot::Mutex<()>),
-    Recursive(parking_lot::ReentrantMutex<()>),
+    Recursive(PthreadMutex),
 }
 
 struct MutexWrapper {
     inner: MutexInner,
     _simple_guard: Option<parking_lot::MutexGuard<'static, ()>>,
-    _reentrant_guard: Option<parking_lot::ReentrantMutexGuard<'static, ()>>,
     lock_count: std::sync::atomic::AtomicI32,
 }
 
 fn create_mutex(recursive: bool) -> *mut pj_mutex_t {
     let wrapper = Box::new(MutexWrapper {
         inner: if recursive {
-            MutexInner::Recursive(parking_lot::ReentrantMutex::new(()))
+            MutexInner::Recursive(PthreadMutex::new())
         } else {
             MutexInner::Simple(parking_lot::Mutex::new(()))
         },
         _simple_guard: None,
-        _reentrant_guard: None,
         lock_count: std::sync::atomic::AtomicI32::new(0),
     });
     Box::into_raw(wrapper) as *mut pj_mutex_t
@@ -367,8 +420,7 @@ pub unsafe extern "C" fn pj_mutex_lock(mutex: *mut pj_mutex_t) -> pj_status_t {
             std::mem::forget(guard);
         }
         MutexInner::Recursive(m) => {
-            let guard = m.lock();
-            std::mem::forget(guard);
+            m.lock();
         }
     }
     wrapper.lock_count.fetch_add(1, Ordering::SeqCst);
@@ -391,12 +443,7 @@ pub unsafe extern "C" fn pj_mutex_trylock(mutex: *mut pj_mutex_t) -> pj_status_t
             }
         }
         MutexInner::Recursive(m) => {
-            if let Some(guard) = m.try_lock() {
-                std::mem::forget(guard);
-                true
-            } else {
-                false
-            }
+            m.try_lock()
         }
     };
     if locked {
@@ -423,7 +470,7 @@ pub unsafe extern "C" fn pj_mutex_unlock(mutex: *mut pj_mutex_t) -> pj_status_t 
             m.force_unlock();
         }
         MutexInner::Recursive(m) => {
-            m.force_unlock();
+            m.unlock();
         }
     }
     PJ_SUCCESS

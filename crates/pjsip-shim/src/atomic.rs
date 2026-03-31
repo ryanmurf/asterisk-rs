@@ -3,6 +3,7 @@
 //! Wraps std::sync::atomic to provide the C-callable atomic API.
 
 use crate::types::*;
+use crate::threading::PthreadMutex;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 /// Opaque atomic variable.
@@ -130,7 +131,7 @@ pub struct pj_grp_lock_t {
 struct GrpLockInner {
     /// Must be first field -- pj_lock_acquire reads it to dispatch.
     tag: u32,
-    lock: parking_lot::ReentrantMutex<()>,
+    lock: PthreadMutex,
     ref_count: AtomicIsize,
     destroy_handlers: Vec<(unsafe extern "C" fn(*mut libc::c_void), *mut libc::c_void)>,
 }
@@ -150,7 +151,7 @@ pub unsafe extern "C" fn pj_grp_lock_create(
     }
     let inner = Box::new(GrpLockInner {
         tag: crate::threading::LOCK_TAG_GRP,
-        lock: parking_lot::ReentrantMutex::new(()),
+        lock: PthreadMutex::new(),
         ref_count: AtomicIsize::new(0),
         destroy_handlers: Vec::new(),
     });
@@ -182,8 +183,7 @@ pub unsafe extern "C" fn pj_grp_lock_acquire(lock: *mut pj_grp_lock_t) -> pj_sta
         return PJ_EINVAL;
     }
     let inner = &*(lock as *const GrpLockInner);
-    let guard = inner.lock.lock();
-    std::mem::forget(guard);
+    inner.lock.lock();
     PJ_SUCCESS
 }
 
@@ -193,8 +193,7 @@ pub unsafe extern "C" fn pj_grp_lock_tryacquire(lock: *mut pj_grp_lock_t) -> pj_
         return PJ_EINVAL;
     }
     let inner = &*(lock as *const GrpLockInner);
-    if let Some(guard) = inner.lock.try_lock() {
-        std::mem::forget(guard);
+    if inner.lock.try_lock() {
         PJ_SUCCESS
     } else {
         PJ_EBUSY
@@ -207,7 +206,7 @@ pub unsafe extern "C" fn pj_grp_lock_release(lock: *mut pj_grp_lock_t) -> pj_sta
         return PJ_EINVAL;
     }
     let inner = &*(lock as *const GrpLockInner);
-    inner.lock.force_unlock();
+    inner.lock.unlock();
     PJ_SUCCESS
 }
 
@@ -296,14 +295,14 @@ pub unsafe extern "C" fn pj_grp_lock_get_ref(lock: *mut pj_grp_lock_t) -> i32 {
     inner.ref_count.load(Ordering::SeqCst) as i32
 }
 
-/// Return a raw pointer to the underlying ReentrantMutex of a group lock.
+/// Return a raw pointer to the underlying PthreadMutex of a group lock.
 /// Used by the ioqueue to use the group lock as the per-key lock.
 pub(crate) unsafe fn grp_lock_inner_mutex(
     lock: *mut pj_grp_lock_t,
-) -> *const parking_lot::ReentrantMutex<()> {
+) -> *const PthreadMutex {
     if lock.is_null() {
         return std::ptr::null();
     }
     let inner = &*(lock as *const GrpLockInner);
-    &inner.lock as *const parking_lot::ReentrantMutex<()>
+    &inner.lock as *const PthreadMutex
 }
