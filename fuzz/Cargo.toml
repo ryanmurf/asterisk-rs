@@ -1,0 +1,40 @@
+[package]
+name = "asterisk-rs-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Minimal dependencies for standalone parsing
+thiserror = "2"
+bytes = "1"
+
+[[bin]]
+name = "fuzz_sip_parse"
+path = "fuzz_targets/fuzz_sip_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sdp_parse"
+path = "fuzz_targets/fuzz_sdp_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_rtp_parse"
+path = "fuzz_targets/fuzz_rtp_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_stun_parse"
+path = "fuzz_targets/fuzz_stun_parse.rs"
+test = false
+doc = false

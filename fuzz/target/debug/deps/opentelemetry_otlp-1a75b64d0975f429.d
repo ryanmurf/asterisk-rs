@@ -1,0 +1,13 @@
+/Users/ryan/IdeaProjects/nes-experimental/phone-stuff/asterisk-rs/fuzz/target/debug/deps/opentelemetry_otlp-1a75b64d0975f429.d: /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/lib.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/mod.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/mod.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/metrics.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/trace.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/metric.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/span.rs
+
+/Users/ryan/IdeaProjects/nes-experimental/phone-stuff/asterisk-rs/fuzz/target/debug/deps/libopentelemetry_otlp-1a75b64d0975f429.rmeta: /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/lib.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/mod.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/mod.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/metrics.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/trace.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/metric.rs /Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/span.rs
+
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/lib.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/mod.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/mod.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/metrics.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/exporter/tonic/trace.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/metric.rs:
+/Users/ryan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/opentelemetry-otlp-0.15.0/src/span.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.15.0

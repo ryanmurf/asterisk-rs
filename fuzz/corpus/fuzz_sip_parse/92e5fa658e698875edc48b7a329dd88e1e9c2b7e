@@ -1,0 +1,10 @@
+REGISTER sip:atlanta.example.com SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.100:5060;branch=z9hG4bKnashds9
+Max-Forwards: 70
+To: Alice <sip:alice@atlanta.example.com>
+From: Alice <sip:alice@atlanta.example.com>;tag=456248
+Call-ID: 843817637684230@atlanta.example.com
+CSeq: 1826 REGISTER
+Contact: <sip:attttttttttttttlice@192.168.1.100:5060>
+Expires: 7200
+Content-Length: 0

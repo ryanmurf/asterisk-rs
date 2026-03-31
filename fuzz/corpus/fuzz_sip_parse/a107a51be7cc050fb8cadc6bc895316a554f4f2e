@@ -1,0 +1,4 @@
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP 192.168.1.100:5060;branch=z9hG4bKnashds8;received=192.168.1.100
+To: UseSIP/2.0 200 OK
+Via: SIP/2.0/UDP 192r .1

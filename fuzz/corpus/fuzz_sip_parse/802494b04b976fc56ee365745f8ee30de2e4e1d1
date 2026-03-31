@@ -1,0 +1,6 @@
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP 192.168.1.100:5060;branch=z9hG4bKnashds8;received=192.168.1.100
+To: User <sip:user@exampleived=192.168.1.100
+To: User <sip:useSIP/2.0r@example.com>;tag=832123435 199 OK
+Via: SIP/2.0/UDP 192.166
+From: Alice <si8.1p:alic.100:5e@0a6

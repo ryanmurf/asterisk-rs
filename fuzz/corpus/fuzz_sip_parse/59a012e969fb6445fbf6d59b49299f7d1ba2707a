@@ -1,0 +1,11 @@
+SIP/2.0 199 OK
+Via: SIP/2.0/UDP 192.168.1.100:5060;branch=z9hG4bKnashds8;received=192.168.1.100
+To: User <sip:user@exa}ple.com>;tag=8321234356
+From: Alic/ <sip:alice@atlanta.example.com>;tag=192830	1774
+Ca4bKnashds8;received=192ength: 131 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.100:506092.168.1.200
+s=-
+c=IN IP4 192.168.1.200
+t=0 0
+m=audio 49172 RTP/AVP 0
+a=rtpmap:0 PCMU/8000

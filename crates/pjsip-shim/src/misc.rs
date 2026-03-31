@@ -811,6 +811,7 @@ pub unsafe extern "C" fn pj_activesock_create(
     match crate::ioqueue::ioqueue_register_impl(
         ioqueue as *mut pj_ioqueue_t, sock,
         inner_ptr as *mut libc::c_void, &ioq_cb,
+        std::ptr::null_mut(),
     ) {
         Ok(key) => {
             (*inner_ptr).key = key;
@@ -1139,7 +1140,7 @@ pub unsafe extern "C" fn pj_ioqueue_register_sock(
     if p_key.is_null() {
         return PJ_EINVAL;
     }
-    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb) {
+    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb, std::ptr::null_mut()) {
         Ok(key) => {
             *p_key = key;
             PJ_SUCCESS
@@ -1153,7 +1154,7 @@ pub unsafe extern "C" fn pj_ioqueue_register_sock2(
     _pool: *mut pj_pool_t,
     ioqueue: *mut pj_ioqueue_t,
     sock: crate::socket::pj_sock_t,
-    _grp_lock: *mut crate::atomic::pj_grp_lock_t,
+    grp_lock: *mut crate::atomic::pj_grp_lock_t,
     user_data: *mut libc::c_void,
     cb: *const pj_ioqueue_callback,
     p_key: *mut *mut pj_ioqueue_key_t,
@@ -1161,7 +1162,7 @@ pub unsafe extern "C" fn pj_ioqueue_register_sock2(
     if p_key.is_null() {
         return PJ_EINVAL;
     }
-    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb) {
+    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb, grp_lock) {
         Ok(key) => {
             *p_key = key;
             PJ_SUCCESS

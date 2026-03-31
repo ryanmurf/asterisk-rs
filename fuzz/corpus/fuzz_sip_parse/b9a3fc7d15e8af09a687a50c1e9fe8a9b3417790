@@ -1,0 +1,5 @@
+SIP/2.0 199 OK
+Via: SIom>;tag=192830	1774
+Call-ID: a8/sdp
+Content-Length: 131 SIP/2.0
+Via: SIP/2.0/UDP 192.168.1.100:506092.168.1.20ap:0 PCMU/8000

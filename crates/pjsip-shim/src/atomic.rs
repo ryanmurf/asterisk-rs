@@ -295,3 +295,15 @@ pub unsafe extern "C" fn pj_grp_lock_get_ref(lock: *mut pj_grp_lock_t) -> i32 {
     let inner = &*(lock as *const GrpLockInner);
     inner.ref_count.load(Ordering::SeqCst) as i32
 }
+
+/// Return a raw pointer to the underlying ReentrantMutex of a group lock.
+/// Used by the ioqueue to use the group lock as the per-key lock.
+pub(crate) unsafe fn grp_lock_inner_mutex(
+    lock: *mut pj_grp_lock_t,
+) -> *const parking_lot::ReentrantMutex<()> {
+    if lock.is_null() {
+        return std::ptr::null();
+    }
+    let inner = &*(lock as *const GrpLockInner);
+    &inner.lock as *const parking_lot::ReentrantMutex<()>
+}

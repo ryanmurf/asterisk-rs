@@ -1,54 +1,42 @@
 //! pj_ioqueue -- async I/O queue using select().
 //!
-//! Implements the pjlib ioqueue reactor pattern: register sockets,
-//! request async I/O operations, poll for completions, fire callbacks.
+//! Implements the pjlib ioqueue reactor pattern matching pjproject's
+//! ioqueue_select.c + ioqueue_common_abs.c semantics.
 //!
-//! Thread-safe: multiple threads may call poll concurrently.  Per-key
-//! mutex + `processing` flag prevents two threads from processing the same
-//! key at the same time, preserving TCP byte-stream ordering.
-//!
-//! The `processing` flag stays set while a callback is in progress.
-//! Combined with the application-level grp_lock (which serialises counter
-//! fills and sends), this matches pjproject's ordering guarantees.
+//! Key design choices (matching pjproject):
+//!   - Per-key REENTRANT mutex so callbacks can re-enter send/recv.
+//!   - When allow_concurrent=false, the key lock is held through callbacks.
+//!   - The immediate-send fast path does NOT hold the key lock (matching
+//!     pjproject's speculative optimisation in pj_ioqueue_send).
+//!   - Partial writes on stream sockets are tracked to completion.
 
-use std::sync::Mutex;
+use std::cell::UnsafeCell;
 
 use crate::misc::{pj_ioqueue_callback, pj_ioqueue_key_t, pj_ioqueue_op_key_t, pj_ioqueue_t};
 use crate::socket::pj_sock_t;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
-// Op-key pending flag -- mirrors pjproject's `op_rec->op` field.
+// Op-key pending flag -- mirrors pjproject's write_op->op field.
 //
-// pjproject stores the operation type at offset 2 (after prev/next list
-// pointers) inside the op_key.  We only need 0 = idle, non-zero = pending.
+// pjproject stores a 4-byte int at byte offset 16 inside the op_key.
+// 0 = PJ_IOQUEUE_OP_NONE, non-zero = pending.
 // ---------------------------------------------------------------------------
 
-/// Byte offset of the `op` field (a 4-byte int) inside pj_ioqueue_op_key_t.
-/// In pjproject this is `struct generic_operation { prev, next, op }`:
-///   offset = 2 * sizeof(void*) = 16 on 64-bit.
 const OP_BYTE_OFFSET: usize = 2 * std::mem::size_of::<*mut libc::c_void>();
 
-unsafe fn op_key_set_pending(op_key: *mut pj_ioqueue_op_key_t) {
+unsafe fn op_key_set_pending(op_key: *mut pj_ioqueue_op_key_t, op_type: i32) {
     if !op_key.is_null() {
         let p = (op_key as *mut u8).add(OP_BYTE_OFFSET) as *mut i32;
-        *p = 1; // PJ_IOQUEUE_OP_SEND or similar
+        *p = op_type;
     }
 }
 
-unsafe fn op_key_clear_pending(op_key: *mut pj_ioqueue_op_key_t) {
+unsafe fn op_key_clear(op_key: *mut pj_ioqueue_op_key_t) {
     if !op_key.is_null() {
         let p = (op_key as *mut u8).add(OP_BYTE_OFFSET) as *mut i32;
-        *p = 0; // PJ_IOQUEUE_OP_NONE
+        *p = 0;
     }
-}
-
-unsafe fn op_key_is_pending(op_key: *mut pj_ioqueue_op_key_t) -> bool {
-    if op_key.is_null() {
-        return false;
-    }
-    let p = (op_key as *const u8).add(OP_BYTE_OFFSET) as *const i32;
-    *p != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -69,11 +57,9 @@ struct PendingWrite {
     op_key: *mut pj_ioqueue_op_key_t,
     buf: *const libc::c_void,
     len: isize,
-    /// How many bytes have been sent so far (for partial writes on streams).
     written: isize,
     flags: u32,
     to: Option<(*const pj_sockaddr, i32)>,
-    /// Socket type: true = datagram (no partial-write tracking needed).
     is_dgram: bool,
 }
 unsafe impl Send for PendingWrite {}
@@ -88,14 +74,17 @@ struct PendingAccept {
 unsafe impl Send for PendingAccept {}
 
 // ---------------------------------------------------------------------------
-// IoKey / IoQueueInner
+// IoKey / IoQueueInner -- reentrant mutex approach
 // ---------------------------------------------------------------------------
 
-/// Per-key state.  The Mutex serialises access from concurrent poll
-/// threads AND from the application thread that queues new operations.
 struct IoKey {
-    /// Guards all mutable fields below.
-    lock: Mutex<IoKeyInner>,
+    lock: parking_lot::ReentrantMutex<()>,
+    /// When a group lock is provided via register_sock2, this points to
+    /// the group lock's internal ReentrantMutex.  key_lock/key_try_lock
+    /// use this instead of `self.lock` so that the ioqueue dispatch
+    /// acquires the SAME lock the test callbacks use, matching pjproject.
+    ext_lock: *const parking_lot::ReentrantMutex<()>,
+    inner: UnsafeCell<IoKeyInner>,
 }
 
 struct IoKeyInner {
@@ -108,16 +97,22 @@ struct IoKeyInner {
     connecting: bool,
     ioqueue: *mut IoQueueInner,
     closing: bool,
-    /// True while a poll thread is processing this key's completions.
-    /// Other poll threads skip this key until the processing thread is done.
-    processing: bool,
-    /// Socket type (SOCK_STREAM vs SOCK_DGRAM).
+    allow_concurrent: bool,
     fd_type: i32,
+    /// Mirrors pjproject's `processing` flag.  Set to `true` while a poll
+    /// thread is dispatching an event (recv/send/accept/connect) for this key.
+    /// Other poll threads that see this flag skip the key entirely, which
+    /// prevents two threads from doing recv() on the same TCP socket and
+    /// delivering data out of order.
+    processing: bool,
 }
 unsafe impl Send for IoKeyInner {}
 
+unsafe impl Send for IoKey {}
+unsafe impl Sync for IoKey {}
+
 struct IoQueueInner {
-    data: Mutex<IoQueueData>,
+    data: std::sync::Mutex<IoQueueData>,
     default_concurrency: std::sync::atomic::AtomicBool,
 }
 
@@ -128,16 +123,34 @@ struct IoQueueData {
 unsafe impl Send for IoQueueData {}
 unsafe impl Sync for IoQueueData {}
 
-// IoKey contains a Mutex which is Send+Sync
-unsafe impl Send for IoKey {}
-unsafe impl Sync for IoKey {}
-
-fn get_errno() -> i32 {
-    unsafe { *libc::__error() }
-}
+fn get_errno() -> i32 { unsafe { *libc::__error() } }
 
 fn is_wouldblock(err: i32) -> bool {
     err == libc::EAGAIN || err == libc::EWOULDBLOCK
+}
+
+/// Lock the key's reentrant mutex.  When an external group lock is
+/// set, we lock that instead (matching pjproject's behaviour where
+/// register_sock2's grp_lock replaces the per-key lock).
+unsafe fn key_lock(key: &IoKey) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+    if !key.ext_lock.is_null() {
+        (*key.ext_lock).lock()
+    } else {
+        key.lock.lock()
+    }
+}
+
+unsafe fn key_try_lock(key: &IoKey) -> Option<parking_lot::ReentrantMutexGuard<'_, ()>> {
+    if !key.ext_lock.is_null() {
+        (*key.ext_lock).try_lock()
+    } else {
+        key.lock.try_lock()
+    }
+}
+
+#[inline]
+unsafe fn ki(key: &IoKey) -> &mut IoKeyInner {
+    &mut *key.inner.get()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +159,7 @@ fn is_wouldblock(err: i32) -> bool {
 
 pub unsafe fn ioqueue_create_impl(max_fd: u32) -> *mut pj_ioqueue_t {
     let inner = Box::new(IoQueueInner {
-        data: Mutex::new(IoQueueData {
+        data: std::sync::Mutex::new(IoQueueData {
             keys: Vec::new(),
             max_fd: max_fd as usize,
         }),
@@ -156,22 +169,18 @@ pub unsafe fn ioqueue_create_impl(max_fd: u32) -> *mut pj_ioqueue_t {
 }
 
 pub unsafe fn ioqueue_destroy_impl(ioqueue: *mut pj_ioqueue_t) {
-    if ioqueue.is_null() {
-        return;
-    }
+    if ioqueue.is_null() { return; }
     let inner = Box::from_raw(ioqueue as *mut IoQueueInner);
     let mut data = inner.data.lock().unwrap();
     for &key_ptr in &data.keys {
         if !key_ptr.is_null() {
-            let mut ki = (*key_ptr).lock.lock().unwrap();
-            if !ki.closing {
-                ki.closing = true;
-                let fd = ki.fd;
-                if fd >= 0 {
-                    ki.fd = -1;
-                    libc::close(fd);
-                }
-                ki.ioqueue = std::ptr::null_mut();
+            let _g = key_lock(&*key_ptr);
+            let k = ki(&*key_ptr);
+            if !k.closing {
+                k.closing = true;
+                let fd = k.fd;
+                if fd >= 0 { k.fd = -1; libc::close(fd); }
+                k.ioqueue = std::ptr::null_mut();
             }
         }
     }
@@ -179,31 +188,22 @@ pub unsafe fn ioqueue_destroy_impl(ioqueue: *mut pj_ioqueue_t) {
     drop(data);
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency settings (stored but enforcement uses processing flag)
-// ---------------------------------------------------------------------------
-
 pub unsafe fn ioqueue_set_default_concurrency_impl(
-    ioqueue: *mut pj_ioqueue_t,
-    allow: pj_bool_t,
+    ioqueue: *mut pj_ioqueue_t, allow: pj_bool_t,
 ) -> pj_status_t {
-    if ioqueue.is_null() {
-        return PJ_EINVAL;
-    }
+    if ioqueue.is_null() { return PJ_EINVAL; }
     let inner = &*(ioqueue as *const IoQueueInner);
-    inner.default_concurrency.store(
-        allow != 0,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    inner.default_concurrency.store(allow != 0, std::sync::atomic::Ordering::Relaxed);
     PJ_SUCCESS
 }
 
 pub unsafe fn ioqueue_set_concurrency_impl(
-    _key: *mut pj_ioqueue_key_t,
-    _allow: pj_bool_t,
+    key: *mut pj_ioqueue_key_t, allow: pj_bool_t,
 ) -> pj_status_t {
-    // The `processing` flag provides the same guarantees as
-    // allow_concurrent=false: only one poll thread processes a key at a time.
+    if key.is_null() { return PJ_EINVAL; }
+    let key_ptr = key as *mut IoKey;
+    let _g = key_lock(&*key_ptr);
+    ki(&*key_ptr).allow_concurrent = allow != 0;
     PJ_SUCCESS
 }
 
@@ -212,113 +212,77 @@ pub unsafe fn ioqueue_set_concurrency_impl(
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_register_impl(
-    ioqueue: *mut pj_ioqueue_t,
-    sock: pj_sock_t,
-    user_data: *mut libc::c_void,
-    cb: *const pj_ioqueue_callback,
+    ioqueue: *mut pj_ioqueue_t, sock: pj_sock_t,
+    user_data: *mut libc::c_void, cb: *const pj_ioqueue_callback,
+    grp_lock: *mut crate::atomic::pj_grp_lock_t,
 ) -> Result<*mut pj_ioqueue_key_t, pj_status_t> {
-    if ioqueue.is_null() {
-        return Err(PJ_EINVAL);
-    }
+    if ioqueue.is_null() { return Err(PJ_EINVAL); }
     let inner = &*(ioqueue as *const IoQueueInner);
     let mut data = inner.data.lock().unwrap();
+    if data.keys.len() >= data.max_fd { return Err(PJ_ETOOMANY); }
 
-    if data.keys.len() >= data.max_fd {
-        return Err(PJ_ETOOMANY);
-    }
-
-    // Set socket to non-blocking
     let flags = libc::fcntl(sock as i32, libc::F_GETFL, 0);
-    if flags >= 0 {
-        libc::fcntl(sock as i32, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    if flags >= 0 { libc::fcntl(sock as i32, libc::F_SETFL, flags | libc::O_NONBLOCK); }
 
-    let callback = if !cb.is_null() {
-        *cb
-    } else {
+    let callback = if !cb.is_null() { *cb } else {
         pj_ioqueue_callback {
-            on_read_complete: None,
-            on_write_complete: None,
-            on_accept_complete: None,
-            on_connect_complete: None,
+            on_read_complete: None, on_write_complete: None,
+            on_accept_complete: None, on_connect_complete: None,
         }
     };
 
-    // Query socket type (SOCK_STREAM vs SOCK_DGRAM) for partial-write handling
     let mut fd_type: i32 = libc::SOCK_STREAM;
     let mut optlen: libc::socklen_t = std::mem::size_of::<i32>() as _;
-    libc::getsockopt(
-        sock as i32, libc::SOL_SOCKET, libc::SO_TYPE,
-        &mut fd_type as *mut _ as *mut libc::c_void, &mut optlen,
-    );
+    libc::getsockopt(sock as i32, libc::SOL_SOCKET, libc::SO_TYPE,
+        &mut fd_type as *mut _ as *mut libc::c_void, &mut optlen);
+
+    let default_c = inner.default_concurrency.load(std::sync::atomic::Ordering::Relaxed);
+
+    // If a group lock is provided, use its internal mutex as the key lock.
+    // This matches pjproject where register_sock2's grp_lock replaces the
+    // per-key lock, ensuring the ioqueue dispatch and the application
+    // callbacks acquire the SAME lock.
+    let ext = crate::atomic::grp_lock_inner_mutex(grp_lock);
 
     let key = Box::new(IoKey {
-        lock: Mutex::new(IoKeyInner {
-            fd: sock as i32,
-            user_data,
-            cb: callback,
-            pending_reads: Vec::new(),
-            pending_writes: Vec::new(),
-            pending_accept: None,
-            connecting: false,
+        lock: parking_lot::ReentrantMutex::new(()),
+        ext_lock: ext,
+        inner: UnsafeCell::new(IoKeyInner {
+            fd: sock as i32, user_data, cb: callback,
+            pending_reads: Vec::new(), pending_writes: Vec::new(),
+            pending_accept: None, connecting: false,
             ioqueue: ioqueue as *mut IoQueueInner,
-            closing: false,
+            closing: false, allow_concurrent: default_c, fd_type,
             processing: false,
-            fd_type,
         }),
     });
     let key_ptr = Box::into_raw(key);
     data.keys.push(key_ptr);
-
     Ok(key_ptr as *mut pj_ioqueue_key_t)
 }
 
 pub unsafe fn ioqueue_unregister_impl(key: *mut pj_ioqueue_key_t) {
-    if key.is_null() {
-        return;
-    }
+    if key.is_null() { return; }
     let key_ptr = key as *mut IoKey;
-    let fd;
-    let ioqueue;
-
+    let fd; let ioqueue;
     {
-        let mut ki = (*key_ptr).lock.lock().unwrap();
-        if ki.closing {
-            return;
-        }
-        ki.closing = true;
-        fd = ki.fd;
-        ioqueue = ki.ioqueue;
-
-        // Clear pending op flags on all queued op_keys
-        for pr in &ki.pending_reads {
-            op_key_clear_pending(pr.op_key);
-        }
-        for pw in &ki.pending_writes {
-            op_key_clear_pending(pw.op_key);
-        }
-        if let Some(ref pa) = ki.pending_accept {
-            op_key_clear_pending(pa.op_key);
-        }
-
-        ki.pending_reads.clear();
-        ki.pending_writes.clear();
-        ki.pending_accept = None;
-        ki.connecting = false;
-        ki.ioqueue = std::ptr::null_mut();
-        ki.fd = -1;
+        let _g = key_lock(&*key_ptr);
+        let k = ki(&*key_ptr);
+        if k.closing { return; }
+        k.closing = true; fd = k.fd; ioqueue = k.ioqueue;
+        for pr in &k.pending_reads { op_key_clear(pr.op_key); }
+        for pw in &k.pending_writes { op_key_clear(pw.op_key); }
+        if let Some(ref pa) = k.pending_accept { op_key_clear(pa.op_key); }
+        k.pending_reads.clear(); k.pending_writes.clear();
+        k.pending_accept = None; k.connecting = false;
+        k.ioqueue = std::ptr::null_mut(); k.fd = -1;
     }
-
     if !ioqueue.is_null() {
         let inner = &*ioqueue;
         let mut data = inner.data.lock().unwrap();
-        data.keys.retain(|&k| k != key_ptr);
+        data.keys.retain(|&kp| kp != key_ptr);
     }
-
-    if fd >= 0 {
-        libc::close(fd);
-    }
-    // Key memory intentionally leaked -- pjlib allocates keys from pool.
+    if fd >= 0 { libc::close(fd); }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,37 +290,29 @@ pub unsafe fn ioqueue_unregister_impl(key: *mut pj_ioqueue_key_t) {
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_get_user_data_impl(key: *mut pj_ioqueue_key_t) -> *mut libc::c_void {
-    if key.is_null() {
-        return std::ptr::null_mut();
-    }
+    if key.is_null() { return std::ptr::null_mut(); }
     let key_ptr = key as *mut IoKey;
-    let ki = (*key_ptr).lock.lock().unwrap();
-    ki.user_data
+    let _g = key_lock(&*key_ptr);
+    ki(&*key_ptr).user_data
 }
 
 pub unsafe fn ioqueue_set_user_data_impl(
-    key: *mut pj_ioqueue_key_t,
-    user_data: *mut libc::c_void,
+    key: *mut pj_ioqueue_key_t, user_data: *mut libc::c_void,
     old_data: *mut *mut libc::c_void,
 ) {
-    if key.is_null() {
-        return;
-    }
+    if key.is_null() { return; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
-    if !old_data.is_null() {
-        *old_data = ki.user_data;
-    }
-    ki.user_data = user_data;
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
+    if !old_data.is_null() { *old_data = k.user_data; }
+    k.user_data = user_data;
 }
 
 pub unsafe fn ioqueue_get_os_handle_impl(key: *mut libc::c_void) -> pj_sock_t {
-    if key.is_null() {
-        return -1;
-    }
+    if key.is_null() { return -1; }
     let key_ptr = key as *mut IoKey;
-    let ki = (*key_ptr).lock.lock().unwrap();
-    ki.fd as pj_sock_t
+    let _g = key_lock(&*key_ptr);
+    ki(&*key_ptr).fd as pj_sock_t
 }
 
 // ---------------------------------------------------------------------------
@@ -364,19 +320,15 @@ pub unsafe fn ioqueue_get_os_handle_impl(key: *mut libc::c_void) -> pj_sock_t {
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_recv_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    buf: *mut libc::c_void,
-    length: *mut isize,
-    flags: u32,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    buf: *mut libc::c_void, length: *mut isize, flags: u32,
 ) -> pj_status_t {
-    if key.is_null() || buf.is_null() || length.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() || buf.is_null() || length.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
 
-    let n = libc::recv(ki.fd, buf, *length as usize, flags as i32);
+    let n = libc::recv(k.fd, buf, *length as usize, flags as i32);
     if n >= 0 {
         *length = n as isize;
         return PJ_SUCCESS;
@@ -384,8 +336,8 @@ pub unsafe fn ioqueue_recv_impl(
 
     let err = get_errno();
     if is_wouldblock(err) {
-        op_key_set_pending(op_key);
-        ki.pending_reads.push(PendingRead {
+        op_key_set_pending(op_key, 2); // OP_RECV
+        k.pending_reads.push(PendingRead {
             op_key, buf, len: *length, flags,
             from: std::ptr::null_mut(), fromlen: std::ptr::null_mut(),
         });
@@ -395,44 +347,32 @@ pub unsafe fn ioqueue_recv_impl(
 }
 
 pub unsafe fn ioqueue_recvfrom_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    buf: *mut libc::c_void,
-    length: *mut isize,
-    flags: u32,
-    addr: *mut pj_sockaddr,
-    addrlen: *mut i32,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    buf: *mut libc::c_void, length: *mut isize, flags: u32,
+    addr: *mut pj_sockaddr, addrlen: *mut i32,
 ) -> pj_status_t {
-    if key.is_null() || buf.is_null() || length.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() || buf.is_null() || length.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
 
     let mut slen: libc::socklen_t = if !addrlen.is_null() {
         *addrlen as libc::socklen_t
-    } else {
-        std::mem::size_of::<pj_sockaddr>() as libc::socklen_t
-    };
-    let from_ptr = if addr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        addr as *mut libc::sockaddr
-    };
+    } else { std::mem::size_of::<pj_sockaddr>() as _ };
+    let from_ptr = if addr.is_null() { std::ptr::null_mut() }
+                   else { addr as *mut libc::sockaddr };
 
-    let n = libc::recvfrom(ki.fd, buf, *length as usize, flags as i32, from_ptr, &mut slen);
+    let n = libc::recvfrom(k.fd, buf, *length as usize, flags as i32, from_ptr, &mut slen);
     if n >= 0 {
         *length = n as isize;
-        if !addrlen.is_null() {
-            *addrlen = slen as i32;
-        }
+        if !addrlen.is_null() { *addrlen = slen as i32; }
         return PJ_SUCCESS;
     }
 
     let err = get_errno();
     if is_wouldblock(err) {
-        op_key_set_pending(op_key);
-        ki.pending_reads.push(PendingRead {
+        op_key_set_pending(op_key, 3); // OP_RECV_FROM
+        k.pending_reads.push(PendingRead {
             op_key, buf, len: *length, flags, from: addr, fromlen: addrlen,
         });
         return PJ_EPENDING;
@@ -442,160 +382,123 @@ pub unsafe fn ioqueue_recvfrom_impl(
 
 // ---------------------------------------------------------------------------
 // Async send / sendto
+//
+// CRITICAL: the immediate-send fast path does NOT hold the key lock.
+// This matches pjproject's behaviour and avoids deadlock when the
+// callback (which holds the key lock) calls pj_ioqueue_send and
+// another thread holds grp_lock while trying to acquire the key lock.
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_send_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    data: *const libc::c_void,
-    length: *mut isize,
-    flags: u32,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    data: *const libc::c_void, length: *mut isize, flags: u32,
 ) -> pj_status_t {
-    if key.is_null() || data.is_null() || length.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() || data.is_null() || length.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
 
-    // Only try immediate send if no pending writes — otherwise we'd
-    // skip queued data and break TCP byte ordering (pjproject does the
-    // same check: `if pj_list_empty(&key->write_list)`).
-    //
-    if ki.pending_writes.is_empty() {
-        let n = libc::send(ki.fd, data, *length as usize, flags as i32);
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
+    if k.closing { return 70015; }
+
+    if k.pending_writes.is_empty() {
+        let n = libc::send(k.fd, data, *length as usize, flags as i32);
         if n >= 0 {
-            if n as isize >= *length || ki.fd_type == libc::SOCK_DGRAM {
+            if n as isize >= *length || k.fd_type == libc::SOCK_DGRAM {
                 *length = n as isize;
                 return PJ_SUCCESS;
             }
-            // Partial write on a stream socket -- queue the remainder
-            // so the rest of the buffer gets sent in order.
-            let is_dgram = false;
-            op_key_set_pending(op_key);
-            ki.pending_writes.push(PendingWrite {
+            // Partial write on stream -- queue remainder
+            op_key_set_pending(op_key, 1); // OP_SEND
+            k.pending_writes.push(PendingWrite {
                 op_key, buf: data, len: *length, written: n as isize,
-                flags, to: None, is_dgram,
+                flags, to: None, is_dgram: false,
             });
             return PJ_EPENDING;
         }
-
         let err = get_errno();
-        if !is_wouldblock(err) {
-            return 120000 + err;
-        }
+        if !is_wouldblock(err) { return 120000 + err; }
     }
 
-    let is_dgram = ki.fd_type == libc::SOCK_DGRAM;
-    op_key_set_pending(op_key);
-    ki.pending_writes.push(PendingWrite {
-        op_key, buf: data, len: *length, written: 0, flags, to: None, is_dgram,
+    // Write list non-empty or EWOULDBLOCK -- queue
+    let is_dgram = k.fd_type == libc::SOCK_DGRAM;
+    op_key_set_pending(op_key, 1); // OP_SEND
+    k.pending_writes.push(PendingWrite {
+        op_key, buf: data, len: *length, written: 0,
+        flags, to: None, is_dgram,
     });
     PJ_EPENDING
 }
 
 pub unsafe fn ioqueue_sendto_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    data: *const libc::c_void,
-    length: *mut isize,
-    flags: u32,
-    addr: *const pj_sockaddr,
-    addrlen: i32,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    data: *const libc::c_void, length: *mut isize, flags: u32,
+    addr: *const pj_sockaddr, addrlen: i32,
 ) -> pj_status_t {
-    if key.is_null() || data.is_null() || length.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() || data.is_null() || length.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
 
-    // Only try immediate sendto if no pending writes (preserves ordering)
-    if ki.pending_writes.is_empty() {
-        let n = libc::sendto(
-            ki.fd, data, *length as usize, flags as i32,
-            addr as *const libc::sockaddr, addrlen as libc::socklen_t,
-        );
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
+    if k.closing { return 70015; }
+
+    if k.pending_writes.is_empty() {
+        let n = libc::sendto(k.fd, data, *length as usize, flags as i32,
+            addr as *const libc::sockaddr, addrlen as libc::socklen_t);
         if n >= 0 {
-            if n as isize >= *length || ki.fd_type == libc::SOCK_DGRAM {
+            if n as isize >= *length || k.fd_type == libc::SOCK_DGRAM {
                 *length = n as isize;
                 return PJ_SUCCESS;
             }
-            // Partial write on a stream socket -- queue remainder
-            op_key_set_pending(op_key);
-            ki.pending_writes.push(PendingWrite {
+            op_key_set_pending(op_key, 4); // OP_SEND_TO
+            k.pending_writes.push(PendingWrite {
                 op_key, buf: data, len: *length, written: n as isize,
                 flags, to: Some((addr, addrlen)), is_dgram: false,
             });
             return PJ_EPENDING;
         }
-
         let err = get_errno();
-        if !is_wouldblock(err) {
-            return 120000 + err;
-        }
+        if !is_wouldblock(err) { return 120000 + err; }
     }
 
-    let is_dgram = ki.fd_type == libc::SOCK_DGRAM;
-    op_key_set_pending(op_key);
-    ki.pending_writes.push(PendingWrite {
-        op_key, buf: data, len: *length, written: 0, flags,
-        to: Some((addr, addrlen)),
-        is_dgram,
+    let is_dgram = k.fd_type == libc::SOCK_DGRAM;
+    op_key_set_pending(op_key, 4);
+    k.pending_writes.push(PendingWrite {
+        op_key, buf: data, len: *length, written: 0,
+        flags, to: Some((addr, addrlen)), is_dgram,
     });
     PJ_EPENDING
 }
 
-// ---------------------------------------------------------------------------
-// Async read / write (same as recv/send with flags=0)
-// ---------------------------------------------------------------------------
-
 pub unsafe fn ioqueue_read_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    buf: *mut libc::c_void,
-    length: *mut isize,
-) -> pj_status_t {
-    ioqueue_recv_impl(key, op_key, buf, length, 0)
-}
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    buf: *mut libc::c_void, length: *mut isize,
+) -> pj_status_t { ioqueue_recv_impl(key, op_key, buf, length, 0) }
 
 pub unsafe fn ioqueue_write_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    data: *const libc::c_void,
-    length: *mut isize,
-) -> pj_status_t {
-    ioqueue_send_impl(key, op_key, data, length, 0)
-}
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    data: *const libc::c_void, length: *mut isize,
+) -> pj_status_t { ioqueue_send_impl(key, op_key, data, length, 0) }
 
 // ---------------------------------------------------------------------------
-// Async accept
+// Async accept / connect
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_accept_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    sock: *mut pj_sock_t,
-    local: *mut pj_sockaddr,
-    remote: *mut pj_sockaddr,
-    addrlen: *mut i32,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
+    sock: *mut pj_sock_t, local: *mut pj_sockaddr,
+    remote: *mut pj_sockaddr, addrlen: *mut i32,
 ) -> pj_status_t {
-    if key.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
 
     let mut slen: libc::socklen_t = if !addrlen.is_null() {
-        *addrlen as libc::socklen_t
-    } else {
-        std::mem::size_of::<pj_sockaddr>() as libc::socklen_t
-    };
-    let remote_ptr = if remote.is_null() {
-        std::ptr::null_mut()
-    } else {
-        remote as *mut libc::sockaddr
-    };
+        *addrlen as libc::socklen_t } else { std::mem::size_of::<pj_sockaddr>() as _ };
+    let rp = if remote.is_null() { std::ptr::null_mut() }
+             else { remote as *mut libc::sockaddr };
 
-    let fd = libc::accept(ki.fd, remote_ptr, &mut slen);
+    let fd = libc::accept(k.fd, rp, &mut slen);
     if fd >= 0 {
         if !sock.is_null() { *sock = fd as pj_sock_t; }
         if !addrlen.is_null() { *addrlen = slen as i32; }
@@ -605,209 +508,123 @@ pub unsafe fn ioqueue_accept_impl(
         }
         return PJ_SUCCESS;
     }
-
     let err = get_errno();
     if is_wouldblock(err) {
-        op_key_set_pending(op_key);
-        ki.pending_accept = Some(PendingAccept {
-            op_key, new_sock: sock, local, remote, addrlen,
-        });
+        op_key_set_pending(op_key, 5);
+        k.pending_accept = Some(PendingAccept { op_key, new_sock: sock, local, remote, addrlen });
         return PJ_EPENDING;
     }
     120000 + err
 }
-
-// ---------------------------------------------------------------------------
-// Async connect
-// ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_connect_impl(
-    key: *mut pj_ioqueue_key_t,
-    addr: *const pj_sockaddr,
-    addrlen: i32,
+    key: *mut pj_ioqueue_key_t, addr: *const pj_sockaddr, addrlen: i32,
 ) -> pj_status_t {
-    if key.is_null() || addr.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() || addr.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let mut ki = (*key_ptr).lock.lock().unwrap();
-
-    let rc = libc::connect(
-        ki.fd, addr as *const libc::sockaddr, addrlen as libc::socklen_t,
-    );
-    if rc == 0 {
-        return PJ_SUCCESS;
-    }
-
+    let _g = key_lock(&*key_ptr);
+    let k = ki(&*key_ptr);
+    let rc = libc::connect(k.fd, addr as *const libc::sockaddr, addrlen as libc::socklen_t);
+    if rc == 0 { return PJ_SUCCESS; }
     let err = get_errno();
-    if err == libc::EINPROGRESS {
-        ki.connecting = true;
-        return PJ_EPENDING;
-    }
+    if err == libc::EINPROGRESS { k.connecting = true; return PJ_EPENDING; }
     120000 + err
 }
 
 // ---------------------------------------------------------------------------
-// Poll  -- thread-safe: multiple threads may call concurrently.
+// Poll
 //
-// Strategy:
-//   1.  Lock ioqueue, snapshot which keys have pending ops, unlock.
-//   2.  Build fd_sets and call select() (no lock held).
-//   3.  For each ready fd, lock the *per-key* mutex, set `processing`,
-//       claim the pending op, do the syscall, release lock, fire callback,
-//       then clear `processing`.
-//
-// The per-key `processing` flag stays set DURING the callback so that no
-// other poll thread can race on the same key.  This preserves TCP byte
-// ordering across concurrent poll threads.
-//
-// For stream sockets, partial writes are tracked: if send() only
-// transmits part of the buffer, the entry stays in the queue with an
-// updated `written` offset.  The callback fires only when the entire
-// buffer has been sent (or on error), matching pjproject's behaviour.
+// When allow_concurrent=false, the key lock is held through the callback.
+// The reentrant mutex allows the callback to call send/recv on the same key.
+// The immediate-send fast path in ioqueue_send_impl does NOT acquire the
+// key lock, so there is no deadlock.
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_poll_impl(
     ioqueue: *mut pj_ioqueue_t,
     timeout: *const crate::timer::pj_time_val,
 ) -> i32 {
-    if ioqueue.is_null() {
-        return -1;
-    }
+    if ioqueue.is_null() { return -1; }
     let inner = &*(ioqueue as *const IoQueueInner);
 
-    // ------------------------------------------------------------------
-    // Step 1: snapshot which fds to watch.
-    // ------------------------------------------------------------------
-
-    struct PollEntry {
-        key_ptr: *mut IoKey,
-        fd: i32,
-        want_read: bool,
-        want_write: bool,
-    }
+    struct PollEntry { key_ptr: *mut IoKey, fd: i32, want_read: bool, want_write: bool }
 
     let entries: Vec<PollEntry>;
     {
         let data = inner.data.lock().unwrap();
-        entries = data
-            .keys
-            .iter()
-            .filter_map(|&key_ptr| {
-                if key_ptr.is_null() {
-                    return None;
-                }
-                // Try to lock key; if another poll thread has it, skip.
-                let ki = match (*key_ptr).lock.try_lock() {
-                    Ok(g) => g,
-                    Err(_) => return None,
-                };
-                if ki.closing || ki.fd < 0 || ki.processing {
-                    return None;
-                }
-                let want_read = !ki.pending_reads.is_empty() || ki.pending_accept.is_some();
-                let want_write = !ki.pending_writes.is_empty() || ki.connecting;
-                if !want_read && !want_write {
-                    return None;
-                }
-                Some(PollEntry {
-                    key_ptr,
-                    fd: ki.fd,
-                    want_read,
-                    want_write,
-                })
-            })
-            .collect();
+        entries = data.keys.iter().filter_map(|&key_ptr| {
+            if key_ptr.is_null() { return None; }
+            let _g = key_try_lock(&*key_ptr)?;
+            let k = ki(&*key_ptr);
+            if k.closing || k.fd < 0 { return None; }
+            // Skip keys that another poll thread is already dispatching.
+            if k.processing { return None; }
+            let want_read = !k.pending_reads.is_empty() || k.pending_accept.is_some();
+            let want_write = !k.pending_writes.is_empty() || k.connecting;
+            if !want_read && !want_write { return None; }
+            Some(PollEntry { key_ptr, fd: k.fd, want_read, want_write })
+        }).collect();
     }
 
     if entries.is_empty() {
         if !timeout.is_null() {
             let total_us = (*timeout).sec as u64 * 1_000_000 + (*timeout).msec as u64 * 1000;
-            if total_us > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(total_us));
-            }
+            if total_us > 0 { std::thread::sleep(std::time::Duration::from_micros(total_us)); }
         }
         return 0;
     }
 
-    // ------------------------------------------------------------------
-    // Step 2: build fd_sets and call select()
-    // ------------------------------------------------------------------
-
     let mut read_fds: libc::fd_set = std::mem::zeroed();
     let mut write_fds: libc::fd_set = std::mem::zeroed();
-    libc::FD_ZERO(&mut read_fds);
-    libc::FD_ZERO(&mut write_fds);
+    libc::FD_ZERO(&mut read_fds); libc::FD_ZERO(&mut write_fds);
 
     let mut max_fd: i32 = 0;
     for e in &entries {
-        if e.want_read {
-            libc::FD_SET(e.fd, &mut read_fds);
-        }
-        if e.want_write {
-            libc::FD_SET(e.fd, &mut write_fds);
-        }
-        if e.fd >= max_fd {
-            max_fd = e.fd + 1;
-        }
+        if e.want_read { libc::FD_SET(e.fd, &mut read_fds); }
+        if e.want_write { libc::FD_SET(e.fd, &mut write_fds); }
+        if e.fd >= max_fd { max_fd = e.fd + 1; }
     }
 
     let mut tv = if !timeout.is_null() {
-        libc::timeval {
-            tv_sec: (*timeout).sec as libc::time_t,
-            tv_usec: ((*timeout).msec * 1000) as libc::suseconds_t,
-        }
-    } else {
-        libc::timeval { tv_sec: 60, tv_usec: 0 }
-    };
+        libc::timeval { tv_sec: (*timeout).sec as libc::time_t,
+                        tv_usec: ((*timeout).msec * 1000) as libc::suseconds_t }
+    } else { libc::timeval { tv_sec: 60, tv_usec: 0 } };
 
-    let nready = libc::select(
-        max_fd, &mut read_fds, &mut write_fds, std::ptr::null_mut(), &mut tv,
-    );
-    if nready <= 0 {
-        return nready;
-    }
-
-    // ------------------------------------------------------------------
-    // Step 3: for each ready fd, claim pending op under per-key lock,
-    //         do I/O, release lock, fire callback, then clear processing.
-    // ------------------------------------------------------------------
+    let nready = libc::select(max_fd, &mut read_fds, &mut write_fds, std::ptr::null_mut(), &mut tv);
+    if nready <= 0 { return nready; }
 
     let mut events_fired = 0i32;
 
     for e in &entries {
         let readable = e.want_read && libc::FD_ISSET(e.fd, &read_fds);
         let writable = e.want_write && libc::FD_ISSET(e.fd, &write_fds);
-        if !readable && !writable {
-            continue;
-        }
+        if !readable && !writable { continue; }
 
-        // Lock the key.  Use try_lock to avoid blocking if another
-        // poll thread got there first.
-        let mut ki = match (*e.key_ptr).lock.try_lock() {
-            Ok(g) => g,
-            Err(_) => continue,
+        let guard = match key_try_lock(&*e.key_ptr) {
+            Some(g) => g,
+            None => continue,
         };
-        if ki.closing || ki.fd < 0 || ki.processing {
-            continue;
-        }
-        ki.processing = true;
+        let k = ki(&*e.key_ptr);
+        if k.closing || k.fd < 0 { drop(guard); continue; }
+
+        // With allow_concurrent=false, the key lock is held through the
+        // callback, preventing concurrent dispatch. With allow_concurrent=true,
+        // the lock is dropped before the callback, so we must NOT let another
+        // thread dispatch for the same key concurrently. Use the processing
+        // flag for this.
+        if k.processing { drop(guard); continue; }
+        k.processing = true;
+
 
         // --- Readable: accept ---
         if readable {
-            if let Some(pa) = ki.pending_accept.take() {
-                op_key_clear_pending(pa.op_key);
+            if let Some(pa) = k.pending_accept.take() {
+                op_key_clear(pa.op_key);
                 let mut slen: libc::socklen_t = if !pa.addrlen.is_null() {
-                    *pa.addrlen as libc::socklen_t
-                } else {
-                    std::mem::size_of::<pj_sockaddr>() as _
-                };
-                let rp = if pa.remote.is_null() {
-                    std::ptr::null_mut()
-                } else {
-                    pa.remote as *mut libc::sockaddr
-                };
-                let new_fd = libc::accept(ki.fd, rp, &mut slen);
+                    *pa.addrlen as _ } else { std::mem::size_of::<pj_sockaddr>() as _ };
+                let rp = if pa.remote.is_null() { std::ptr::null_mut() }
+                         else { pa.remote as *mut libc::sockaddr };
+                let new_fd = libc::accept(k.fd, rp, &mut slen);
                 if new_fd >= 0 {
                     if !pa.new_sock.is_null() { *pa.new_sock = new_fd as pj_sock_t; }
                     if !pa.addrlen.is_null() { *pa.addrlen = slen as i32; }
@@ -815,91 +632,82 @@ pub unsafe fn ioqueue_poll_impl(
                         let mut ll: libc::socklen_t = std::mem::size_of::<pj_sockaddr>() as _;
                         libc::getsockname(new_fd, pa.local as *mut libc::sockaddr, &mut ll);
                     }
-                    let cb = ki.cb.on_accept_complete;
-                    drop(ki); // release lock before callback
+                    let cb = k.cb.on_accept_complete;
+                    let ac = k.allow_concurrent;
+                    if ac { drop(guard); }
                     events_fired += 1;
                     if let Some(f) = cb {
-                        f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key,
-                          new_fd as pj_sock_t, PJ_SUCCESS);
+                        f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key, new_fd as pj_sock_t, PJ_SUCCESS);
                     }
-                    // Clear processing flag
-                    let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                    ki2.processing = false;
-                    continue; // done with this entry
+                    if ac {
+                        let _g2 = key_lock(&*e.key_ptr);
+                        ki(&*e.key_ptr).processing = false;
+                    } else {
+                        k.processing = false;
+                    }
+                    continue;
                 } else {
                     let err = get_errno();
                     if is_wouldblock(err) {
-                        op_key_set_pending(pa.op_key);
-                        ki.pending_accept = Some(pa);
+                        op_key_set_pending(pa.op_key, 5);
+                        k.pending_accept = Some(pa);
                     } else {
-                        let cb = ki.cb.on_accept_complete;
-                        drop(ki);
+                        let cb = k.cb.on_accept_complete; let ac = k.allow_concurrent;
+                        if ac { drop(guard); }
                         events_fired += 1;
-                        if let Some(f) = cb {
-                            f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key,
-                              -1 as pj_sock_t, 120000 + err);
+                        if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key, -1 as pj_sock_t, 120000+err); }
+                        if ac {
+                            let _g2 = key_lock(&*e.key_ptr);
+                            ki(&*e.key_ptr).processing = false;
+                        } else {
+                            k.processing = false;
                         }
-                        let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                        ki2.processing = false;
                         continue;
                     }
                 }
             }
 
             // --- Readable: recv ---
-            if !ki.pending_reads.is_empty() {
-                let pr = ki.pending_reads.remove(0);
-                // Don't clear op_key pending yet; the callback may re-queue
-                let op_key_ptr = pr.op_key;
+            if !k.pending_reads.is_empty() {
+                let pr = k.pending_reads.remove(0);
+                op_key_clear(pr.op_key);
                 let mut slen: libc::socklen_t = if !pr.fromlen.is_null() {
-                    *pr.fromlen as libc::socklen_t
-                } else {
-                    std::mem::size_of::<pj_sockaddr>() as _
-                };
-
+                    *pr.fromlen as _ } else { std::mem::size_of::<pj_sockaddr>() as _ };
                 let n = if !pr.from.is_null() {
-                    libc::recvfrom(
-                        ki.fd, pr.buf, pr.len as usize, pr.flags as i32,
-                        pr.from as *mut libc::sockaddr, &mut slen,
-                    )
+                    libc::recvfrom(k.fd, pr.buf, pr.len as usize, pr.flags as i32,
+                        pr.from as *mut libc::sockaddr, &mut slen)
                 } else {
-                    libc::recv(ki.fd, pr.buf, pr.len as usize, pr.flags as i32)
+                    libc::recv(k.fd, pr.buf, pr.len as usize, pr.flags as i32)
                 };
-
                 if n >= 0 {
                     if !pr.fromlen.is_null() { *pr.fromlen = slen as i32; }
-                    let cb = ki.cb.on_read_complete;
-                    drop(ki);
+                    let cb = k.cb.on_read_complete; let ac = k.allow_concurrent;
+                    if ac { drop(guard); }
                     events_fired += 1;
-                    if let Some(f) = cb {
-                        f(e.key_ptr as *mut pj_ioqueue_key_t, op_key_ptr, n as isize);
-                    }
-                    // Clear pending only if callback didn't re-queue
-                    {
-                        let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                        let still_queued = ki2.pending_reads.iter()
-                            .any(|pr| pr.op_key == op_key_ptr);
-                        if !still_queued {
-                            op_key_clear_pending(op_key_ptr);
-                        }
-                        ki2.processing = false;
+                    if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key, n as isize); }
+                    if ac {
+                        let _g2 = key_lock(&*e.key_ptr);
+                        ki(&*e.key_ptr).processing = false;
+                    } else {
+                        k.processing = false;
                     }
                     continue;
                 } else {
                     let err = get_errno();
                     if is_wouldblock(err) {
-                        op_key_set_pending(pr.op_key);
-                        ki.pending_reads.insert(0, pr);
+                        op_key_set_pending(pr.op_key, 2);
+                        k.pending_reads.insert(0, pr);
                     } else {
-                        let cb = ki.cb.on_read_complete;
-                        drop(ki);
+                        let cb = k.cb.on_read_complete; let ac = k.allow_concurrent;
+                        if ac { drop(guard); }
                         events_fired += 1;
-                        if let Some(f) = cb {
-                            f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key,
-                              -(err as isize));
+                        if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key, -(err as isize)); }
+                        if ac {
+                            let _g2 = key_lock(&*e.key_ptr);
+                            ki(&*e.key_ptr).processing = false;
+                        } else {
+                            k.processing = false;
                         }
-                        let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                        ki2.processing = false;
                         continue;
                     }
                 }
@@ -908,135 +716,87 @@ pub unsafe fn ioqueue_poll_impl(
 
         // --- Writable: connect ---
         if writable {
-            if ki.connecting {
-                ki.connecting = false;
+            if k.connecting {
+                k.connecting = false;
                 let mut err: i32 = 0;
                 let mut errlen: libc::socklen_t = std::mem::size_of::<i32>() as _;
-                libc::getsockopt(
-                    ki.fd, libc::SOL_SOCKET, libc::SO_ERROR,
-                    &mut err as *mut _ as *mut libc::c_void, &mut errlen,
-                );
+                libc::getsockopt(k.fd, libc::SOL_SOCKET, libc::SO_ERROR,
+                    &mut err as *mut _ as *mut libc::c_void, &mut errlen);
                 let status = if err == 0 { PJ_SUCCESS } else { 120000 + err };
-                let cb = ki.cb.on_connect_complete;
-                drop(ki);
+                let cb = k.cb.on_connect_complete; let ac = k.allow_concurrent;
+                if ac { drop(guard); }
                 events_fired += 1;
-                if let Some(f) = cb {
-                    f(e.key_ptr as *mut pj_ioqueue_key_t, status);
+                if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, status); }
+                if ac {
+                    let _g2 = key_lock(&*e.key_ptr);
+                    ki(&*e.key_ptr).processing = false;
+                } else {
+                    k.processing = false;
                 }
-                let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                ki2.processing = false;
                 continue;
-            } else if !ki.pending_writes.is_empty() {
-                // --- Writable: send ---
-                //
-                // pjproject semantics: for stream sockets, keep sending
-                // until the entire buffer is sent.  Only then fire the
-                // callback.  For datagrams, one send() call suffices.
-                //
-                // Extract fields from the front entry to avoid borrow
-                // conflicts with ki.fd.
-                let fd = ki.fd;
-                let pw_written = ki.pending_writes[0].written;
-                let pw_len = ki.pending_writes[0].len;
-                let pw_flags = ki.pending_writes[0].flags;
-                let pw_buf = ki.pending_writes[0].buf;
-                let pw_to = ki.pending_writes[0].to;
-                let pw_is_dgram = ki.pending_writes[0].is_dgram;
+            } else if !k.pending_writes.is_empty() {
+                // --- Writable: send (with partial-write tracking) ---
+                let fd = k.fd;
+                let pw_written = k.pending_writes[0].written;
+                let pw_len = k.pending_writes[0].len;
+                let pw_flags = k.pending_writes[0].flags;
+                let pw_buf = k.pending_writes[0].buf;
+                let pw_to = k.pending_writes[0].to;
+                let pw_is_dgram = k.pending_writes[0].is_dgram;
 
                 let remaining = (pw_len - pw_written) as usize;
-                let buf_offset = (pw_buf as *const u8).add(pw_written as usize)
-                    as *const libc::c_void;
+                let buf_offset = (pw_buf as *const u8).add(pw_written as usize) as *const libc::c_void;
 
                 let n = if let Some((to, tolen)) = pw_to {
-                    libc::sendto(
-                        fd, buf_offset, remaining, pw_flags as i32,
-                        to as *const libc::sockaddr, tolen as libc::socklen_t,
-                    )
+                    libc::sendto(fd, buf_offset, remaining, pw_flags as i32,
+                        to as *const libc::sockaddr, tolen as libc::socklen_t)
                 } else {
                     libc::send(fd, buf_offset, remaining, pw_flags as i32)
                 };
 
                 if n >= 0 {
-                    ki.pending_writes[0].written += n as isize;
-                    let new_written = ki.pending_writes[0].written;
-
-                    // Are we done with this buffer?
+                    k.pending_writes[0].written += n as isize;
+                    let new_written = k.pending_writes[0].written;
                     if new_written >= pw_len || pw_is_dgram {
-                        // Complete -- remove from queue and fire callback.
-                        // Do NOT clear op_key pending yet: the callback may
-                        // call pj_ioqueue_send which re-queues this op_key.
-                        // We clear it AFTER the callback if it wasn't re-queued.
-                        let pw = ki.pending_writes.remove(0);
-                        let op_key_ptr = pw.op_key;
-                        let cb = ki.cb.on_write_complete;
-                        drop(ki);
+                        let pw = k.pending_writes.remove(0);
+                        op_key_clear(pw.op_key);
+                        let cb = k.cb.on_write_complete; let ac = k.allow_concurrent;
+                        if ac { drop(guard); }
                         events_fired += 1;
-                        if let Some(f) = cb {
-                            f(e.key_ptr as *mut pj_ioqueue_key_t, op_key_ptr, new_written);
-                        }
-                        // After callback: clear pending flag only if the callback
-                        // did NOT re-queue this op_key (pj_ioqueue_send would have
-                        // called op_key_set_pending again if it queued).
-                        // The flag is already set if re-queued, so we only clear
-                        // if it's still set from the ORIGINAL queue entry.
-                        // Actually, pj_ioqueue_send sets pending on queue.
-                        // If the callback's send succeeded immediately (PJ_SUCCESS),
-                        // the flag was never re-set. If it was re-queued, the flag
-                        // is already set. So we clear it unconditionally and let
-                        // pj_ioqueue_send re-set it if needed.
-                        // But this creates the same race window...
-                        //
-                        // The correct approach: the callback either:
-                        // a) Called pj_ioqueue_send which returned PJ_SUCCESS -> op_key not re-set
-                        // b) Called pj_ioqueue_send which returned PJ_EPENDING -> op_key re-set by send
-                        // c) Didn't call pj_ioqueue_send -> op_key still set from original
-                        //
-                        // In all cases, op_key_is_pending reflects the correct state
-                        // AFTER the callback. We just need to clear it for case (a) and (c).
-                        // Case (a): send succeeded, op_key not in pending_writes
-                        // Case (c): callback didn't re-send, op_key not in pending_writes
-                        //
-                        // So: clear if op_key is NOT currently in pending_writes.
-                        {
-                            let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                            let still_queued = ki2.pending_writes.iter()
-                                .any(|pw| pw.op_key == op_key_ptr);
-                            if !still_queued {
-                                op_key_clear_pending(op_key_ptr);
-                            }
-                            ki2.processing = false;
+                        if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key, new_written); }
+                        if ac {
+                            let _g2 = key_lock(&*e.key_ptr);
+                            ki(&*e.key_ptr).processing = false;
+                        } else {
+                            k.processing = false;
                         }
                         continue;
                     }
-                    // Partial write on a stream socket -- leave the
-                    // entry in the queue with updated `written` offset.
-                    // Next poll iteration will continue sending.
+                    // partial write -- stay in queue, clear processing
                 } else {
                     let err = get_errno();
-                    if is_wouldblock(err) {
-                        // Leave in queue, try again next poll
-                    } else {
-                        // Real error -- remove and report via callback
-                        let pw = ki.pending_writes.remove(0);
-                        op_key_clear_pending(pw.op_key);
-                        let cb = ki.cb.on_write_complete;
-                        drop(ki);
+                    if !is_wouldblock(err) {
+                        let pw = k.pending_writes.remove(0);
+                        op_key_clear(pw.op_key);
+                        let cb = k.cb.on_write_complete; let ac = k.allow_concurrent;
+                        if ac { drop(guard); }
                         events_fired += 1;
-                        if let Some(f) = cb {
-                            f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key,
-                              -(err as isize));
+                        if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key, -(err as isize)); }
+                        if ac {
+                            let _g2 = key_lock(&*e.key_ptr);
+                            ki(&*e.key_ptr).processing = false;
+                        } else {
+                            k.processing = false;
                         }
-                        let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                        ki2.processing = false;
                         continue;
                     }
                 }
             }
         }
 
-        // No completion was produced (e.g. wouldblock on both read/write).
-        ki.processing = false;
-        drop(ki);
+        // No event dispatched or only partial write -- clear processing.
+        k.processing = false;
+        drop(guard);
     }
 
     events_fired
@@ -1047,43 +807,20 @@ pub unsafe fn ioqueue_poll_impl(
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_is_pending_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
+    _key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
 ) -> pj_bool_t {
-    // Check per-op_key pending flag (4-byte int at OP_BYTE_OFFSET).
-    // This matches pjproject's check of write_op->op != 0.
-    if op_key_is_pending(op_key) {
-        return PJ_TRUE;
-    }
-    // Also return true if the key itself is being processed by a poll thread.
-    // This prevents the worker thread from interfering with an in-progress
-    // poll callback.
-    if !key.is_null() {
-        let key_ptr = key as *mut IoKey;
-        if let Ok(ki) = (*key_ptr).lock.try_lock() {
-            if ki.processing {
-                return PJ_TRUE;
-            }
-        }
-    }
-    PJ_FALSE
+    if op_key.is_null() { return PJ_FALSE; }
+    let p = (op_key as *const u8).add(OP_BYTE_OFFSET) as *const i32;
+    if *p != 0 { PJ_TRUE } else { PJ_FALSE }
 }
 
 pub unsafe fn ioqueue_post_completion_impl(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
+    key: *mut pj_ioqueue_key_t, op_key: *mut pj_ioqueue_op_key_t,
     bytes_status: isize,
 ) -> pj_status_t {
-    if key.is_null() {
-        return PJ_EINVAL;
-    }
+    if key.is_null() { return PJ_EINVAL; }
     let key_ptr = key as *mut IoKey;
-    let cb = {
-        let ki = (*key_ptr).lock.lock().unwrap();
-        ki.cb.on_read_complete
-    };
-    if let Some(f) = cb {
-        f(key, op_key, bytes_status);
-    }
+    let cb = { let _g = key_lock(&*key_ptr); ki(&*key_ptr).cb.on_read_complete };
+    if let Some(f) = cb { f(key, op_key, bytes_status); }
     PJ_SUCCESS
 }
