@@ -12,8 +12,10 @@ use parking_lot::RwLock;
 use tracing::{info, warn, debug};
 
 use crate::parser::SipMessage;
+use crate::sdp::SessionDescription;
 use crate::session::SipSession;
 use crate::transport::SipTransport;
+use asterisk_codecs::{codecs, Codec};
 use asterisk_core::channel::store;
 use asterisk_core::channel::softhangup;
 use asterisk_core::pbx::Dialplan;
@@ -38,6 +40,8 @@ pub struct SipEventHandler {
     transport: Arc<dyn SipTransport>,
     /// Per-call SIP state keyed by Call-ID.
     call_states: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<CallState>>>>>,
+    /// Supported codecs (audio + video) for SDP answer generation.
+    supported_codecs: Vec<Codec>,
 }
 
 impl SipEventHandler {
@@ -48,6 +52,10 @@ impl SipEventHandler {
             callid_map: Arc::new(RwLock::new(HashMap::new())),
             transport,
             call_states: Arc::new(RwLock::new(HashMap::new())),
+            supported_codecs: vec![
+                codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
+                codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
+            ],
         }
     }
 
@@ -58,7 +66,7 @@ impl SipEventHandler {
         &self,
         request: &SipMessage,
         remote_addr: SocketAddr,
-        session: SipSession,
+        mut session: SipSession,
     ) -> Option<String> {
         // 1. Extract caller info from From header
         let from = request.get_header("From")?;
@@ -105,7 +113,19 @@ impl SipEventHandler {
             map.insert(call_id.clone(), channel_name.clone());
         }
 
-        // 7. Store the SIP session state for later signaling (200 OK, BYE)
+        // 7. Generate SDP answer from the remote offer so 200 OK includes media.
+        let local_ip = session.local_addr.ip().to_string();
+        if let Some(ref remote_sdp) = session.remote_sdp {
+            let answer_sdp = SessionDescription::create_answer(
+                remote_sdp,
+                &local_ip,
+                10000, // RTP port (will be overridden if RTP session is created)
+                &self.supported_codecs,
+            );
+            session.local_sdp = Some(answer_sdp);
+        }
+
+        // 8. Store the SIP session state for later signaling (200 OK, BYE)
         let call_state = Arc::new(tokio::sync::Mutex::new(CallState {
             session,
             remote_addr,
@@ -116,7 +136,7 @@ impl SipEventHandler {
             states.insert(call_id.clone(), call_state.clone());
         }
 
-        // 8. Spawn PBX execution on a background task.
+        // 9. Spawn PBX execution on a background task.
         //
         // The task lifecycle:
         //   a) Wait for the Answer() dialplan app to fire (answer callback)

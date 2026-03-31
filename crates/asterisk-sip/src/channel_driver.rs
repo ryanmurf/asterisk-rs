@@ -68,7 +68,10 @@ impl SipChannelDriver {
             local_addr,
             channels: RwLock::new(HashMap::new()),
             transport: None,
-            codecs: vec![codecs::pcmu(), codecs::pcma(), codecs::telephone_event()],
+            codecs: vec![
+                codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
+                codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
+            ],
         }
     }
 

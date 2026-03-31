@@ -91,6 +91,12 @@ pub mod codecs {
         Codec { payload_type: 111, name: "opus".to_string(), sample_rate: 48000, channels: 2 }
     }
     pub fn telephone_event() -> Codec { Codec::new("telephone-event", 101, 8000) }
+
+    // Video codecs
+    pub fn h264() -> Codec { Codec::new("H264", 99, 90000) }
+    pub fn vp8() -> Codec { Codec::new("VP8", 96, 90000) }
+    pub fn vp9() -> Codec { Codec::new("VP9", 98, 90000) }
+    pub fn h265() -> Codec { Codec::new("H265", 100, 90000) }
 }
 
 /// Format capabilities - a set of codecs a channel supports.

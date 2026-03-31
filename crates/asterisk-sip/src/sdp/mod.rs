@@ -532,7 +532,32 @@ impl SessionDescription {
         port: u16,
         supported_codecs: &[Codec],
     ) -> Self {
-        let mut answer = Self::create_offer(addr, port, &[]);
+        let session_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+
+        let mut answer = SessionDescription {
+            version: 0,
+            origin: Origin {
+                username: "-".to_string(),
+                session_id: session_id.clone(),
+                session_version: session_id,
+                net_type: "IN".to_string(),
+                addr_type: "IP4".to_string(),
+                addr: addr.to_string(),
+            },
+            session_name: "Asterisk".to_string(),
+            connection: Some(ConnectionData {
+                net_type: "IN".to_string(),
+                addr_type: "IP4".to_string(),
+                addr: addr.to_string(),
+            }),
+            time: (0, 0),
+            media_descriptions: Vec::new(),
+            attributes: Vec::new(),
+        };
 
         // For each media in the offer, find common codecs
         for offer_media in &offer.media_descriptions {
