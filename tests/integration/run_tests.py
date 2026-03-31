@@ -70,7 +70,7 @@ class DaemonManager:
         self.process = None
 
     def start(self):
-        # Create minimal config dir with extensions.conf
+        # Create minimal config dir with extensions.conf and asterisk.conf
         os.makedirs(CONFIG_DIR, exist_ok=True)
         ext_conf = os.path.join(CONFIG_DIR, "extensions.conf")
         with open(ext_conf, "w") as f:
@@ -87,10 +87,19 @@ class DaemonManager:
                 exten => s,n,Hangup()
             """))
 
+        # Create asterisk.conf so -C points to a file (not a directory).
+        # The daemon uses the file's parent directory as the config dir.
+        ast_conf = os.path.join(CONFIG_DIR, "asterisk.conf")
+        with open(ast_conf, "w") as f:
+            f.write(textwrap.dedent("""\
+                [directories]
+                astetcdir => {config_dir}
+            """.format(config_dir=CONFIG_DIR)))
+
         # Do NOT pass -f or -c: those enter rustyline console mode which
         # immediately exits when stdin is a pipe. Without them the daemon
         # enters its event loop and waits for SIGTERM.
-        cmd = [self.binary, "-C", CONFIG_DIR, "-v"]
+        cmd = [self.binary, "-C", ast_conf, "-v"]
         print(f"  Starting daemon: {' '.join(cmd)}")
         self.process = subprocess.Popen(
             cmd,
@@ -656,7 +665,8 @@ def test_ami_logoff(daemon):
         sock.close()
 
         parsed = ami_parse_response(resp)
-        if parsed.get("Response") == "Success":
+        # Real Asterisk returns Response: Goodbye (not Success) for Logoff
+        if parsed.get("Response") in ("Success", "Goodbye"):
             r.passed = True
             r.detail = f"Message: {parsed.get('Message', 'N/A')}"
         else:
