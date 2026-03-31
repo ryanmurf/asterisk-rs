@@ -1291,18 +1291,18 @@ pub unsafe extern "C" fn pj_ioqueue_post_completion(
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_ioqueue_set_default_concurrency(
-    _ioqueue: *mut pj_ioqueue_t,
-    _allow: pj_bool_t,
+    ioqueue: *mut pj_ioqueue_t,
+    allow: pj_bool_t,
 ) -> pj_status_t {
-    PJ_SUCCESS
+    crate::ioqueue::ioqueue_set_default_concurrency_impl(ioqueue, allow)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_ioqueue_set_concurrency(
-    _key: *mut pj_ioqueue_key_t,
-    _allow: pj_bool_t,
+    key: *mut pj_ioqueue_key_t,
+    allow: pj_bool_t,
 ) -> pj_status_t {
-    PJ_SUCCESS
+    crate::ioqueue::ioqueue_set_concurrency_impl(key, allow)
 }
 
 #[no_mangle]

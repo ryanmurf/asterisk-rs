@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::parser::SipMessage;
 
@@ -109,15 +109,53 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    /// Bind a UDP transport to the given address (IPv4 or IPv6).
+    /// Bind a UDP transport to the given address (IPv4 or IPv6) with retry logic.
     pub async fn bind(addr: SocketAddr) -> Result<Self, TransportError> {
-        let socket = UdpSocket::bind(addr).await?;
-        let local = socket.local_addr()?;
-        let family = if local.is_ipv6() { "IPv6" } else { "IPv4" };
-        info!(addr = %local, family, "UDP SIP transport bound");
-        Ok(Self {
-            socket: Arc::new(socket),
-        })
+        const MAX_PORT_ATTEMPTS: usize = 10;
+        
+        let original_port = addr.port();
+        let mut current_addr = addr;
+        let mut last_error = None;
+        
+        for attempt in 0..MAX_PORT_ATTEMPTS {
+            match UdpSocket::bind(current_addr).await {
+                Ok(socket) => {
+                    let local_addr = socket.local_addr()?;
+                    if local_addr.port() != original_port {
+                        info!(
+                            "UDP SIP: Port {} was busy, successfully bound to port {} instead",
+                            original_port, local_addr.port()
+                        );
+                    }
+                    let family = if local_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                    info!(addr = %local_addr, family, "UDP SIP transport bound");
+                    return Ok(Self {
+                        socket: Arc::new(socket),
+                    });
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                        last_error = Some(e);
+                        current_addr.set_port(current_addr.port() + 1);
+                        debug!(
+                            "UDP SIP: Port {} busy (attempt {}), trying port {}",
+                            current_addr.port() - 1,
+                            attempt + 1,
+                            current_addr.port()
+                        );
+                    } else {
+                        // Non-port-conflict error, fail immediately
+                        return Err(TransportError::Io(e));
+                    }
+                }
+            }
+        }
+        
+        let final_error = last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrInUse, "All attempted ports are in use")
+        });
+        warn!("Failed to bind UDP SIP transport after {} attempts: {}", MAX_PORT_ATTEMPTS, final_error);
+        Err(TransportError::Io(final_error))
     }
 
     /// Bind a UDP transport to an IPv6 address.

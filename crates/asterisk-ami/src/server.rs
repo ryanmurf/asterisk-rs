@@ -94,7 +94,7 @@ impl AmiServer {
         self.user_registry.add_user(user);
     }
 
-    /// Start the AMI server.
+    /// Start the AMI server with retry logic for port binding.
     ///
     /// This spawns the TCP listener task and returns immediately.
     /// The server runs until the returned handle is dropped.
@@ -104,8 +104,48 @@ impl AmiServer {
             return Ok(());
         }
 
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
-        info!("AMI: listening on {}", self.config.bind_addr);
+        const MAX_PORT_ATTEMPTS: usize = 10;
+        let original_port = self.config.bind_addr.port();
+        let mut current_addr = self.config.bind_addr;
+        let mut last_error = None;
+
+        let listener: TcpListener = loop {
+            match TcpListener::bind(current_addr).await {
+                Ok(listener) => {
+                    let actual_addr = listener.local_addr()?;
+                    if actual_addr.port() != original_port {
+                        info!(
+                            "AMI: Port {} was busy, successfully bound to port {} instead",
+                            original_port, actual_addr.port()
+                        );
+                    }
+                    info!("AMI: listening on {}", actual_addr);
+                    break listener;
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                        last_error = Some(e);
+                        current_addr.set_port(current_addr.port() + 1);
+                        debug!(
+                            "AMI: Port {} busy, trying port {}",
+                            current_addr.port() - 1,
+                            current_addr.port()
+                        );
+                        
+                        // Check if we've exceeded max attempts
+                        if current_addr.port() > original_port + (MAX_PORT_ATTEMPTS as u16) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse, 
+                                "All attempted AMI ports are in use"
+                            ));
+                        }
+                    } else {
+                        // Non-port-conflict error, fail immediately
+                        return Err(e);
+                    }
+                }
+            }
+        };
 
         let sessions = self.sessions.clone();
         let user_registry = self.user_registry.clone();

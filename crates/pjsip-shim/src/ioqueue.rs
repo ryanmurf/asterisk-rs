@@ -4,14 +4,52 @@
 //! request async I/O operations, poll for completions, fire callbacks.
 //!
 //! Thread-safe: multiple threads may call poll concurrently.  Per-key
-//! mutex prevents two threads from processing the same key at the same
-//! time, preserving TCP byte-stream ordering.
+//! mutex + `processing` flag prevents two threads from processing the same
+//! key at the same time, preserving TCP byte-stream ordering.
+//!
+//! The `processing` flag stays set while a callback is in progress.
+//! Combined with the application-level grp_lock (which serialises counter
+//! fills and sends), this matches pjproject's ordering guarantees.
 
 use std::sync::Mutex;
 
 use crate::misc::{pj_ioqueue_callback, pj_ioqueue_key_t, pj_ioqueue_op_key_t, pj_ioqueue_t};
 use crate::socket::pj_sock_t;
 use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// Op-key pending flag -- mirrors pjproject's `op_rec->op` field.
+//
+// pjproject stores the operation type at offset 2 (after prev/next list
+// pointers) inside the op_key.  We only need 0 = idle, non-zero = pending.
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the `op` field (a 4-byte int) inside pj_ioqueue_op_key_t.
+/// In pjproject this is `struct generic_operation { prev, next, op }`:
+///   offset = 2 * sizeof(void*) = 16 on 64-bit.
+const OP_BYTE_OFFSET: usize = 2 * std::mem::size_of::<*mut libc::c_void>();
+
+unsafe fn op_key_set_pending(op_key: *mut pj_ioqueue_op_key_t) {
+    if !op_key.is_null() {
+        let p = (op_key as *mut u8).add(OP_BYTE_OFFSET) as *mut i32;
+        *p = 1; // PJ_IOQUEUE_OP_SEND or similar
+    }
+}
+
+unsafe fn op_key_clear_pending(op_key: *mut pj_ioqueue_op_key_t) {
+    if !op_key.is_null() {
+        let p = (op_key as *mut u8).add(OP_BYTE_OFFSET) as *mut i32;
+        *p = 0; // PJ_IOQUEUE_OP_NONE
+    }
+}
+
+unsafe fn op_key_is_pending(op_key: *mut pj_ioqueue_op_key_t) -> bool {
+    if op_key.is_null() {
+        return false;
+    }
+    let p = (op_key as *const u8).add(OP_BYTE_OFFSET) as *const i32;
+    *p != 0
+}
 
 // ---------------------------------------------------------------------------
 // Pending operation types
@@ -31,8 +69,12 @@ struct PendingWrite {
     op_key: *mut pj_ioqueue_op_key_t,
     buf: *const libc::c_void,
     len: isize,
+    /// How many bytes have been sent so far (for partial writes on streams).
+    written: isize,
     flags: u32,
     to: Option<(*const pj_sockaddr, i32)>,
+    /// Socket type: true = datagram (no partial-write tracking needed).
+    is_dgram: bool,
 }
 unsafe impl Send for PendingWrite {}
 
@@ -69,11 +111,14 @@ struct IoKeyInner {
     /// True while a poll thread is processing this key's completions.
     /// Other poll threads skip this key until the processing thread is done.
     processing: bool,
+    /// Socket type (SOCK_STREAM vs SOCK_DGRAM).
+    fd_type: i32,
 }
 unsafe impl Send for IoKeyInner {}
 
 struct IoQueueInner {
     data: Mutex<IoQueueData>,
+    default_concurrency: std::sync::atomic::AtomicBool,
 }
 
 struct IoQueueData {
@@ -105,6 +150,7 @@ pub unsafe fn ioqueue_create_impl(max_fd: u32) -> *mut pj_ioqueue_t {
             keys: Vec::new(),
             max_fd: max_fd as usize,
         }),
+        default_concurrency: std::sync::atomic::AtomicBool::new(true),
     });
     Box::into_raw(inner) as *mut pj_ioqueue_t
 }
@@ -131,6 +177,34 @@ pub unsafe fn ioqueue_destroy_impl(ioqueue: *mut pj_ioqueue_t) {
     }
     data.keys.clear();
     drop(data);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency settings (stored but enforcement uses processing flag)
+// ---------------------------------------------------------------------------
+
+pub unsafe fn ioqueue_set_default_concurrency_impl(
+    ioqueue: *mut pj_ioqueue_t,
+    allow: pj_bool_t,
+) -> pj_status_t {
+    if ioqueue.is_null() {
+        return PJ_EINVAL;
+    }
+    let inner = &*(ioqueue as *const IoQueueInner);
+    inner.default_concurrency.store(
+        allow != 0,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PJ_SUCCESS
+}
+
+pub unsafe fn ioqueue_set_concurrency_impl(
+    _key: *mut pj_ioqueue_key_t,
+    _allow: pj_bool_t,
+) -> pj_status_t {
+    // The `processing` flag provides the same guarantees as
+    // allow_concurrent=false: only one poll thread processes a key at a time.
+    PJ_SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +244,14 @@ pub unsafe fn ioqueue_register_impl(
         }
     };
 
+    // Query socket type (SOCK_STREAM vs SOCK_DGRAM) for partial-write handling
+    let mut fd_type: i32 = libc::SOCK_STREAM;
+    let mut optlen: libc::socklen_t = std::mem::size_of::<i32>() as _;
+    libc::getsockopt(
+        sock as i32, libc::SOL_SOCKET, libc::SO_TYPE,
+        &mut fd_type as *mut _ as *mut libc::c_void, &mut optlen,
+    );
+
     let key = Box::new(IoKey {
         lock: Mutex::new(IoKeyInner {
             fd: sock as i32,
@@ -182,6 +264,7 @@ pub unsafe fn ioqueue_register_impl(
             ioqueue: ioqueue as *mut IoQueueInner,
             closing: false,
             processing: false,
+            fd_type,
         }),
     });
     let key_ptr = Box::into_raw(key);
@@ -206,6 +289,17 @@ pub unsafe fn ioqueue_unregister_impl(key: *mut pj_ioqueue_key_t) {
         ki.closing = true;
         fd = ki.fd;
         ioqueue = ki.ioqueue;
+
+        // Clear pending op flags on all queued op_keys
+        for pr in &ki.pending_reads {
+            op_key_clear_pending(pr.op_key);
+        }
+        for pw in &ki.pending_writes {
+            op_key_clear_pending(pw.op_key);
+        }
+        if let Some(ref pa) = ki.pending_accept {
+            op_key_clear_pending(pa.op_key);
+        }
 
         ki.pending_reads.clear();
         ki.pending_writes.clear();
@@ -290,6 +384,7 @@ pub unsafe fn ioqueue_recv_impl(
 
     let err = get_errno();
     if is_wouldblock(err) {
+        op_key_set_pending(op_key);
         ki.pending_reads.push(PendingRead {
             op_key, buf, len: *length, flags,
             from: std::ptr::null_mut(), fromlen: std::ptr::null_mut(),
@@ -336,6 +431,7 @@ pub unsafe fn ioqueue_recvfrom_impl(
 
     let err = get_errno();
     if is_wouldblock(err) {
+        op_key_set_pending(op_key);
         ki.pending_reads.push(PendingRead {
             op_key, buf, len: *length, flags, from: addr, fromlen: addrlen,
         });
@@ -361,20 +457,40 @@ pub unsafe fn ioqueue_send_impl(
     let key_ptr = key as *mut IoKey;
     let mut ki = (*key_ptr).lock.lock().unwrap();
 
-    let n = libc::send(ki.fd, data, *length as usize, flags as i32);
-    if n >= 0 {
-        *length = n as isize;
-        return PJ_SUCCESS;
+    // Only try immediate send if no pending writes — otherwise we'd
+    // skip queued data and break TCP byte ordering (pjproject does the
+    // same check: `if pj_list_empty(&key->write_list)`).
+    //
+    if ki.pending_writes.is_empty() {
+        let n = libc::send(ki.fd, data, *length as usize, flags as i32);
+        if n >= 0 {
+            if n as isize >= *length || ki.fd_type == libc::SOCK_DGRAM {
+                *length = n as isize;
+                return PJ_SUCCESS;
+            }
+            // Partial write on a stream socket -- queue the remainder
+            // so the rest of the buffer gets sent in order.
+            let is_dgram = false;
+            op_key_set_pending(op_key);
+            ki.pending_writes.push(PendingWrite {
+                op_key, buf: data, len: *length, written: n as isize,
+                flags, to: None, is_dgram,
+            });
+            return PJ_EPENDING;
+        }
+
+        let err = get_errno();
+        if !is_wouldblock(err) {
+            return 120000 + err;
+        }
     }
 
-    let err = get_errno();
-    if is_wouldblock(err) {
-        ki.pending_writes.push(PendingWrite {
-            op_key, buf: data, len: *length, flags, to: None,
-        });
-        return PJ_EPENDING;
-    }
-    120000 + err
+    let is_dgram = ki.fd_type == libc::SOCK_DGRAM;
+    op_key_set_pending(op_key);
+    ki.pending_writes.push(PendingWrite {
+        op_key, buf: data, len: *length, written: 0, flags, to: None, is_dgram,
+    });
+    PJ_EPENDING
 }
 
 pub unsafe fn ioqueue_sendto_impl(
@@ -392,24 +508,40 @@ pub unsafe fn ioqueue_sendto_impl(
     let key_ptr = key as *mut IoKey;
     let mut ki = (*key_ptr).lock.lock().unwrap();
 
-    let n = libc::sendto(
-        ki.fd, data, *length as usize, flags as i32,
-        addr as *const libc::sockaddr, addrlen as libc::socklen_t,
-    );
-    if n >= 0 {
-        *length = n as isize;
-        return PJ_SUCCESS;
+    // Only try immediate sendto if no pending writes (preserves ordering)
+    if ki.pending_writes.is_empty() {
+        let n = libc::sendto(
+            ki.fd, data, *length as usize, flags as i32,
+            addr as *const libc::sockaddr, addrlen as libc::socklen_t,
+        );
+        if n >= 0 {
+            if n as isize >= *length || ki.fd_type == libc::SOCK_DGRAM {
+                *length = n as isize;
+                return PJ_SUCCESS;
+            }
+            // Partial write on a stream socket -- queue remainder
+            op_key_set_pending(op_key);
+            ki.pending_writes.push(PendingWrite {
+                op_key, buf: data, len: *length, written: n as isize,
+                flags, to: Some((addr, addrlen)), is_dgram: false,
+            });
+            return PJ_EPENDING;
+        }
+
+        let err = get_errno();
+        if !is_wouldblock(err) {
+            return 120000 + err;
+        }
     }
 
-    let err = get_errno();
-    if is_wouldblock(err) {
-        ki.pending_writes.push(PendingWrite {
-            op_key, buf: data, len: *length, flags,
-            to: Some((addr, addrlen)),
-        });
-        return PJ_EPENDING;
-    }
-    120000 + err
+    let is_dgram = ki.fd_type == libc::SOCK_DGRAM;
+    op_key_set_pending(op_key);
+    ki.pending_writes.push(PendingWrite {
+        op_key, buf: data, len: *length, written: 0, flags,
+        to: Some((addr, addrlen)),
+        is_dgram,
+    });
+    PJ_EPENDING
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +608,7 @@ pub unsafe fn ioqueue_accept_impl(
 
     let err = get_errno();
     if is_wouldblock(err) {
+        op_key_set_pending(op_key);
         ki.pending_accept = Some(PendingAccept {
             op_key, new_sock: sock, local, remote, addrlen,
         });
@@ -527,6 +660,11 @@ pub unsafe fn ioqueue_connect_impl(
 // The per-key `processing` flag stays set DURING the callback so that no
 // other poll thread can race on the same key.  This preserves TCP byte
 // ordering across concurrent poll threads.
+//
+// For stream sockets, partial writes are tracked: if send() only
+// transmits part of the buffer, the entry stays in the queue with an
+// updated `written` offset.  The callback fires only when the entire
+// buffer has been sent (or on error), matching pjproject's behaviour.
 // ---------------------------------------------------------------------------
 
 pub unsafe fn ioqueue_poll_impl(
@@ -658,6 +796,7 @@ pub unsafe fn ioqueue_poll_impl(
         // --- Readable: accept ---
         if readable {
             if let Some(pa) = ki.pending_accept.take() {
+                op_key_clear_pending(pa.op_key);
                 let mut slen: libc::socklen_t = if !pa.addrlen.is_null() {
                     *pa.addrlen as libc::socklen_t
                 } else {
@@ -690,6 +829,7 @@ pub unsafe fn ioqueue_poll_impl(
                 } else {
                     let err = get_errno();
                     if is_wouldblock(err) {
+                        op_key_set_pending(pa.op_key);
                         ki.pending_accept = Some(pa);
                     } else {
                         let cb = ki.cb.on_accept_complete;
@@ -709,6 +849,8 @@ pub unsafe fn ioqueue_poll_impl(
             // --- Readable: recv ---
             if !ki.pending_reads.is_empty() {
                 let pr = ki.pending_reads.remove(0);
+                // Don't clear op_key pending yet; the callback may re-queue
+                let op_key_ptr = pr.op_key;
                 let mut slen: libc::socklen_t = if !pr.fromlen.is_null() {
                     *pr.fromlen as libc::socklen_t
                 } else {
@@ -730,14 +872,23 @@ pub unsafe fn ioqueue_poll_impl(
                     drop(ki);
                     events_fired += 1;
                     if let Some(f) = cb {
-                        f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key, n as isize);
+                        f(e.key_ptr as *mut pj_ioqueue_key_t, op_key_ptr, n as isize);
                     }
-                    let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                    ki2.processing = false;
+                    // Clear pending only if callback didn't re-queue
+                    {
+                        let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
+                        let still_queued = ki2.pending_reads.iter()
+                            .any(|pr| pr.op_key == op_key_ptr);
+                        if !still_queued {
+                            op_key_clear_pending(op_key_ptr);
+                        }
+                        ki2.processing = false;
+                    }
                     continue;
                 } else {
                     let err = get_errno();
                     if is_wouldblock(err) {
+                        op_key_set_pending(pr.op_key);
                         ki.pending_reads.insert(0, pr);
                     } else {
                         let cb = ki.cb.on_read_complete;
@@ -777,31 +928,97 @@ pub unsafe fn ioqueue_poll_impl(
                 continue;
             } else if !ki.pending_writes.is_empty() {
                 // --- Writable: send ---
-                let pw = ki.pending_writes.remove(0);
-                let n = if let Some((to, tolen)) = pw.to {
+                //
+                // pjproject semantics: for stream sockets, keep sending
+                // until the entire buffer is sent.  Only then fire the
+                // callback.  For datagrams, one send() call suffices.
+                //
+                // Extract fields from the front entry to avoid borrow
+                // conflicts with ki.fd.
+                let fd = ki.fd;
+                let pw_written = ki.pending_writes[0].written;
+                let pw_len = ki.pending_writes[0].len;
+                let pw_flags = ki.pending_writes[0].flags;
+                let pw_buf = ki.pending_writes[0].buf;
+                let pw_to = ki.pending_writes[0].to;
+                let pw_is_dgram = ki.pending_writes[0].is_dgram;
+
+                let remaining = (pw_len - pw_written) as usize;
+                let buf_offset = (pw_buf as *const u8).add(pw_written as usize)
+                    as *const libc::c_void;
+
+                let n = if let Some((to, tolen)) = pw_to {
                     libc::sendto(
-                        ki.fd, pw.buf, pw.len as usize, pw.flags as i32,
+                        fd, buf_offset, remaining, pw_flags as i32,
                         to as *const libc::sockaddr, tolen as libc::socklen_t,
                     )
                 } else {
-                    libc::send(ki.fd, pw.buf, pw.len as usize, pw.flags as i32)
+                    libc::send(fd, buf_offset, remaining, pw_flags as i32)
                 };
 
                 if n >= 0 {
-                    let cb = ki.cb.on_write_complete;
-                    drop(ki);
-                    events_fired += 1;
-                    if let Some(f) = cb {
-                        f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key, n as isize);
+                    ki.pending_writes[0].written += n as isize;
+                    let new_written = ki.pending_writes[0].written;
+
+                    // Are we done with this buffer?
+                    if new_written >= pw_len || pw_is_dgram {
+                        // Complete -- remove from queue and fire callback.
+                        // Do NOT clear op_key pending yet: the callback may
+                        // call pj_ioqueue_send which re-queues this op_key.
+                        // We clear it AFTER the callback if it wasn't re-queued.
+                        let pw = ki.pending_writes.remove(0);
+                        let op_key_ptr = pw.op_key;
+                        let cb = ki.cb.on_write_complete;
+                        drop(ki);
+                        events_fired += 1;
+                        if let Some(f) = cb {
+                            f(e.key_ptr as *mut pj_ioqueue_key_t, op_key_ptr, new_written);
+                        }
+                        // After callback: clear pending flag only if the callback
+                        // did NOT re-queue this op_key (pj_ioqueue_send would have
+                        // called op_key_set_pending again if it queued).
+                        // The flag is already set if re-queued, so we only clear
+                        // if it's still set from the ORIGINAL queue entry.
+                        // Actually, pj_ioqueue_send sets pending on queue.
+                        // If the callback's send succeeded immediately (PJ_SUCCESS),
+                        // the flag was never re-set. If it was re-queued, the flag
+                        // is already set. So we clear it unconditionally and let
+                        // pj_ioqueue_send re-set it if needed.
+                        // But this creates the same race window...
+                        //
+                        // The correct approach: the callback either:
+                        // a) Called pj_ioqueue_send which returned PJ_SUCCESS -> op_key not re-set
+                        // b) Called pj_ioqueue_send which returned PJ_EPENDING -> op_key re-set by send
+                        // c) Didn't call pj_ioqueue_send -> op_key still set from original
+                        //
+                        // In all cases, op_key_is_pending reflects the correct state
+                        // AFTER the callback. We just need to clear it for case (a) and (c).
+                        // Case (a): send succeeded, op_key not in pending_writes
+                        // Case (c): callback didn't re-send, op_key not in pending_writes
+                        //
+                        // So: clear if op_key is NOT currently in pending_writes.
+                        {
+                            let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
+                            let still_queued = ki2.pending_writes.iter()
+                                .any(|pw| pw.op_key == op_key_ptr);
+                            if !still_queued {
+                                op_key_clear_pending(op_key_ptr);
+                            }
+                            ki2.processing = false;
+                        }
+                        continue;
                     }
-                    let mut ki2 = (*e.key_ptr).lock.lock().unwrap();
-                    ki2.processing = false;
-                    continue;
+                    // Partial write on a stream socket -- leave the
+                    // entry in the queue with updated `written` offset.
+                    // Next poll iteration will continue sending.
                 } else {
                     let err = get_errno();
                     if is_wouldblock(err) {
-                        ki.pending_writes.insert(0, pw);
+                        // Leave in queue, try again next poll
                     } else {
+                        // Real error -- remove and report via callback
+                        let pw = ki.pending_writes.remove(0);
+                        op_key_clear_pending(pw.op_key);
                         let cb = ki.cb.on_write_complete;
                         drop(ki);
                         events_fired += 1;
@@ -831,22 +1048,25 @@ pub unsafe fn ioqueue_poll_impl(
 
 pub unsafe fn ioqueue_is_pending_impl(
     key: *mut pj_ioqueue_key_t,
-    _op_key: *mut pj_ioqueue_op_key_t,
+    op_key: *mut pj_ioqueue_op_key_t,
 ) -> pj_bool_t {
-    if key.is_null() {
-        return PJ_FALSE;
+    // Check per-op_key pending flag (4-byte int at OP_BYTE_OFFSET).
+    // This matches pjproject's check of write_op->op != 0.
+    if op_key_is_pending(op_key) {
+        return PJ_TRUE;
     }
-    let key_ptr = key as *mut IoKey;
-    let ki = (*key_ptr).lock.lock().unwrap();
-    if !ki.pending_reads.is_empty()
-        || !ki.pending_writes.is_empty()
-        || ki.pending_accept.is_some()
-        || ki.connecting
-    {
-        PJ_TRUE
-    } else {
-        PJ_FALSE
+    // Also return true if the key itself is being processed by a poll thread.
+    // This prevents the worker thread from interfering with an in-progress
+    // poll callback.
+    if !key.is_null() {
+        let key_ptr = key as *mut IoKey;
+        if let Ok(ki) = (*key_ptr).lock.try_lock() {
+            if ki.processing {
+                return PJ_TRUE;
+            }
+        }
     }
+    PJ_FALSE
 }
 
 pub unsafe fn ioqueue_post_completion_impl(

@@ -22,6 +22,11 @@ extern "C" {
 
 typedef int32_t pj_status_t;
 typedef int32_t pj_bool_t;
+typedef size_t pj_size_t;
+typedef ptrdiff_t pj_ssize_t;
+typedef uint64_t pj_timestamp;
+typedef uint64_t pj_highprec_t;
+typedef uint64_t pj_time_val;
 
 #define PJ_SUCCESS      0
 #define PJ_EINVAL       70014
@@ -35,6 +40,23 @@ typedef int32_t pj_bool_t;
 #define PJ_TRUE         1
 #define PJ_FALSE        0
 
+/* PJSIP status codes */
+#define PJSIP_EPARTIALMSG   171061
+
+/* ------------------------------------------------------------------ */
+/* Logging macros                                                      */
+/* ------------------------------------------------------------------ */
+
+#define PJ_LOG(level, arg) do { \
+    if ((level) <= pj_log_get_level()) { \
+        /* Simplified logging - just print to stdout for now */ \
+        printf arg; \
+        printf("\n"); \
+    } \
+} while (0)
+
+#include <stdio.h>
+
 /* ------------------------------------------------------------------ */
 /* pj_str_t                                                            */
 /* ------------------------------------------------------------------ */
@@ -45,18 +67,123 @@ typedef struct pj_str_t {
 } pj_str_t;
 
 /* ------------------------------------------------------------------ */
-/* Opaque types                                                        */
+/* List structure - simplified for compatibility                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct pj_list {
+    void *prev;
+    void *next;
+} pj_list;
+
+/* ------------------------------------------------------------------ */
+/* Complete struct definitions                                         */
 /* ------------------------------------------------------------------ */
 
 typedef struct pj_pool_t        pj_pool_t;
 typedef struct pj_pool_factory {
     char _opaque[0];
 } pj_pool_factory;
-typedef struct pjsip_uri        pjsip_uri;
-typedef struct pjsip_sip_uri    pjsip_sip_uri;
-typedef struct pjsip_msg        pjsip_msg;
-typedef struct pjsip_hdr        pjsip_hdr;
+
 typedef struct pjsip_endpoint   pjsip_endpoint;
+
+/* Message type constants */
+#define PJSIP_REQUEST_MSG  0
+#define PJSIP_RESPONSE_MSG 1
+
+/* Header types */
+#define PJSIP_H_VIA             1
+#define PJSIP_H_FROM            2
+#define PJSIP_H_TO              3
+#define PJSIP_H_CALL_ID         4
+#define PJSIP_H_CSEQ            5
+#define PJSIP_H_CONTACT         6
+#define PJSIP_H_CONTENT_TYPE    7
+#define PJSIP_H_CONTENT_LENGTH  8
+#define PJSIP_H_OTHER           63
+
+typedef struct pjsip_method {
+    int id;
+    pj_str_t name;
+} pjsip_method;
+
+typedef struct pjsip_uri {
+    const void *vptr;
+} pjsip_uri;
+
+typedef struct pjsip_sip_uri {
+    const void *vptr;
+    pj_str_t scheme;
+    pj_str_t user;
+    pj_str_t passwd;
+    pj_str_t host;
+    int port;
+    pj_str_t transport_param;
+    pj_str_t user_param;
+    pj_str_t method_param;
+    int ttl_param;
+    int lr_param;
+    pj_str_t maddr_param;
+} pjsip_sip_uri;
+
+typedef struct pjsip_hdr {
+    struct pjsip_hdr *prev;
+    struct pjsip_hdr *next;
+    int htype;
+    pj_str_t name;
+    pj_str_t sname;
+} pjsip_hdr;
+
+typedef struct pjsip_name_addr {
+    struct pjsip_hdr *prev;
+    struct pjsip_hdr *next;
+    int htype;
+    pj_str_t name;
+    pj_str_t sname;
+    pj_str_t display;
+    pjsip_uri *uri;
+} pjsip_name_addr;
+
+typedef struct pjsip_request_line {
+    pjsip_method method;
+    pjsip_uri *uri;
+} pjsip_request_line;
+
+typedef struct pjsip_status_line {
+    int code;
+    pj_str_t reason;
+} pjsip_status_line;
+
+typedef union pjsip_msg_line {
+    pjsip_request_line req;
+    pjsip_status_line status;
+} pjsip_msg_line;
+
+typedef struct pjsip_media_type {
+    pj_str_t type;
+    pj_str_t subtype;
+} pjsip_media_type;
+
+typedef struct pjsip_msg_body {
+    pjsip_media_type content_type;
+    void *data;
+    unsigned int len;
+} pjsip_msg_body;
+
+typedef struct pjsip_msg {
+    int type;
+    pjsip_msg_line line;
+    pjsip_hdr hdr;
+    pjsip_msg_body *body;
+} pjsip_msg;
+
+/* Parser error report list */
+typedef struct pjsip_parser_err_report {
+    pj_list list;
+    int line;
+    int col;
+    pj_str_t except_code;
+    char *hname;
+} pjsip_parser_err_report;
 
 typedef struct pj_caching_pool {
     pj_pool_factory factory;
@@ -101,6 +228,84 @@ typedef union pj_sockaddr {
 #else
 #define PJ_AF_INET6  10
 #endif
+
+/* ------------------------------------------------------------------ */
+/* String / Utility Functions                                         */
+/* ------------------------------------------------------------------ */
+
+size_t pj_ansi_strlen(const char *str);
+int pj_ansi_snprintf(char *buf, size_t size, const char *fmt, ...);
+char* pj_ansi_strxcpy(char *dst, const char *src, size_t size);
+void pj_bzero(void *ptr, size_t size);
+
+/* ------------------------------------------------------------------ */
+/* Timing Functions                                                   */
+/* ------------------------------------------------------------------ */
+
+void pj_get_timestamp(pj_timestamp *ts);
+void pj_add_timestamp(pj_timestamp *ts1, const pj_timestamp *ts2);
+void pj_sub_timestamp(pj_timestamp *ts1, const pj_timestamp *ts2);
+uint64_t pj_elapsed_time(const pj_timestamp *start, const pj_timestamp *stop);
+uint64_t pj_elapsed_usec(const pj_timestamp *start, const pj_timestamp *stop);
+pj_highprec_t pj_highprec_div(pj_highprec_t val, pj_highprec_t div);
+pj_highprec_t pj_highprec_mod(pj_highprec_t val, pj_highprec_t mod);
+pj_highprec_t pj_highprec_mul(pj_highprec_t val, pj_highprec_t mul);
+
+/* ------------------------------------------------------------------ */
+/* List Functions                                                     */
+/* ------------------------------------------------------------------ */
+
+void pj_list_init(pj_list *list);
+void pj_list_push_back(pj_list *list, void *node);
+size_t pj_list_size(const pj_list *list);
+
+/* ------------------------------------------------------------------ */
+/* SIP Message Functions                                              */
+/* ------------------------------------------------------------------ */
+
+pj_status_t pjsip_find_msg(const char *buf, pj_size_t len, 
+                           pj_bool_t is_datagram, pj_size_t *msg_size);
+
+pjsip_msg* pjsip_parse_msg(pj_pool_t *pool, char *buf, pj_size_t size,
+                           pjsip_parser_err_report *err_list);
+
+pj_ssize_t pjsip_msg_print(const pjsip_msg *msg, char *buf, pj_size_t size);
+
+int pjsip_method_cmp(const pjsip_method *m1, const pjsip_method *m2);
+void pjsip_method_set(pjsip_method *m, int method_id, const pj_str_t *method_name);
+
+pj_ssize_t pjsip_hdr_print_on(void *hdr, char *buf, pj_size_t size);
+
+pjsip_hdr* pjsip_parse_hdr(pj_pool_t *pool, const pj_str_t *name,
+                           char *buf, pj_size_t size, int *parsed_len);
+
+/* ------------------------------------------------------------------ */
+/* SIP Header Creation Functions                                      */
+/* ------------------------------------------------------------------ */
+
+pjsip_hdr* pjsip_cid_hdr_create(pj_pool_t *pool);
+pjsip_hdr* pjsip_clen_hdr_create(pj_pool_t *pool);
+pjsip_hdr* pjsip_contact_hdr_create(pj_pool_t *pool);
+pjsip_hdr* pjsip_cseq_hdr_create(pj_pool_t *pool, unsigned seq, const pjsip_method *method);
+pjsip_hdr* pjsip_ctype_hdr_create(pj_pool_t *pool);
+pjsip_hdr* pjsip_from_hdr_create(pj_pool_t *pool);
+pjsip_hdr* pjsip_generic_string_hdr_create(pj_pool_t *pool, const pj_str_t *name, const pj_str_t *value);
+pjsip_hdr* pjsip_max_fwd_hdr_create(pj_pool_t *pool, int value);
+pjsip_name_addr* pjsip_name_addr_create(pj_pool_t *pool);
+
+/* ------------------------------------------------------------------ */
+/* URI Functions                                                      */
+/* ------------------------------------------------------------------ */
+
+int pjsip_uri_cmp(int context, const pjsip_uri *uri1, const pjsip_uri *uri2);
+
+#define PJSIP_URI_IN_REQ_URI    1
+
+/* ------------------------------------------------------------------ */
+/* Misc Functions                                                     */
+/* ------------------------------------------------------------------ */
+
+void app_perror(const char *msg, pj_status_t status);
 
 /* ------------------------------------------------------------------ */
 /* Init / shutdown                                                     */
@@ -175,8 +380,6 @@ pjsip_uri* pjsip_parse_uri(pj_pool_t *pool, char *buf, size_t size,
 /* Message                                                             */
 /* ------------------------------------------------------------------ */
 
-pjsip_msg* pjsip_parse_msg(pj_pool_t *pool, char *buf, size_t size,
-                            unsigned options);
 pjsip_msg* pjsip_msg_create(pj_pool_t *pool, int type);
 pjsip_hdr* pjsip_msg_find_hdr(const pjsip_msg *msg, int type,
                                const pjsip_hdr *start);

@@ -251,3 +251,202 @@ fn header_name_to_type(name: &str) -> i32 {
         _ => PJSIP_H_OTHER,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Missing functions for pjsip tests
+// ---------------------------------------------------------------------------
+
+/// Find the beginning of a SIP message in a buffer
+#[no_mangle]
+pub unsafe extern "C" fn pjsip_find_msg(
+    buf: *const libc::c_char,
+    len: usize,
+    _is_datagram: i32,
+    msg_size: *mut usize,
+) -> pj_status_t {
+    if buf.is_null() || msg_size.is_null() || len == 0 {
+        return PJ_EINVAL;
+    }
+    
+    // Simple implementation: assume the entire buffer is one message
+    *msg_size = len;
+    PJ_SUCCESS
+}
+
+/// Compare two SIP methods
+#[no_mangle]
+pub unsafe extern "C" fn pjsip_method_cmp(
+    m1: *const pjsip_method,
+    m2: *const pjsip_method,
+) -> i32 {
+    if m1.is_null() || m2.is_null() {
+        return 1;
+    }
+    
+    // If both have the same ID and the ID is not OTHER_METHOD, they're equal
+    if (*m1).id == (*m2).id && (*m1).id != PJSIP_OTHER_METHOD {
+        return 0;
+    }
+    
+    // Otherwise compare the string names
+    crate::string::pj_strcmp(&(*m1).name, &(*m2).name)
+}
+
+/// Compare two SIP URIs
+#[no_mangle] 
+pub unsafe extern "C" fn pjsip_uri_cmp(
+    _context: i32,
+    uri1: *const pjsip_uri,
+    uri2: *const pjsip_uri,
+) -> i32 {
+    if uri1.is_null() && uri2.is_null() {
+        return 0;
+    }
+    if uri1.is_null() || uri2.is_null() {
+        return 1;
+    }
+    
+    // Simple pointer comparison for now - in a real implementation
+    // we would need to parse and compare the URI components
+    if uri1 == uri2 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Print a header to a buffer
+#[no_mangle]
+pub unsafe extern "C" fn pjsip_hdr_print_on(
+    hdr: *mut libc::c_void,
+    buf: *mut libc::c_char,
+    size: usize,
+) -> isize {
+    if hdr.is_null() || buf.is_null() || size == 0 {
+        return -1;
+    }
+    
+    let h = hdr as *mut pjsip_hdr;
+    
+    // For generic string headers, print as "Name: Value"
+    if (*h).htype == PJSIP_H_OTHER {
+        let generic_hdr = hdr as *mut pjsip_generic_string_hdr;
+        let name_str = std::slice::from_raw_parts(
+            (*generic_hdr).name.ptr as *const u8, 
+            (*generic_hdr).name.slen as usize
+        );
+        let value_str = std::slice::from_raw_parts(
+            (*generic_hdr).hvalue.ptr as *const u8,
+            (*generic_hdr).hvalue.slen as usize
+        );
+        
+        let formatted = format!(
+            "{}: {}",
+            std::str::from_utf8_unchecked(name_str),
+            std::str::from_utf8_unchecked(value_str)
+        );
+        
+        let copy_len = std::cmp::min(formatted.len(), size - 1);
+        std::ptr::copy_nonoverlapping(
+            formatted.as_ptr(),
+            buf as *mut u8,
+            copy_len
+        );
+        *buf.add(copy_len) = 0; // null terminate
+        
+        copy_len as isize
+    } else {
+        // For other header types, just print the name for now
+        let name_str = std::slice::from_raw_parts(
+            (*h).name.ptr as *const u8,
+            (*h).name.slen as usize
+        );
+        let name = std::str::from_utf8_unchecked(name_str);
+        let copy_len = std::cmp::min(name.len(), size - 1);
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            buf as *mut u8,
+            copy_len
+        );
+        *buf.add(copy_len) = 0;
+        
+        copy_len as isize
+    }
+}
+
+/// Print a complete SIP message to a buffer
+#[no_mangle]
+pub unsafe extern "C" fn pjsip_msg_print(
+    msg: *const pjsip_msg,
+    buf: *mut libc::c_char,
+    size: usize,
+) -> isize {
+    if msg.is_null() || buf.is_null() || size == 0 {
+        return -1;
+    }
+    
+    let mut pos = 0usize;
+    let mut output = Vec::new();
+    
+    // Print start line
+    if (*msg).msg_type == PJSIP_REQUEST_MSG {
+        let req_line = &(*msg).line.req;
+        let method_name = std::slice::from_raw_parts(
+            req_line.method.name.ptr as *const u8,
+            req_line.method.name.slen as usize
+        );
+        let method = std::str::from_utf8_unchecked(method_name);
+        
+        // Simple URI representation - just use "sip:example.com" for now
+        let start_line = format!("{} sip:example.com SIP/2.0\r\n", method);
+        output.extend_from_slice(start_line.as_bytes());
+    } else {
+        let status_line = &(*msg).line.status;
+        let reason = std::slice::from_raw_parts(
+            status_line.reason.ptr as *const u8,
+            status_line.reason.slen as usize
+        );
+        let reason_str = std::str::from_utf8_unchecked(reason);
+        
+        let start_line = format!("SIP/2.0 {} {}\r\n", status_line.code, reason_str);
+        output.extend_from_slice(start_line.as_bytes());
+    }
+    
+    // Print headers
+    let mut hdr = (*msg).hdr.next;
+    while hdr != &(*msg).hdr as *const _ as *mut _ {
+        if (*hdr).htype == PJSIP_H_OTHER {
+            let generic_hdr = hdr as *mut pjsip_generic_string_hdr;
+            let name_str = std::slice::from_raw_parts(
+                (*generic_hdr).name.ptr as *const u8,
+                (*generic_hdr).name.slen as usize
+            );
+            let value_str = std::slice::from_raw_parts(
+                (*generic_hdr).hvalue.ptr as *const u8,
+                (*generic_hdr).hvalue.slen as usize
+            );
+            
+            let header_line = format!(
+                "{}: {}\r\n",
+                std::str::from_utf8_unchecked(name_str),
+                std::str::from_utf8_unchecked(value_str)
+            );
+            output.extend_from_slice(header_line.as_bytes());
+        }
+        hdr = (*hdr).next;
+    }
+    
+    // Add empty line to separate headers from body
+    output.extend_from_slice(b"\r\n");
+    
+    // Copy to output buffer
+    let copy_len = std::cmp::min(output.len(), size - 1);
+    std::ptr::copy_nonoverlapping(
+        output.as_ptr(),
+        buf as *mut u8,
+        copy_len
+    );
+    *buf.add(copy_len) = 0; // null terminate
+    
+    copy_len as isize
+}
