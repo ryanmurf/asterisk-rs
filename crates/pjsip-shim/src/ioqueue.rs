@@ -86,6 +86,11 @@ struct IoKey {
     /// acquires the SAME lock the test callbacks use, matching pjproject.
     ext_lock: *const PthreadMutex,
     inner: UnsafeCell<IoKeyInner>,
+    /// Mirrors pjproject's `processing` flag.  Set to `true` while a poll
+    /// thread is dispatching an event for this key.  Lives outside the
+    /// UnsafeCell so it can be accessed with proper atomic ordering even
+    /// after the key lock is released (allow_concurrent=true).
+    processing: std::sync::atomic::AtomicBool,
 }
 
 struct IoKeyInner {
@@ -100,12 +105,6 @@ struct IoKeyInner {
     closing: bool,
     allow_concurrent: bool,
     fd_type: i32,
-    /// Mirrors pjproject's `processing` flag.  Set to `true` while a poll
-    /// thread is dispatching an event (recv/send/accept/connect) for this key.
-    /// Other poll threads that see this flag skip the key entirely, which
-    /// prevents two threads from doing recv() on the same TCP socket and
-    /// delivering data out of order.
-    processing: bool,
 }
 unsafe impl Send for IoKeyInner {}
 
@@ -272,8 +271,8 @@ pub unsafe fn ioqueue_register_impl(
             pending_accept: None, connecting: false,
             ioqueue: ioqueue as *mut IoQueueInner,
             closing: false, allow_concurrent: default_c, fd_type,
-            processing: false,
         }),
+        processing: std::sync::atomic::AtomicBool::new(false),
     });
     let key_ptr = Box::into_raw(key);
     data.keys.push(key_ptr);
@@ -347,22 +346,28 @@ pub unsafe fn ioqueue_recv_impl(
     let _g = key_lock(&*key_ptr);
     let k = ki(&*key_ptr);
 
-    let n = libc::recv(k.fd, buf, *length as usize, flags as i32);
-    if n >= 0 {
-        *length = n as isize;
-        return PJ_SUCCESS;
+    // Only attempt immediate recv if no reads are already pending.
+    // This matches pjproject's behaviour: if the read list is non-empty,
+    // we must queue behind existing reads to preserve ordering.
+    if k.pending_reads.is_empty() {
+        let n = libc::recv(k.fd, buf, *length as usize, flags as i32);
+        if n >= 0 {
+            *length = n as isize;
+            return PJ_SUCCESS;
+        }
+
+        let err = get_errno();
+        if !is_wouldblock(err) {
+            return 120000 + err;
+        }
     }
 
-    let err = get_errno();
-    if is_wouldblock(err) {
-        op_key_set_pending(op_key, 2); // OP_RECV
-        k.pending_reads.push(PendingRead {
-            op_key, buf, len: *length, flags,
-            from: std::ptr::null_mut(), fromlen: std::ptr::null_mut(),
-        });
-        return PJ_EPENDING;
-    }
-    120000 + err
+    op_key_set_pending(op_key, 2); // OP_RECV
+    k.pending_reads.push(PendingRead {
+        op_key, buf, len: *length, flags,
+        from: std::ptr::null_mut(), fromlen: std::ptr::null_mut(),
+    });
+    PJ_EPENDING
 }
 
 pub unsafe fn ioqueue_recvfrom_impl(
@@ -375,28 +380,32 @@ pub unsafe fn ioqueue_recvfrom_impl(
     let _g = key_lock(&*key_ptr);
     let k = ki(&*key_ptr);
 
-    let mut slen: libc::socklen_t = if !addrlen.is_null() {
-        *addrlen as libc::socklen_t
-    } else { std::mem::size_of::<pj_sockaddr>() as _ };
-    let from_ptr = if addr.is_null() { std::ptr::null_mut() }
-                   else { addr as *mut libc::sockaddr };
+    // Only attempt immediate recv if no reads are already pending.
+    if k.pending_reads.is_empty() {
+        let mut slen: libc::socklen_t = if !addrlen.is_null() {
+            *addrlen as libc::socklen_t
+        } else { std::mem::size_of::<pj_sockaddr>() as _ };
+        let from_ptr = if addr.is_null() { std::ptr::null_mut() }
+                       else { addr as *mut libc::sockaddr };
 
-    let n = libc::recvfrom(k.fd, buf, *length as usize, flags as i32, from_ptr, &mut slen);
-    if n >= 0 {
-        *length = n as isize;
-        if !addrlen.is_null() { *addrlen = slen as i32; }
-        return PJ_SUCCESS;
+        let n = libc::recvfrom(k.fd, buf, *length as usize, flags as i32, from_ptr, &mut slen);
+        if n >= 0 {
+            *length = n as isize;
+            if !addrlen.is_null() { *addrlen = slen as i32; }
+            return PJ_SUCCESS;
+        }
+
+        let err = get_errno();
+        if !is_wouldblock(err) {
+            return 120000 + err;
+        }
     }
 
-    let err = get_errno();
-    if is_wouldblock(err) {
-        op_key_set_pending(op_key, 3); // OP_RECV_FROM
-        k.pending_reads.push(PendingRead {
-            op_key, buf, len: *length, flags, from: addr, fromlen: addrlen,
-        });
-        return PJ_EPENDING;
-    }
-    120000 + err
+    op_key_set_pending(op_key, 3); // OP_RECV_FROM
+    k.pending_reads.push(PendingRead {
+        op_key, buf, len: *length, flags, from: addr, fromlen: addrlen,
+    });
+    PJ_EPENDING
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +586,7 @@ pub unsafe fn ioqueue_poll_impl(
             let k = ki(&*key_ptr);
             if k.closing || k.fd < 0 { return None; }
             // Skip keys that another poll thread is already dispatching.
-            if k.processing { return None; }
+            if (*key_ptr).processing.load(std::sync::atomic::Ordering::Acquire) { return None; }
             let want_read = !k.pending_reads.is_empty() || k.pending_accept.is_some();
             let want_write = !k.pending_writes.is_empty() || k.connecting;
             if !want_read && !want_write { return None; }
@@ -631,8 +640,11 @@ pub unsafe fn ioqueue_poll_impl(
         // the lock is dropped before the callback, so we must NOT let another
         // thread dispatch for the same key concurrently. Use the processing
         // flag for this.
-        if k.processing { drop(guard); continue; }
-        k.processing = true;
+        if (*e.key_ptr).processing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // Another thread is already processing this key.
+            drop(guard);
+            continue;
+        }
 
 
         // --- Readable: accept ---
@@ -658,12 +670,7 @@ pub unsafe fn ioqueue_poll_impl(
                     if let Some(f) = cb {
                         f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key, new_fd as pj_sock_t, PJ_SUCCESS);
                     }
-                    if ac {
-                        let _g2 = key_lock(&*e.key_ptr);
-                        ki(&*e.key_ptr).processing = false;
-                    } else {
-                        k.processing = false;
-                    }
+                    (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                     continue;
                 } else {
                     let err = get_errno();
@@ -675,12 +682,7 @@ pub unsafe fn ioqueue_poll_impl(
                         if ac { drop(guard); }
                         events_fired += 1;
                         if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pa.op_key, -1 as pj_sock_t, 120000+err); }
-                        if ac {
-                            let _g2 = key_lock(&*e.key_ptr);
-                            ki(&*e.key_ptr).processing = false;
-                        } else {
-                            k.processing = false;
-                        }
+                        (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                         continue;
                     }
                 }
@@ -704,12 +706,7 @@ pub unsafe fn ioqueue_poll_impl(
                     if ac { drop(guard); }
                     events_fired += 1;
                     if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key, n as isize); }
-                    if ac {
-                        let _g2 = key_lock(&*e.key_ptr);
-                        ki(&*e.key_ptr).processing = false;
-                    } else {
-                        k.processing = false;
-                    }
+                    (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                     continue;
                 } else {
                     let err = get_errno();
@@ -721,12 +718,7 @@ pub unsafe fn ioqueue_poll_impl(
                         if ac { drop(guard); }
                         events_fired += 1;
                         if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pr.op_key, -(err as isize)); }
-                        if ac {
-                            let _g2 = key_lock(&*e.key_ptr);
-                            ki(&*e.key_ptr).processing = false;
-                        } else {
-                            k.processing = false;
-                        }
+                        (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                         continue;
                     }
                 }
@@ -746,12 +738,7 @@ pub unsafe fn ioqueue_poll_impl(
                 if ac { drop(guard); }
                 events_fired += 1;
                 if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, status); }
-                if ac {
-                    let _g2 = key_lock(&*e.key_ptr);
-                    ki(&*e.key_ptr).processing = false;
-                } else {
-                    k.processing = false;
-                }
+                (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                 continue;
             } else if !k.pending_writes.is_empty() {
                 // --- Writable: send (with partial-write tracking) ---
@@ -783,12 +770,7 @@ pub unsafe fn ioqueue_poll_impl(
                         if ac { drop(guard); }
                         events_fired += 1;
                         if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key, new_written); }
-                        if ac {
-                            let _g2 = key_lock(&*e.key_ptr);
-                            ki(&*e.key_ptr).processing = false;
-                        } else {
-                            k.processing = false;
-                        }
+                        (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                         continue;
                     }
                     // partial write -- stay in queue, clear processing
@@ -801,12 +783,7 @@ pub unsafe fn ioqueue_poll_impl(
                         if ac { drop(guard); }
                         events_fired += 1;
                         if let Some(f) = cb { f(e.key_ptr as *mut pj_ioqueue_key_t, pw.op_key, -(err as isize)); }
-                        if ac {
-                            let _g2 = key_lock(&*e.key_ptr);
-                            ki(&*e.key_ptr).processing = false;
-                        } else {
-                            k.processing = false;
-                        }
+                        (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
                         continue;
                     }
                 }
@@ -814,7 +791,7 @@ pub unsafe fn ioqueue_poll_impl(
         }
 
         // No event dispatched or only partial write -- clear processing.
-        k.processing = false;
+        (*e.key_ptr).processing.store(false, std::sync::atomic::Ordering::Release);
         drop(guard);
     }
 
