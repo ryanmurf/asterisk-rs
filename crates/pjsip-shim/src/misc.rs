@@ -650,7 +650,7 @@ unsafe extern "C" fn activesock_on_read_complete(
     op_key: *mut pj_ioqueue_op_key_t,
     bytes_read: isize,
 ) {
-    let user_data = crate::ioqueue::ioqueue_get_user_data_impl(key);
+    let user_data = crate::ioqueue::pj_ioqueue_get_user_data(key);
     if user_data.is_null() { return; }
     let asock_ptr = user_data as *mut ActiveSockInner;
     let asock = &mut *asock_ptr;
@@ -693,13 +693,13 @@ unsafe extern "C" fn activesock_on_read_complete(
         if asock.read_type == 2 {
             // recvfrom -- capture source address into asock for next callback
             asock.src_addr_len = std::mem::size_of::<pj_sockaddr>() as i32;
-            crate::ioqueue::ioqueue_recvfrom_impl(
+            crate::ioqueue::pj_ioqueue_recvfrom(
                 key, op_key, buf_ptr, &mut len, flags,
-                &mut asock.src_addr as *mut pj_sockaddr,
+                &mut asock.src_addr as *mut pj_sockaddr as *mut libc::c_void,
                 &mut asock.src_addr_len as *mut i32,
             );
         } else {
-            crate::ioqueue::ioqueue_recv_impl(key, op_key, buf_ptr, &mut len, flags);
+            crate::ioqueue::pj_ioqueue_recv(key, op_key, buf_ptr, &mut len, flags);
         }
     }
 }
@@ -709,7 +709,7 @@ unsafe extern "C" fn activesock_on_write_complete(
     op_key: *mut pj_ioqueue_op_key_t,
     bytes_sent: isize,
 ) {
-    let user_data = crate::ioqueue::ioqueue_get_user_data_impl(key);
+    let user_data = crate::ioqueue::pj_ioqueue_get_user_data(key);
     if user_data.is_null() { return; }
     let asock = &*(user_data as *const ActiveSockInner);
     let self_ptr = user_data as *mut pj_activesock_t;
@@ -725,7 +725,7 @@ unsafe extern "C" fn activesock_on_accept_complete(
     new_sock: crate::socket::pj_sock_t,
     status: pj_status_t,
 ) {
-    let user_data = crate::ioqueue::ioqueue_get_user_data_impl(key);
+    let user_data = crate::ioqueue::pj_ioqueue_get_user_data(key);
     if user_data.is_null() { return; }
     let asock = &*(user_data as *const ActiveSockInner);
     let self_ptr = user_data as *mut pj_activesock_t;
@@ -741,7 +741,7 @@ unsafe extern "C" fn activesock_on_connect_complete(
     key: *mut pj_ioqueue_key_t,
     status: pj_status_t,
 ) {
-    let user_data = crate::ioqueue::ioqueue_get_user_data_impl(key);
+    let user_data = crate::ioqueue::pj_ioqueue_get_user_data(key);
     if user_data.is_null() { return; }
     let asock = &*(user_data as *const ActiveSockInner);
     let self_ptr = user_data as *mut pj_activesock_t;
@@ -808,20 +808,20 @@ pub unsafe extern "C" fn pj_activesock_create(
         on_connect_complete: Some(activesock_on_connect_complete),
     };
 
-    match crate::ioqueue::ioqueue_register_impl(
+    let mut key: *mut pj_ioqueue_key_t = std::ptr::null_mut();
+    let status = crate::ioqueue::pj_ioqueue_register_sock(
+        _pool,
         ioqueue as *mut pj_ioqueue_t, sock,
         inner_ptr as *mut libc::c_void, &ioq_cb,
-        std::ptr::null_mut(),
-    ) {
-        Ok(key) => {
-            (*inner_ptr).key = key;
-            *p_asock = inner_ptr as *mut pj_activesock_t;
-            PJ_SUCCESS
-        }
-        Err(e) => {
-            let _ = Box::from_raw(inner_ptr);
-            e
-        }
+        &mut key,
+    );
+    if status == PJ_SUCCESS {
+        (*inner_ptr).key = key;
+        *p_asock = inner_ptr as *mut pj_activesock_t;
+        PJ_SUCCESS
+    } else {
+        let _ = Box::from_raw(inner_ptr);
+        status
     }
 }
 
@@ -881,7 +881,7 @@ pub unsafe extern "C" fn pj_activesock_close(asock: *mut pj_activesock_t) -> pj_
     }
     let inner = &mut *(asock as *mut ActiveSockInner);
     if !inner.key.is_null() {
-        crate::ioqueue::ioqueue_unregister_impl(inner.key);
+        crate::ioqueue::pj_ioqueue_unregister(inner.key);
         inner.key = std::ptr::null_mut();
     }
     // Don't free inner -- it might be accessed from callbacks
@@ -929,7 +929,7 @@ pub unsafe extern "C" fn pj_activesock_start_read(
 
     let mut len = buff_size as isize;
     let buf_ptr = inner.read_buf.as_mut_ptr() as *mut libc::c_void;
-    let status = crate::ioqueue::ioqueue_recv_impl(
+    let status = crate::ioqueue::pj_ioqueue_recv(
         inner.key, &mut inner.read_op_key, buf_ptr, &mut len, flags,
     );
     if status == PJ_SUCCESS {
@@ -973,9 +973,9 @@ pub unsafe extern "C" fn pj_activesock_start_recvfrom(
     let mut len = buff_size as isize;
     let buf_ptr = inner.read_buf.as_mut_ptr() as *mut libc::c_void;
     inner.src_addr_len = std::mem::size_of::<pj_sockaddr>() as i32;
-    let status = crate::ioqueue::ioqueue_recvfrom_impl(
+    let status = crate::ioqueue::pj_ioqueue_recvfrom(
         inner.key, &mut inner.read_op_key, buf_ptr, &mut len, flags,
-        &mut inner.src_addr as *mut pj_sockaddr,
+        &mut inner.src_addr as *mut pj_sockaddr as *mut libc::c_void,
         &mut inner.src_addr_len as *mut i32,
     );
     if status == PJ_SUCCESS {
@@ -1011,7 +1011,7 @@ pub unsafe extern "C" fn pj_activesock_send(
         return PJ_EINVAL;
     }
     let inner = &*(asock as *const ActiveSockInner);
-    crate::ioqueue::ioqueue_send_impl(
+    crate::ioqueue::pj_ioqueue_send(
         inner.key, send_key as *mut pj_ioqueue_op_key_t, data, size, flags,
     )
 }
@@ -1030,9 +1030,9 @@ pub unsafe extern "C" fn pj_activesock_sendto(
         return PJ_EINVAL;
     }
     let inner = &*(asock as *const ActiveSockInner);
-    crate::ioqueue::ioqueue_sendto_impl(
+    crate::ioqueue::pj_ioqueue_sendto(
         inner.key, send_key as *mut pj_ioqueue_op_key_t,
-        data, size, flags, addr, addr_len,
+        data, size, flags, addr as *const libc::c_void, addr_len,
     )
 }
 
@@ -1047,7 +1047,7 @@ pub unsafe extern "C" fn pj_activesock_start_accept(
     let inner = &mut *(asock as *mut ActiveSockInner);
     let mut new_sock: crate::socket::pj_sock_t = -1;
     let mut addrlen: i32 = std::mem::size_of::<pj_sockaddr>() as i32;
-    crate::ioqueue::ioqueue_accept_impl(
+    crate::ioqueue::pj_ioqueue_accept(
         inner.key, &mut inner.read_op_key,
         &mut new_sock, std::ptr::null_mut(), std::ptr::null_mut(), &mut addrlen,
     )
@@ -1064,7 +1064,7 @@ pub unsafe extern "C" fn pj_activesock_start_connect(
         return PJ_EINVAL;
     }
     let inner = &*(asock as *const ActiveSockInner);
-    crate::ioqueue::ioqueue_connect_impl(inner.key, remaddr, addr_len)
+    crate::ioqueue::pj_ioqueue_connect(inner.key, remaddr as *const libc::c_void, addr_len)
 }
 
 // ============================================================================
@@ -1101,215 +1101,8 @@ pub struct pj_ioqueue_callback {
     pub on_connect_complete: Option<unsafe extern "C" fn(*mut pj_ioqueue_key_t, pj_status_t)>,
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_create(
-    _pool: *mut pj_pool_t,
-    max_fd: u32,
-    p_ioqueue: *mut *mut pj_ioqueue_t,
-) -> pj_status_t {
-    if p_ioqueue.is_null() {
-        return PJ_EINVAL;
-    }
-    *p_ioqueue = crate::ioqueue::ioqueue_create_impl(max_fd);
-    PJ_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_destroy(ioqueue: *mut pj_ioqueue_t) -> pj_status_t {
-    crate::ioqueue::ioqueue_destroy_impl(ioqueue);
-    PJ_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_poll(
-    ioqueue: *mut pj_ioqueue_t,
-    timeout: *const crate::timer::pj_time_val,
-) -> i32 {
-    crate::ioqueue::ioqueue_poll_impl(ioqueue, timeout)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_register_sock(
-    _pool: *mut pj_pool_t,
-    ioqueue: *mut pj_ioqueue_t,
-    sock: crate::socket::pj_sock_t,
-    user_data: *mut libc::c_void,
-    cb: *const pj_ioqueue_callback,
-    p_key: *mut *mut pj_ioqueue_key_t,
-) -> pj_status_t {
-    if p_key.is_null() {
-        return PJ_EINVAL;
-    }
-    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb, std::ptr::null_mut()) {
-        Ok(key) => {
-            *p_key = key;
-            PJ_SUCCESS
-        }
-        Err(e) => e,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_register_sock2(
-    _pool: *mut pj_pool_t,
-    ioqueue: *mut pj_ioqueue_t,
-    sock: crate::socket::pj_sock_t,
-    grp_lock: *mut crate::atomic::pj_grp_lock_t,
-    user_data: *mut libc::c_void,
-    cb: *const pj_ioqueue_callback,
-    p_key: *mut *mut pj_ioqueue_key_t,
-) -> pj_status_t {
-    if p_key.is_null() {
-        return PJ_EINVAL;
-    }
-    match crate::ioqueue::ioqueue_register_impl(ioqueue, sock, user_data, cb, grp_lock) {
-        Ok(key) => {
-            *p_key = key;
-            PJ_SUCCESS
-        }
-        Err(e) => e,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_unregister(key: *mut pj_ioqueue_key_t) -> pj_status_t {
-    crate::ioqueue::ioqueue_unregister_impl(key);
-    PJ_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_get_user_data(
-    key: *mut pj_ioqueue_key_t,
-) -> *mut libc::c_void {
-    crate::ioqueue::ioqueue_get_user_data_impl(key)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_set_user_data(
-    key: *mut pj_ioqueue_key_t,
-    user_data: *mut libc::c_void,
-    old_data: *mut *mut libc::c_void,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_set_user_data_impl(key, user_data, old_data);
-    PJ_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_recv(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    buf: *mut libc::c_void,
-    length: *mut isize,
-    flags: u32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_recv_impl(key, op_key, buf, length, flags)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_recvfrom(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    buf: *mut libc::c_void,
-    length: *mut isize,
-    flags: u32,
-    addr: *mut pj_sockaddr,
-    addrlen: *mut i32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_recvfrom_impl(key, op_key, buf, length, flags, addr, addrlen)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_send(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    data: *const libc::c_void,
-    length: *mut isize,
-    flags: u32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_send_impl(key, op_key, data, length, flags)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_sendto(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    data: *const libc::c_void,
-    length: *mut isize,
-    flags: u32,
-    addr: *const pj_sockaddr,
-    addrlen: i32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_sendto_impl(key, op_key, data, length, flags, addr, addrlen)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_accept(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    sock: *mut crate::socket::pj_sock_t,
-    local: *mut pj_sockaddr,
-    remote: *mut pj_sockaddr,
-    addrlen: *mut i32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_accept_impl(key, op_key, sock, local, remote, addrlen)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_connect(
-    key: *mut pj_ioqueue_key_t,
-    addr: *const pj_sockaddr,
-    addrlen: i32,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_connect_impl(key, addr, addrlen)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_op_key_init(
-    op_key: *mut pj_ioqueue_op_key_t,
-    _size: usize,
-) {
-    if !op_key.is_null() {
-        std::ptr::write_bytes(op_key as *mut u8, 0, std::mem::size_of::<pj_ioqueue_op_key_t>());
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_is_pending(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-) -> pj_bool_t {
-    crate::ioqueue::ioqueue_is_pending_impl(key, op_key)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_post_completion(
-    key: *mut pj_ioqueue_key_t,
-    op_key: *mut pj_ioqueue_op_key_t,
-    bytes_status: isize,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_post_completion_impl(key, op_key, bytes_status)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_set_default_concurrency(
-    ioqueue: *mut pj_ioqueue_t,
-    allow: pj_bool_t,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_set_default_concurrency_impl(ioqueue, allow)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_set_concurrency(
-    key: *mut pj_ioqueue_key_t,
-    allow: pj_bool_t,
-) -> pj_status_t {
-    crate::ioqueue::ioqueue_set_concurrency_impl(key, allow)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_name() -> *const libc::c_char {
-    b"select\0".as_ptr() as *const _
-}
+// NOTE: All pj_ioqueue_* functions are now provided by the compiled C source
+// (ioqueue_select.c + ioqueue_common_abs.c). See ioqueue.rs for extern decls.
 
 // ============================================================================
 // Pool extensions
@@ -2502,37 +2295,5 @@ pub unsafe extern "C" fn pj_atomic_slist_calloc(
     crate::pool::pj_pool_calloc(pool, count, elem_size)
 }
 
-// ============================================================================
-// I/O Queue extensions
-// ============================================================================
-
-/// I/O queue configuration (matches C pj_ioqueue_cfg layout).
-/// C struct: { unsigned epoll_flags; int default_concurrency; }
-#[repr(C)]
-pub struct pj_ioqueue_cfg {
-    pub epoll_flags: u32,
-    pub default_concurrency: i32,
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_cfg_default(cfg: *mut pj_ioqueue_cfg) {
-    if cfg.is_null() {
-        return;
-    }
-    std::ptr::write_bytes(cfg as *mut u8, 0, std::mem::size_of::<pj_ioqueue_cfg>());
-    (*cfg).default_concurrency = -1;
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_create2(
-    _pool: *mut pj_pool_t,
-    max_fd: u32,
-    _cfg: *const pj_ioqueue_cfg,
-    p_ioqueue: *mut *mut pj_ioqueue_t,
-) -> pj_status_t {
-    if p_ioqueue.is_null() {
-        return PJ_EINVAL;
-    }
-    *p_ioqueue = crate::ioqueue::ioqueue_create_impl(max_fd);
-    PJ_SUCCESS
-}
+// NOTE: pj_ioqueue_cfg_default and pj_ioqueue_create2 are now provided
+// by the compiled C ioqueue source code.

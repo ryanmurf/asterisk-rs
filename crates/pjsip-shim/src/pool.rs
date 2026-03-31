@@ -10,7 +10,14 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use crate::types::*;
 
 /// PJ_POOL_ALIGNMENT -- default alignment for pool allocations.
-pub const PJ_POOL_ALIGNMENT: usize = 4;
+pub const PJ_POOL_ALIGNMENT: usize = 8;
+
+/// Size of the C-visible pj_pool_t struct (without Rust-only fields).
+/// This must match what C code computes as `sizeof(pj_pool_t)`:
+///   prev(8) + next(8) + obj_name(32) + factory(8) + factory_data(8) +
+///   capacity(8) + increment_size(8) + block_list(40) + callback(8) +
+///   alignment(8) = 136 bytes on 64-bit.
+const C_POOL_T_SIZE: usize = 136;
 
 /// Pool block -- matches `struct pj_pool_block` in pjlib.
 ///
@@ -175,12 +182,15 @@ pub(crate) unsafe fn pj_pool_create_internal(
     (*sentinel).cur = std::ptr::null_mut();
     (*sentinel).end = std::ptr::null_mut();
 
-    // Allocate the initial block
-    // Subtract pool struct overhead from initial_size
-    let pool_struct_size = std::mem::size_of::<CPoolT>();
+    // Allocate the initial block.
+    // Subtract the *C-visible* pool struct overhead from initial_size, because
+    // callers (including the C test suite) budget initial_size using the C
+    // sizeof(pj_pool_t) -- not our larger Rust CPoolT which has extra Vec
+    // fields.  We heap-allocate CPoolT separately, so the data block should
+    // get the space the caller intended.
     let block_struct_size = std::mem::size_of::<pj_pool_block>();
-    let data_size = if initial_size > pool_struct_size + block_struct_size {
-        initial_size - pool_struct_size - block_struct_size
+    let data_size = if initial_size > C_POOL_T_SIZE + block_struct_size {
+        initial_size - C_POOL_T_SIZE - block_struct_size
     } else {
         64 // minimum
     };
@@ -356,7 +366,7 @@ pub unsafe extern "C" fn pj_pool_get_used_size(pool: *const pj_pool_t) -> usize 
         return 0;
     }
     let cpool = pool as *const CPoolT;
-    let mut used = std::mem::size_of::<CPoolT>(); // pool struct overhead
+    let mut used = C_POOL_T_SIZE; // pool struct overhead (C-visible size)
 
     let sentinel = &(*cpool).block_list as *const pj_pool_block;
     let mut block = (*sentinel).next;
@@ -376,7 +386,7 @@ pub unsafe extern "C" fn pj_pool_get_capacity(pool: *const pj_pool_t) -> usize {
         return 0;
     }
     let cpool = pool as *const CPoolT;
-    let mut cap = std::mem::size_of::<CPoolT>(); // pool struct overhead
+    let mut cap = C_POOL_T_SIZE; // pool struct overhead (C-visible size)
 
     let sentinel = &(*cpool).block_list as *const pj_pool_block;
     let mut block = (*sentinel).next;

@@ -1224,17 +1224,27 @@ mod tests {
     #[test]
     fn test_ioqueue_create_destroy() {
         unsafe {
+            // C ioqueue needs a real pool for allocation
+            let pool = pool::pj_pool_create(
+                std::ptr::null_mut(),
+                b"ioqtest\0".as_ptr() as *const _,
+                64 * 1024, 4096,
+                std::ptr::null_mut(),
+            );
+            assert!(!pool.is_null());
+
             let mut ioq: *mut misc::pj_ioqueue_t = std::ptr::null_mut();
-            let status = misc::pj_ioqueue_create(
-                std::ptr::null_mut(), 64, &mut ioq,
+            let status = ioqueue::pj_ioqueue_create(
+                pool, 64, &mut ioq,
             );
             assert_eq!(status, PJ_SUCCESS);
             assert!(!ioq.is_null());
 
-            let count = misc::pj_ioqueue_poll(ioq, std::ptr::null());
+            let count = ioqueue::pj_ioqueue_poll(ioq, std::ptr::null());
             assert_eq!(count, 0);
 
-            assert_eq!(misc::pj_ioqueue_destroy(ioq), PJ_SUCCESS);
+            assert_eq!(ioqueue::pj_ioqueue_destroy(ioq), PJ_SUCCESS);
+            pool::pj_pool_release(pool);
         }
     }
 

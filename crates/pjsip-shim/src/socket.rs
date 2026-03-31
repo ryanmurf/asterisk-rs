@@ -57,7 +57,8 @@ pub unsafe extern "C" fn pj_sock_socket(
     let fd = libc::socket(family, sock_type, protocol);
     if fd < 0 {
         *sock = -1;
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *sock = fd as i64;
     PJ_SUCCESS
@@ -71,7 +72,8 @@ pub unsafe extern "C" fn pj_sock_close(sock: pj_sock_t) -> pj_status_t {
     if libc::close(sock as i32) == 0 {
         PJ_SUCCESS
     } else {
-        PJ_EINVAL
+        let err = *libc::__error();
+        120000 + err
     }
 }
 
@@ -89,7 +91,12 @@ pub unsafe extern "C" fn pj_sock_bind(
         addr as *const libc::sockaddr,
         addrlen as libc::socklen_t,
     );
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err // PJ_STATUS_FROM_OS(errno)
+    }
 }
 
 #[no_mangle]
@@ -100,7 +107,8 @@ pub unsafe extern "C" fn pj_sock_listen(sock: pj_sock_t, backlog: i32) -> pj_sta
     if libc::listen(sock as i32, backlog) == 0 {
         PJ_SUCCESS
     } else {
-        PJ_EINVAL
+        let err = *libc::__error();
+        120000 + err // PJ_STATUS_FROM_OS(errno)
     }
 }
 
@@ -130,7 +138,8 @@ pub unsafe extern "C" fn pj_sock_accept(
     );
     if fd < 0 {
         *new_sock = -1;
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *new_sock = fd as i64;
     if !addrlen.is_null() {
@@ -153,7 +162,12 @@ pub unsafe extern "C" fn pj_sock_connect(
         addr as *const libc::sockaddr,
         addrlen as libc::socklen_t,
     );
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err // PJ_STATUS_FROM_OS(errno)
+    }
 }
 
 #[no_mangle]
@@ -168,7 +182,8 @@ pub unsafe extern "C" fn pj_sock_send(
     }
     let sent = libc::send(sock as i32, buf, *len as usize, flags);
     if sent < 0 {
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = sent as isize;
     PJ_SUCCESS
@@ -186,7 +201,8 @@ pub unsafe extern "C" fn pj_sock_recv(
     }
     let recvd = libc::recv(sock as i32, buf, *len as usize, flags);
     if recvd < 0 {
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = recvd as isize;
     PJ_SUCCESS
@@ -213,7 +229,8 @@ pub unsafe extern "C" fn pj_sock_sendto(
         tolen as libc::socklen_t,
     );
     if sent < 0 {
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = sent as isize;
     PJ_SUCCESS
@@ -249,7 +266,8 @@ pub unsafe extern "C" fn pj_sock_recvfrom(
         &mut slen,
     );
     if recvd < 0 {
-        return PJ_EINVAL;
+        let err = *libc::__error();
+        return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = recvd as isize;
     if !fromlen.is_null() {
@@ -266,7 +284,8 @@ pub unsafe extern "C" fn pj_sock_shutdown(sock: pj_sock_t, how: i32) -> pj_statu
     if libc::shutdown(sock as i32, how) == 0 {
         PJ_SUCCESS
     } else {
-        PJ_EINVAL
+        let err = *libc::__error();
+        120000 + err
     }
 }
 
@@ -288,7 +307,12 @@ pub unsafe extern "C" fn pj_sock_setsockopt(
         optval,
         optlen as libc::socklen_t,
     );
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err
+    }
 }
 
 #[no_mangle]
@@ -305,7 +329,12 @@ pub unsafe extern "C" fn pj_sock_getsockopt(
     let mut len = *optlen as libc::socklen_t;
     let rc = libc::getsockopt(sock as i32, level, optname, optval, &mut len);
     *optlen = len as i32;
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err
+    }
 }
 
 #[no_mangle]
@@ -320,7 +349,12 @@ pub unsafe extern "C" fn pj_sock_getsockname(
     let mut len = *addrlen as libc::socklen_t;
     let rc = libc::getsockname(sock as i32, addr as *mut libc::sockaddr, &mut len);
     *addrlen = len as i32;
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err
+    }
 }
 
 #[no_mangle]
@@ -335,7 +369,12 @@ pub unsafe extern "C" fn pj_sock_getpeername(
     let mut len = *addrlen as libc::socklen_t;
     let rc = libc::getpeername(sock as i32, addr as *mut libc::sockaddr, &mut len);
     *addrlen = len as i32;
-    if rc == 0 { PJ_SUCCESS } else { PJ_EINVAL }
+    if rc == 0 {
+        PJ_SUCCESS
+    } else {
+        let err = *libc::__error();
+        120000 + err
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,11 +617,51 @@ pub unsafe extern "C" fn pj_getaddrinfo(
 // ---------------------------------------------------------------------------
 // Select (fd_set operations)
 // ---------------------------------------------------------------------------
+//
+// We compile the C ioqueue with FD_SETSIZE=2048 so that select() can handle
+// fd values >= 1024 (the default macOS limit). The Rust `libc` crate's fd_set
+// is fixed at 1024, so we implement our own raw bitmap operations here.
+//
+// On macOS, fd_set is an array of i32 where bit N of the bitmap represents
+// fd N. With FD_SETSIZE=2048, fd_set is 256 bytes (2048 bits).
+// Our PJ_FD_SET_SIZE must match what we pass to cc::Build.
 
-/// pj_fd_set_t -- wrapper around libc fd_set.  We size it to hold libc::fd_set.
+/// Our custom FD_SETSIZE, matching the -DFD_SETSIZE=2048 in build.rs.
+const PJ_FD_SET_SIZE: usize = 2048;
+
+/// Number of bits per i32 word.
+const NFDBITS: usize = 32;
+
+/// Number of i32 words in our fd_set bitmap.
+const FD_SET_WORDS: usize = PJ_FD_SET_SIZE / NFDBITS; // 64
+
+/// Raw fd_set bitmap matching the macOS `struct fd_set { __int32_t fds_bits[N]; }`
+/// layout when compiled with FD_SETSIZE=2048.
+#[repr(C)]
+pub struct RawFdSet {
+    fds_bits: [i32; FD_SET_WORDS],
+}
+
+/// pj_fd_set_t -- the C pjlib type is `pj_sock_t data[PJ_IOQUEUE_MAX_HANDLES+4]`
+/// (= 8224 bytes). We don't need to match that layout exactly because pj_fd_set_t
+/// is always accessed through our PJ_FD_* functions and pj_sock_select; the C
+/// ioqueue code only stores it inline in pj_ioqueue_t which is allocated by
+/// the compiled C code. Our Rust-side pj_fd_set_t is used only for pointer
+/// casting, never for direct allocation of ioqueue structures.
 #[repr(C)]
 pub struct pj_fd_set_t {
-    _data: [u8; std::mem::size_of::<libc::fd_set>()],
+    _data: [u8; std::mem::size_of::<RawFdSet>()],
+}
+
+/// Reinterpret a pj_fd_set_t pointer as our raw bitmap.
+#[inline]
+unsafe fn as_raw_mut(fdsetp: *mut pj_fd_set_t) -> *mut RawFdSet {
+    fdsetp as *mut RawFdSet
+}
+
+#[inline]
+unsafe fn as_raw(fdsetp: *const pj_fd_set_t) -> *const RawFdSet {
+    fdsetp as *const RawFdSet
 }
 
 #[no_mangle]
@@ -590,35 +669,79 @@ pub unsafe extern "C" fn pj_FD_ZERO(fdsetp: *mut pj_fd_set_t) {
     if fdsetp.is_null() {
         return;
     }
-    libc::FD_ZERO(fdsetp as *mut libc::fd_set);
+    let raw = as_raw_mut(fdsetp);
+    std::ptr::write_bytes(raw, 0, 1);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_FD_SET(fd: pj_sock_t, fdsetp: *mut pj_fd_set_t) {
-    if fdsetp.is_null() || fd < 0 {
+    if fdsetp.is_null() || fd < 0 || (fd as usize) >= PJ_FD_SET_SIZE {
         return;
     }
-    libc::FD_SET(fd as i32, fdsetp as *mut libc::fd_set);
+    let raw = &mut *as_raw_mut(fdsetp);
+    let fd = fd as usize;
+    raw.fds_bits[fd / NFDBITS] |= 1i32 << (fd % NFDBITS);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_FD_CLR(fd: pj_sock_t, fdsetp: *mut pj_fd_set_t) {
-    if fdsetp.is_null() || fd < 0 {
+    if fdsetp.is_null() || fd < 0 || (fd as usize) >= PJ_FD_SET_SIZE {
         return;
     }
-    libc::FD_CLR(fd as i32, fdsetp as *mut libc::fd_set);
+    let raw = &mut *as_raw_mut(fdsetp);
+    let fd = fd as usize;
+    raw.fds_bits[fd / NFDBITS] &= !(1i32 << (fd % NFDBITS));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_FD_ISSET(fd: pj_sock_t, fdsetp: *const pj_fd_set_t) -> pj_bool_t {
-    if fdsetp.is_null() || fd < 0 {
+    if fdsetp.is_null() || fd < 0 || (fd as usize) >= PJ_FD_SET_SIZE {
         return PJ_FALSE;
     }
-    if libc::FD_ISSET(fd as i32, fdsetp as *const libc::fd_set) {
+    let raw = &*as_raw(fdsetp);
+    let fd = fd as usize;
+    if (raw.fds_bits[fd / NFDBITS] & (1i32 << (fd % NFDBITS))) != 0 {
         PJ_TRUE
     } else {
         PJ_FALSE
     }
+}
+
+// On macOS, the select() syscall is not limited to FD_SETSIZE=1024 --
+// it processes fds 0..nfds-1 in the bitmap. The system FD_SET macros
+// and fd_set type enforce the limit, but the syscall itself works with
+// larger bitmaps as long as the buffer is big enough. We bypass libc's
+// wrapper and call the syscall directly through libc::select, casting
+// our RawFdSet to libc::fd_set. This is safe because:
+// - Our RawFdSet (256 bytes) is larger than libc::fd_set (128 bytes)
+// - select() only reads/writes the first ceil(nfds/8) bytes of the bitmap
+// - nfds is always <= PJ_FD_SET_SIZE (2048)
+
+extern "C" {
+    /// On macOS, the default `select()` symbol enforces nfds <= FD_SETSIZE
+    /// (1024) and returns EINVAL otherwise (UNIX conformance mode).
+    /// We need the `select$DARWIN_EXTSN` variant which has no such limit.
+    /// This is the symbol you get when compiling C with _DARWIN_UNLIMITED_SELECT
+    /// or _DARWIN_C_SOURCE.
+    #[cfg(target_os = "macos")]
+    #[link_name = "select$DARWIN_EXTSN"]
+    fn select_unlimited(
+        nfds: i32,
+        readfds: *mut RawFdSet,
+        writefds: *mut RawFdSet,
+        exceptfds: *mut RawFdSet,
+        timeout: *mut libc::timeval,
+    ) -> i32;
+
+    #[cfg(not(target_os = "macos"))]
+    #[link_name = "select"]
+    fn select_unlimited(
+        nfds: i32,
+        readfds: *mut RawFdSet,
+        writefds: *mut RawFdSet,
+        exceptfds: *mut RawFdSet,
+        timeout: *mut libc::timeval,
+    ) -> i32;
 }
 
 #[no_mangle]
@@ -641,22 +764,22 @@ pub unsafe extern "C" fn pj_sock_select(
         }
     };
 
-    libc::select(
+    select_unlimited(
         nfds,
         if readfds.is_null() {
             std::ptr::null_mut()
         } else {
-            readfds as *mut libc::fd_set
+            readfds as *mut RawFdSet
         },
         if writefds.is_null() {
             std::ptr::null_mut()
         } else {
-            writefds as *mut libc::fd_set
+            writefds as *mut RawFdSet
         },
         if exceptfds.is_null() {
             std::ptr::null_mut()
         } else {
-            exceptfds as *mut libc::fd_set
+            exceptfds as *mut RawFdSet
         },
         if timeout.is_null() {
             std::ptr::null_mut()
@@ -1036,13 +1159,4 @@ pub unsafe extern "C" fn pj_set_os_error(code: pj_status_t) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pj_ioqueue_get_os_handle
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_ioqueue_get_os_handle(
-    key: *mut libc::c_void,
-) -> pj_sock_t {
-    crate::ioqueue::ioqueue_get_os_handle_impl(key)
-}
+// NOTE: pj_ioqueue_get_os_handle is now provided by the compiled C ioqueue source.

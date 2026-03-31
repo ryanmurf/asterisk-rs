@@ -40,32 +40,51 @@
 
 // ---------------------------------------------------------------------------
 // FD_SET macro wrappers (uppercase PJ_ prefix, as referenced by pjlib-test)
+//
+// Delegate to the pj_FD_* implementations in socket.rs which use our custom
+// raw bitmap operations supporting FD_SETSIZE=2048.
 // ---------------------------------------------------------------------------
+
+use crate::socket::{pj_fd_set_t, pj_FD_ZERO as fd_zero, pj_FD_SET as fd_set,
+                    pj_FD_CLR as fd_clr, pj_FD_ISSET as fd_isset};
+
+/// Custom FD_SETSIZE matching our C compilation (must stay in sync with socket.rs).
+const PJ_FD_SET_SIZE: usize = 2048;
+const NFDBITS: usize = 32;
 
 #[no_mangle]
 pub unsafe extern "C" fn PJ_FD_ZERO(fdsetp: *mut libc::c_void) {
-    if fdsetp.is_null() {
-        return;
-    }
-    libc::FD_ZERO(fdsetp as *mut libc::fd_set);
+    fd_zero(fdsetp as *mut pj_fd_set_t);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PJ_FD_SET(fd: i64, fdsetp: *mut libc::c_void) {
-    if fdsetp.is_null() || fd < 0 {
-        return;
-    }
-    libc::FD_SET(fd as i32, fdsetp as *mut libc::fd_set);
+    fd_set(fd, fdsetp as *mut pj_fd_set_t);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn PJ_FD_CLR(fd: i64, fdsetp: *mut libc::c_void) {
+    fd_clr(fd, fdsetp as *mut pj_fd_set_t);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PJ_FD_ISSET(fd: i64, fdsetp: *const libc::c_void) -> i32 {
-    if fdsetp.is_null() || fd < 0 {
+    fd_isset(fd, fdsetp as *const pj_fd_set_t)
+}
+
+/// Return the number of descriptors in the set.
+/// The C ioqueue code calls this to check if the set is empty.
+/// We iterate through all possible FDs up to our PJ_FD_SET_SIZE and count.
+#[no_mangle]
+pub unsafe extern "C" fn PJ_FD_COUNT(fdsetp: *const libc::c_void) -> usize {
+    if fdsetp.is_null() {
         return 0;
     }
-    if libc::FD_ISSET(fd as i32, fdsetp as *const libc::fd_set) {
-        1
-    } else {
-        0
+    // Count set bits by iterating over i32 words.
+    let raw = fdsetp as *const [i32; PJ_FD_SET_SIZE / NFDBITS];
+    let mut count: usize = 0;
+    for word in &(*raw) {
+        count += (*word).count_ones() as usize;
     }
+    count
 }
