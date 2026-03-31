@@ -1,32 +1,13 @@
-//! Initialization and shutdown -- pj_init / pj_shutdown / pjsip_endpt_create.
+//! Initialization and shutdown -- pjsip_endpt_create and friends.
 //!
-//! These set up global state for our Rust SIP stack.  The implementation
-//! is intentionally simple: `pj_init` is idempotent, `pj_shutdown` is a
-//! no-op (matching pjproject's behaviour in most embeddings).
-
-use std::sync::Once;
+//! pj_init and pj_shutdown are now provided by pjlib's real C source
+//! (os_core_unix.c) compiled into the library via build.rs.
 
 use crate::types::*;
 
-static INIT: Once = Once::new();
-
-// ---------------------------------------------------------------------------
-// pj_init / pj_shutdown
-// ---------------------------------------------------------------------------
-
-/// Initialize the pjlib library.  Idempotent -- safe to call multiple times.
-#[no_mangle]
-pub unsafe extern "C" fn pj_init() -> pj_status_t {
-    INIT.call_once(|| {
-        // Future: initialize logging, timer heap, etc.
-    });
-    PJ_SUCCESS
-}
-
-/// Shut down pjlib.  Currently a no-op.
-#[no_mangle]
-pub unsafe extern "C" fn pj_shutdown() -> pj_status_t {
-    PJ_SUCCESS
+extern "C" {
+    pub fn pj_init() -> pj_status_t;
+    pub fn pj_shutdown() -> pj_status_t;
 }
 
 // ---------------------------------------------------------------------------

@@ -238,26 +238,12 @@ pub unsafe extern "C" fn pj_elapsed_nanosec(
 // ---------------------------------------------------------------------------
 // High-resolution timestamp
 // ---------------------------------------------------------------------------
+// pj_get_timestamp and pj_get_timestamp_freq are now provided by pjlib's
+// real C source (os_timestamp_posix.c) compiled into the library via build.rs.
 
-#[no_mangle]
-pub unsafe extern "C" fn pj_get_timestamp(ts: *mut pj_timestamp) -> pj_status_t {
-    if ts.is_null() {
-        return PJ_EINVAL;
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    (*ts).u64_val = now.as_nanos() as u64;
-    PJ_SUCCESS
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pj_get_timestamp_freq(freq: *mut pj_timestamp) -> pj_status_t {
-    if freq.is_null() {
-        return PJ_EINVAL;
-    }
-    (*freq).u64_val = 1_000_000_000; // nanosecond frequency
-    PJ_SUCCESS
+extern "C" {
+    pub fn pj_get_timestamp(ts: *mut pj_timestamp) -> pj_status_t;
+    pub fn pj_get_timestamp_freq(freq: *mut pj_timestamp) -> pj_status_t;
 }
 
 // ---------------------------------------------------------------------------
