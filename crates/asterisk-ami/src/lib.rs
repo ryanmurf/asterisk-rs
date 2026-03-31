@@ -47,3 +47,19 @@ pub use server::AmiServer;
 pub use events::EventCategory;
 pub use auth::AmiUser;
 pub use event_bus::{AMI_EVENT_BUS, publish_event};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag indicating the system is fully booted.
+/// Set by the CLI startup sequence, read by the WaitFullyBooted AMI action.
+static FULLY_BOOTED: AtomicBool = AtomicBool::new(false);
+
+/// Mark the system as fully booted.
+pub fn set_fully_booted() {
+    FULLY_BOOTED.store(true, Ordering::SeqCst);
+}
+
+/// Check whether the system is fully booted.
+pub fn is_fully_booted() -> bool {
+    FULLY_BOOTED.load(Ordering::SeqCst)
+}

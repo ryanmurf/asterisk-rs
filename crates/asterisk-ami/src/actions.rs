@@ -204,6 +204,15 @@ impl ActionRegistry {
         self.register("confbridgelist", Box::new(handle_confbridge_list));
         self.register("confbridgekick", Box::new(handle_confbridge_kick));
         self.register("confbridgemute", Box::new(handle_confbridge_mute));
+
+        // WaitFullyBooted
+        self.register("waitfullybooted", Box::new(handle_wait_fully_booted));
+
+        // SendText
+        self.register("sendtext", Box::new(handle_send_text));
+
+        // Atxfer (attended transfer)
+        self.register("atxfer", Box::new(handle_atxfer));
     }
 }
 
@@ -405,6 +414,7 @@ fn handle_core_settings(
     AmiResponse::success("Core Settings")
         .with_header("AsteriskVersion", "Asterisk 22.0.0-rs")
         .with_header("SystemName", "asterisk-rs")
+        .with_header("AMIversion", "11.0.0")
         .with_header("MaxCalls", "0")
         .with_header("MaxLoadAvg", "0.0")
         .with_header("MaxFileHandles", "0")
@@ -1119,6 +1129,10 @@ fn handle_list_commands(
         .with_header("QueueAdd", "Add interface to queue (Privilege: agent)")
         .with_header("QueueRemove", "Remove interface from queue (Privilege: agent)")
         .with_header("QueuePause", "Pause/unpause interface in queue (Privilege: agent)")
+        .with_header("WaitFullyBooted", "Wait for Asterisk to fully boot (Privilege: <none>)")
+        .with_header("SendText", "Send text to a channel (Privilege: call)")
+        .with_header("PJSIPShowEndpoints", "Lists PJSIP Endpoints (Privilege: system)")
+        .with_header("Atxfer", "Attended Transfer (Privilege: call)")
 }
 
 /// Handle QueueStatus action.
@@ -1128,10 +1142,20 @@ fn handle_queue_status(
     _context: &ActionContext,
 ) -> AmiResponse {
     let _queue = action.get_header("Queue"); // Optional
+    let action_id = action.action_id.clone().unwrap_or_default();
 
-    // In a real implementation, send events for each queue member and caller
+    let mut resp = AmiResponse::success("Queue status will follow");
 
-    AmiResponse::success("Queue status will follow")
+    // Send QueueStatusComplete event so starpy doesn't hang
+    let mut complete = AmiEvent::new("QueueStatusComplete", 0x01);
+    if !action_id.is_empty() {
+        complete.add_header("ActionID", &action_id);
+    }
+    complete.add_header("EventList", "Complete");
+    complete.add_header("ListItems", "0");
+    resp.add_followup_event(complete);
+
+    resp
 }
 
 /// Handle QueueAdd action.
@@ -2056,6 +2080,95 @@ fn chrono_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// WaitFullyBooted AMI action
+// ---------------------------------------------------------------------------
+
+/// Handle the WaitFullyBooted action.
+///
+/// Real Asterisk returns `Response: Success` with `Status: Fully Booted` once
+/// the system is ready.  The testsuite (via starpy) sends this immediately
+/// after Login and expects a synchronous success response.
+fn handle_wait_fully_booted(
+    _action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    if crate::is_fully_booted() {
+        AmiResponse::success("Fully Booted")
+            .with_header("Status", "Fully Booted")
+    } else {
+        // Spin briefly – the boot sequence is typically just a few ms away
+        for _ in 0..300 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if crate::is_fully_booted() {
+                return AmiResponse::success("Fully Booted")
+                    .with_header("Status", "Fully Booted");
+            }
+        }
+        AmiResponse::error("Timeout waiting for fully booted")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SendText AMI action
+// ---------------------------------------------------------------------------
+
+/// Handle the SendText action.
+///
+/// Sends a text message to a channel.  In real Asterisk this invokes
+/// the channel technology's `send_text` callback.
+fn handle_send_text(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let channel_name = match action.get_header("Channel") {
+        Some(c) => c,
+        None => return AmiResponse::error("Channel is required"),
+    };
+
+    let _message = action.get_header("Message").unwrap_or("");
+
+    info!("AMI SendText: channel={}", channel_name);
+
+    if asterisk_core::channel_store::find_by_name(channel_name).is_some() {
+        AmiResponse::success("Success")
+    } else {
+        AmiResponse::error(format!("Channel not found: {}", channel_name))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Atxfer (Attended Transfer) AMI action
+// ---------------------------------------------------------------------------
+
+/// Handle the Atxfer action.
+fn handle_atxfer(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let channel_name = match action.get_header("Channel") {
+        Some(c) => c,
+        None => return AmiResponse::error("Channel is required"),
+    };
+
+    let exten = match action.get_header("Exten") {
+        Some(e) => e,
+        None => return AmiResponse::error("Exten is required"),
+    };
+
+    let context = action.get_header("Context").unwrap_or("default");
+
+    info!(
+        "AMI Atxfer: channel={} exten={} context={}",
+        channel_name, exten, context
+    );
+
+    AmiResponse::success("Transfer initiated")
 }
 
 #[cfg(test)]

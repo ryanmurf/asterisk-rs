@@ -1566,6 +1566,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     );
 
     // Emit FullyBooted event (SYSTEM category = 0x01)
+    asterisk_ami::set_fully_booted();
     asterisk_ami::publish_event(
         asterisk_ami::AmiEvent::new("FullyBooted", 0x01)
             .with_header("Status", "Fully Booted"),
@@ -1799,6 +1800,7 @@ async fn main() {
     // Signal that the daemon is fully booted.  Any pending
     // `core waitfullybooted` connections will now unblock.
     FULLY_BOOTED.store(true, Ordering::SeqCst);
+    asterisk_ami::set_fully_booted();
     info!("Asterisk-RS is fully booted.");
 
     if console {
