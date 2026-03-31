@@ -36,6 +36,7 @@ pub mod threading;
 pub mod socket;
 pub mod atomic;
 pub mod misc;
+pub mod ioqueue;
 pub mod socket_consts;
 
 // Re-export everything so symbols appear in the shared library.

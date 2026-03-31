@@ -128,6 +128,8 @@ pub struct pj_grp_lock_t {
 }
 
 struct GrpLockInner {
+    /// Must be first field -- pj_lock_acquire reads it to dispatch.
+    tag: u32,
     lock: parking_lot::ReentrantMutex<()>,
     ref_count: AtomicIsize,
     destroy_handlers: Vec<(unsafe extern "C" fn(*mut libc::c_void), *mut libc::c_void)>,
@@ -147,6 +149,7 @@ pub unsafe extern "C" fn pj_grp_lock_create(
         return PJ_EINVAL;
     }
     let inner = Box::new(GrpLockInner {
+        tag: crate::threading::LOCK_TAG_GRP,
         lock: parking_lot::ReentrantMutex::new(()),
         ref_count: AtomicIsize::new(0),
         destroy_handlers: Vec::new(),

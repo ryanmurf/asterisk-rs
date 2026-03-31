@@ -1042,7 +1042,7 @@ pub unsafe extern "C" fn pj_set_os_error(code: pj_status_t) {
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_ioqueue_get_os_handle(
-    _key: *mut libc::c_void,
+    key: *mut libc::c_void,
 ) -> pj_sock_t {
-    -1
+    crate::ioqueue::ioqueue_get_os_handle_impl(key)
 }

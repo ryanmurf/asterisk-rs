@@ -617,10 +617,15 @@ pub struct pj_lock_t {
     _opaque: [u8; 0],
 }
 
+/// Tag values for lock dispatch.
+const LOCK_TAG_MUTEX: u32 = 0x4C4B_4D58; // "LKMX"
+const LOCK_TAG_NULL: u32  = 0x4C4B_4E4C; // "LKNL"
+pub(crate) const LOCK_TAG_GRP: u32 = 0x4C4B_4750; // "LKGP"
+
 /// Lock operations vtable (matches pjproject's pj_lock_t internally).
 struct LockInner {
+    tag: u32,
     mutex: *mut pj_mutex_t,
-    is_null: bool,
 }
 
 #[no_mangle]
@@ -633,8 +638,8 @@ pub unsafe extern "C" fn pj_lock_create_null_mutex(
         return PJ_EINVAL;
     }
     let inner = Box::new(LockInner {
+        tag: LOCK_TAG_NULL,
         mutex: std::ptr::null_mut(),
-        is_null: true,
     });
     *p_lock = Box::into_raw(inner) as *mut pj_lock_t;
     PJ_SUCCESS
@@ -651,8 +656,8 @@ pub unsafe extern "C" fn pj_lock_create_simple_mutex(
     }
     let mutex = create_mutex(false);
     let inner = Box::new(LockInner {
+        tag: LOCK_TAG_MUTEX,
         mutex,
-        is_null: false,
     });
     *p_lock = Box::into_raw(inner) as *mut pj_lock_t;
     PJ_SUCCESS
@@ -669,8 +674,8 @@ pub unsafe extern "C" fn pj_lock_create_recursive_mutex(
     }
     let mutex = create_mutex(true);
     let inner = Box::new(LockInner {
+        tag: LOCK_TAG_MUTEX,
         mutex,
-        is_null: false,
     });
     *p_lock = Box::into_raw(inner) as *mut pj_lock_t;
     PJ_SUCCESS
@@ -681,11 +686,16 @@ pub unsafe extern "C" fn pj_lock_acquire(lock: *mut pj_lock_t) -> pj_status_t {
     if lock.is_null() {
         return PJ_EINVAL;
     }
-    let inner = &*(lock as *const LockInner);
-    if inner.is_null {
-        return PJ_SUCCESS;
+    // Read tag to dispatch correctly (grp_lock can be cast to pj_lock_t).
+    let tag = *(lock as *const u32);
+    match tag {
+        LOCK_TAG_NULL => PJ_SUCCESS,
+        LOCK_TAG_GRP => crate::atomic::pj_grp_lock_acquire(lock as *mut crate::atomic::pj_grp_lock_t),
+        _ => {
+            let inner = &*(lock as *const LockInner);
+            pj_mutex_lock(inner.mutex)
+        }
     }
-    pj_mutex_lock(inner.mutex)
 }
 
 #[no_mangle]
@@ -693,11 +703,15 @@ pub unsafe extern "C" fn pj_lock_tryacquire(lock: *mut pj_lock_t) -> pj_status_t
     if lock.is_null() {
         return PJ_EINVAL;
     }
-    let inner = &*(lock as *const LockInner);
-    if inner.is_null {
-        return PJ_SUCCESS;
+    let tag = *(lock as *const u32);
+    match tag {
+        LOCK_TAG_NULL => PJ_SUCCESS,
+        LOCK_TAG_GRP => crate::atomic::pj_grp_lock_tryacquire(lock as *mut crate::atomic::pj_grp_lock_t),
+        _ => {
+            let inner = &*(lock as *const LockInner);
+            pj_mutex_trylock(inner.mutex)
+        }
     }
-    pj_mutex_trylock(inner.mutex)
 }
 
 #[no_mangle]
@@ -705,18 +719,27 @@ pub unsafe extern "C" fn pj_lock_release(lock: *mut pj_lock_t) -> pj_status_t {
     if lock.is_null() {
         return PJ_EINVAL;
     }
-    let inner = &*(lock as *const LockInner);
-    if inner.is_null {
-        return PJ_SUCCESS;
+    let tag = *(lock as *const u32);
+    match tag {
+        LOCK_TAG_NULL => PJ_SUCCESS,
+        LOCK_TAG_GRP => crate::atomic::pj_grp_lock_release(lock as *mut crate::atomic::pj_grp_lock_t),
+        _ => {
+            let inner = &*(lock as *const LockInner);
+            pj_mutex_unlock(inner.mutex)
+        }
     }
-    pj_mutex_unlock(inner.mutex)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_lock_destroy(lock: *mut pj_lock_t) -> pj_status_t {
     if !lock.is_null() {
+        let tag = *(lock as *const u32);
+        if tag == LOCK_TAG_GRP {
+            // grp_lock handles its own destruction
+            return PJ_SUCCESS;
+        }
         let inner = Box::from_raw(lock as *mut LockInner);
-        if !inner.is_null && !inner.mutex.is_null() {
+        if tag == LOCK_TAG_MUTEX && !inner.mutex.is_null() {
             pj_mutex_destroy(inner.mutex);
         }
     }
