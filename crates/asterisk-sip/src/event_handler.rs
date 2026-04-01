@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use tracing::{info, warn, debug};
 
 use crate::parser::SipMessage;
+use crate::authenticator::AuthCredentials;
 use crate::sdp::SessionDescription;
 use crate::session::SipSession;
 use crate::transport::SipTransport;
@@ -47,6 +48,8 @@ pub struct SipEventHandler {
 impl SipEventHandler {
     /// Create a new event handler with the given dialplan and transport.
     pub fn new(dialplan: Arc<Dialplan>, transport: Arc<dyn SipTransport>) -> Self {
+        // Register transport with global notify service
+        crate::notify_service::global_notify_service().set_transport(transport.clone());
         Self {
             dialplan,
             callid_map: Arc::new(RwLock::new(HashMap::new())),
@@ -73,14 +76,101 @@ impl SipEventHandler {
         let caller_num = extract_user_from_header(from).unwrap_or_default();
         let caller_name = extract_display_name(from).unwrap_or_default();
 
-        // 2. Extract dialed number from To header / Request-URI
-        let to = request.get_header("To")?;
-        let exten = extract_user_from_header(to).unwrap_or_else(|| "s".to_string());
+        // 2. Extract dialed number from Request-URI (preferred) or To header
+        let exten = match &request.start_line {
+            crate::parser::StartLine::Request(r) => {
+                r.uri.user.clone().unwrap_or_else(|| "s".to_string())
+            }
+            _ => {
+                let to = request.get_header("To")?;
+                extract_user_from_header(to).unwrap_or_else(|| "s".to_string())
+            }
+        };
 
         // 3. Extract Call-ID for tracking
         let call_id = request.call_id()?.to_string();
+        eprintln!("[DEBUG] handle_incoming_invite: call_id={}, exten={}, caller={}", call_id, exten, caller_num);
 
-        // 4. Send 100 Trying immediately
+        // 4. Authenticate the request against configured endpoints.
+        //    Build credentials from all endpoints that have auth configured.
+        let pjsip_config = crate::pjsip_config::get_global_pjsip_config();
+        let mut endpoint_context = "default".to_string();
+        let mut allow_overlap = true;
+
+        if let Some(ref cfg) = pjsip_config {
+            // Collect all auth credentials and their associated endpoint names
+            let mut all_creds: Vec<(String, AuthCredentials)> = Vec::new();
+            for ep in &cfg.endpoints {
+                if let Some(ref auth_name) = ep.auth {
+                    if let Some(auth) = cfg.find_auth(auth_name) {
+                        all_creds.push((
+                            ep.name.clone(),
+                            AuthCredentials::new(&auth.username, &auth.password, ""),
+                        ));
+                    }
+                }
+            }
+
+            if !all_creds.is_empty() {
+                let creds: Vec<AuthCredentials> = all_creds.iter().map(|(_, c)| c.clone()).collect();
+                let authenticator = crate::authenticator::InboundAuthenticator::new();
+                match authenticator.verify(request, &creds, false) {
+                    Ok(()) => {
+                        eprintln!("[DEBUG] Auth succeeded for call_id={}", call_id);
+                        // Auth succeeded -- identify the endpoint from the auth username.
+                        // Extract username from the Authorization header to find the matching endpoint.
+                        if let Some(auth_hdr) = request.get_header(crate::parser::header_names::AUTHORIZATION) {
+                            if let Some(parsed) = crate::authenticator::parse_authorization(auth_hdr) {
+                                for (ep_name, cred) in &all_creds {
+                                    if cred.username == parsed.username {
+                                        if let Some(ep) = cfg.find_endpoint(ep_name) {
+                                            endpoint_context = ep.context.clone();
+                                            allow_overlap = ep.allow_overlap;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(challenge) => {
+                        eprintln!("[DEBUG] Auth failed, sending 401 for call_id={}", call_id);
+                        // Send 401 challenge
+                        if let Err(e) = self.transport.send(&challenge, remote_addr).await {
+                            warn!(call_id = %call_id, "Failed to send 401 challenge: {}", e);
+                        } else {
+                            debug!(call_id = %call_id, "Sent 401 Unauthorized challenge");
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // 5. Check extension existence in the dialplan before proceeding.
+        //    If the extension doesn't exist, respond with 484 or 404 depending
+        //    on the allow_overlap setting.
+        let extension_exists = self.dialplan.find_extension(&endpoint_context, &exten).is_some();
+        eprintln!("[DEBUG] Extension lookup: context={}, exten={}, exists={}, allow_overlap={}", endpoint_context, exten, extension_exists, allow_overlap);
+        if !extension_exists {
+            if allow_overlap && self.dialplan.could_match(&endpoint_context, &exten) {
+                // Overlap enabled and extension could match with more digits -> 484
+                if let Ok(resp) = request.create_response(484, "Address Incomplete") {
+                    let _ = self.transport.send(&resp, remote_addr).await;
+                    debug!(call_id = %call_id, exten = %exten, "Sent 484 Address Incomplete (overlap enabled)");
+                }
+                return None;
+            } else {
+                // No match possible -> 404
+                if let Ok(resp) = request.create_response(404, "Not Found") {
+                    let _ = self.transport.send(&resp, remote_addr).await;
+                    debug!(call_id = %call_id, exten = %exten, "Sent 404 Not Found");
+                }
+                return None;
+            }
+        }
+
+        // 6. Send 100 Trying
         match request.create_response(100, "Trying") {
             Ok(trying) => {
                 if let Err(e) = self.transport.send(&trying, remote_addr).await {
@@ -94,18 +184,28 @@ impl SipEventHandler {
             }
         }
 
-        // 5. Create the channel via the global store
+        // 7. Create the channel and register it in the global store.
+        //    We use register_existing_channel so that all fields (including
+        //    accountcode) are set before the Newchannel AMI event is emitted.
         let channel_name = format!("PJSIP/{}-{:08x}", caller_num, rand_id());
-        let channel = store::alloc_channel(&channel_name);
+        let mut new_ch = asterisk_core::channel::Channel::new(&channel_name);
+        new_ch.caller.id.number.number = caller_num.clone();
+        new_ch.caller.id.name.name = caller_name;
+        new_ch.exten = exten;
+        new_ch.context = endpoint_context.clone();
+        new_ch.set_state(ChannelState::Ring);
 
-        {
-            let mut ch = channel.lock();
-            ch.caller.id.number.number = caller_num;
-            ch.caller.id.name.name = caller_name;
-            ch.exten = exten;
-            ch.context = "from-external".to_string();
-            ch.set_state(ChannelState::Ring);
+        // Look up accountcode from the matched endpoint
+        if let Some(ref cfg) = pjsip_config {
+            let ep_name = cfg.identify_endpoint_by_ip(&remote_addr.ip().to_string());
+            if let Some(ep_name) = ep_name {
+                if let Some(ep) = cfg.find_endpoint(ep_name) {
+                    new_ch.accountcode = ep.accountcode.clone();
+                }
+            }
         }
+
+        let channel = store::register_existing_channel(new_ch);
 
         // 6. Register Call-ID mapping for response routing
         {
@@ -126,6 +226,29 @@ impl SipEventHandler {
         }
 
         // 8. Store the SIP session state for later signaling (200 OK, BYE)
+        //    Also register with global notify service for in-dialog NOTIFY.
+        let remote_contact = request
+            .get_header("Contact")
+            .and_then(crate::parser::extract_uri)
+            .unwrap_or_else(|| format!("sip:{}@{}", caller_num, remote_addr));
+        let local_uri = format!("sip:asterisk@{}", session.local_addr);
+        // Extract From tag from the INVITE for the remote tag in our dialog
+        let remote_from_tag = request
+            .get_header("From")
+            .and_then(crate::parser::extract_tag)
+            .unwrap_or_default();
+        let notify_state = crate::notify_service::ChannelSipState {
+            call_id: session.call_id.clone(),
+            local_tag: session.local_tag.clone(),
+            remote_tag: remote_from_tag,
+            local_uri,
+            remote_target: remote_contact,
+            remote_addr,
+            local_seq: 100,
+        };
+        crate::notify_service::global_notify_service()
+            .register_channel(&channel_name, notify_state);
+
         let call_state = Arc::new(tokio::sync::Mutex::new(CallState {
             session,
             remote_addr,
@@ -356,6 +479,7 @@ impl SipEventHandler {
             };
 
             if let Some(name) = channel_name {
+                crate::notify_service::global_notify_service().unregister_channel(&name);
                 if let Some(channel) = store::find_by_name(&name) {
                     let mut ch = channel.lock();
                     ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
@@ -366,6 +490,96 @@ impl SipEventHandler {
             self.callid_map.write().remove(&call_id);
             self.call_states.write().remove(&call_id);
         }
+    }
+
+    /// Send a re-INVITE to an existing session with a new SDP offer.
+    ///
+    /// Used by the SFU ConfBridge to add/remove video streams.
+    /// Returns `true` if the re-INVITE was sent successfully.
+    pub async fn send_reinvite(&self, call_id: &str, sdp: SessionDescription) -> bool {
+        let cs_arc = {
+            let states = self.call_states.read();
+            match states.get(call_id) {
+                Some(cs) => cs.clone(),
+                None => {
+                    warn!(call_id = %call_id, "Cannot send re-INVITE: no call state");
+                    return false;
+                }
+            }
+        };
+
+        let mut cs = cs_arc.lock().await;
+        if let Some(reinvite) = cs.session.build_reinvite(&sdp) {
+            if let Err(e) = self.transport.send(&reinvite, cs.remote_addr).await {
+                warn!(call_id = %call_id, "Failed to send re-INVITE: {}", e);
+                return false;
+            }
+            info!(call_id = %call_id, "Sent re-INVITE");
+            true
+        } else {
+            warn!(call_id = %call_id, "Failed to build re-INVITE");
+            false
+        }
+    }
+
+    /// Handle a response (200 OK) to our re-INVITE by sending ACK.
+    pub async fn handle_reinvite_response(&self, response: &SipMessage, remote_addr: SocketAddr) {
+        let call_id = match response.call_id() {
+            Some(id) => id.to_string(),
+            None => return,
+        };
+
+        let status_code = response.status_code().unwrap_or(0);
+        if status_code != 200 {
+            return;
+        }
+
+        // Check if this is a response to a re-INVITE we sent (CSeq > 1 INVITE).
+        let cseq = response.cseq().unwrap_or_default();
+        if !cseq.ends_with("INVITE") {
+            return;
+        }
+        let cseq_num: u32 = cseq.split_whitespace().next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        if cseq_num <= 1 {
+            // This is the initial INVITE response, not a re-INVITE.
+            return;
+        }
+
+        let cs_arc = {
+            let states = self.call_states.read();
+            match states.get(&call_id) {
+                Some(cs) => cs.clone(),
+                None => return,
+            }
+        };
+
+        let cs = cs_arc.lock().await;
+        if let Some(ack) = cs.session.build_reinvite_ack(response) {
+            if let Err(e) = self.transport.send(&ack, remote_addr).await {
+                warn!(call_id = %call_id, "Failed to send ACK for re-INVITE 200 OK: {}", e);
+            } else {
+                debug!(call_id = %call_id, "Sent ACK for re-INVITE 200 OK");
+            }
+        }
+    }
+
+    /// Get the remote SDP for an active call (the SDP from the initial INVITE offer).
+    pub fn get_remote_sdp(&self, call_id: &str) -> Option<SessionDescription> {
+        let states = self.call_states.read();
+        let cs_arc = states.get(call_id)?;
+        // We need to try_lock since we're in a sync context
+        let cs = cs_arc.try_lock().ok()?;
+        cs.session.remote_sdp.clone()
+    }
+
+    /// Get the local address for generating SDP.
+    pub fn local_addr_for_call(&self, call_id: &str) -> Option<String> {
+        let states = self.call_states.read();
+        let cs_arc = states.get(call_id)?;
+        let cs = cs_arc.try_lock().ok()?;
+        Some(cs.session.local_addr.ip().to_string())
     }
 
     /// Get the current count of active call-id mappings.

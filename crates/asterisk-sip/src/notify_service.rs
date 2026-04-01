@@ -1,0 +1,219 @@
+//! Global NOTIFY sending service.
+//!
+//! Allows AMI and CLI code to send arbitrary SIP NOTIFY messages
+//! for active channels by looking up their SIP session state.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use parking_lot::RwLock;
+use tracing::{debug, info, warn};
+
+use crate::notify::{build_notify_from_template, NotifyConfig, NotifyTemplate};
+use crate::parser::SipMessage;
+use crate::session::SipSession;
+use crate::transport::SipTransport;
+
+/// Per-channel SIP state needed for in-dialog NOTIFY.
+#[derive(Debug, Clone)]
+pub struct ChannelSipState {
+    pub call_id: String,
+    pub local_tag: String,
+    pub remote_tag: String,
+    pub local_uri: String,
+    pub remote_target: String,
+    pub remote_addr: SocketAddr,
+    pub local_seq: u32,
+}
+
+/// Global notify service that enables sending NOTIFY from anywhere.
+pub struct NotifyService {
+    /// Channel name -> SIP state mapping.
+    channel_states: RwLock<HashMap<String, ChannelSipState>>,
+    /// SIP transport for sending messages.
+    transport: OnceLock<Arc<dyn SipTransport>>,
+    /// NOTIFY template configuration.
+    notify_config: NotifyConfig,
+}
+
+impl NotifyService {
+    fn new() -> Self {
+        Self {
+            channel_states: RwLock::new(HashMap::new()),
+            transport: OnceLock::new(),
+            notify_config: NotifyConfig::new(),
+        }
+    }
+
+    /// Set the SIP transport (called during startup).
+    pub fn set_transport(&self, transport: Arc<dyn SipTransport>) {
+        let _ = self.transport.set(transport);
+    }
+
+    /// Register a channel's SIP state for NOTIFY sending.
+    pub fn register_channel(&self, channel_name: &str, state: ChannelSipState) {
+        debug!(channel = channel_name, call_id = %state.call_id, "Registered channel for NOTIFY");
+        self.channel_states
+            .write()
+            .insert(channel_name.to_string(), state);
+    }
+
+    /// Unregister a channel (on hangup).
+    pub fn unregister_channel(&self, channel_name: &str) {
+        self.channel_states.write().remove(channel_name);
+    }
+
+    /// Get the notify config for loading templates.
+    pub fn notify_config(&self) -> &NotifyConfig {
+        &self.notify_config
+    }
+
+    /// Send a NOTIFY for a channel with the given variables.
+    pub fn send_notify_for_channel(
+        &self,
+        channel_name: &str,
+        variables: &[(String, String)],
+    ) -> Result<(), String> {
+        let state = {
+            let states = self.channel_states.read();
+            states
+                .get(channel_name)
+                .cloned()
+                .ok_or_else(|| format!("Channel '{}' not found", channel_name))?
+        };
+
+        let transport = self
+            .transport
+            .get()
+            .ok_or_else(|| "SIP transport not initialized".to_string())?
+            .clone();
+
+        // Build the NOTIFY from variables
+        let mut template = NotifyTemplate::new("adhoc");
+        for (name, value) in variables {
+            template.add_item(name, value);
+        }
+
+        let notify = build_notify_from_template(
+            &template,
+            &state.remote_target,
+            &state.local_uri,
+            &state.call_id,
+            &state.local_tag,
+            &state.remote_tag,
+            state.local_seq + 1,
+        );
+
+        let remote_addr = state.remote_addr;
+        info!(
+            channel = channel_name,
+            call_id = %state.call_id,
+            remote = %remote_addr,
+            "Sending in-dialog NOTIFY"
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = transport.send(&notify, remote_addr).await {
+                warn!("Failed to send NOTIFY: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Send a NOTIFY to an endpoint using a named template.
+    pub fn send_notify_to_endpoint(
+        &self,
+        template_name: &str,
+        endpoint_name: &str,
+    ) -> Result<(), String> {
+        let template = self
+            .notify_config
+            .get_template(template_name)
+            .ok_or_else(|| format!("Template '{}' not found", template_name))?;
+
+        let transport = self
+            .transport
+            .get()
+            .ok_or_else(|| "SIP transport not initialized".to_string())?
+            .clone();
+
+        // Look up endpoint contact from PJSIP config
+        let contact_uri = {
+            let config = crate::pjsip_config::get_global_pjsip_config()
+                .ok_or_else(|| "PJSIP config not loaded".to_string())?;
+            let aor = config
+                .find_aor(endpoint_name)
+                .ok_or_else(|| format!("AOR for endpoint '{}' not found", endpoint_name))?;
+            aor.contact
+                .first()
+                .cloned()
+                .ok_or_else(|| format!("No contact for endpoint '{}'", endpoint_name))?
+        };
+
+        // Parse the contact URI to get the remote address
+        let remote_addr = parse_contact_addr(&contact_uri)?;
+        let local_ip = remote_addr.ip(); // simplified; in real code would use local transport addr
+
+        let from_uri = format!("sip:asterisk@{}", local_ip);
+        let notify = crate::notify::build_notify_adhoc(
+            &contact_uri,
+            &from_uri,
+            &template
+                .items
+                .iter()
+                .map(|i| (i.name.clone(), i.value.clone()))
+                .collect::<Vec<_>>(),
+        );
+
+        let endpoint_name = endpoint_name.to_string();
+        info!(
+            template = template_name,
+            endpoint = %endpoint_name,
+            remote = %remote_addr,
+            "Sending NOTIFY to endpoint"
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = transport.send(&notify, remote_addr).await {
+                warn!("Failed to send NOTIFY to {}: {}", endpoint_name, e);
+            }
+        });
+
+        Ok(())
+    }
+}
+
+fn parse_contact_addr(uri: &str) -> Result<SocketAddr, String> {
+    // Parse "sip:user@host:port" or "sip:user@host"
+    let stripped = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+    let host_part = if let Some((_user, host)) = stripped.split_once('@') {
+        host
+    } else {
+        stripped
+    };
+    // Remove any URI parameters
+    let host_part = host_part.split(';').next().unwrap_or(host_part);
+
+    if host_part.contains(':') {
+        host_part
+            .parse()
+            .map_err(|e| format!("Invalid address '{}': {}", host_part, e))
+    } else {
+        format!("{}:5060", host_part)
+            .parse()
+            .map_err(|e| format!("Invalid address '{}': {}", host_part, e))
+    }
+}
+
+/// Global notify service instance.
+static NOTIFY_SERVICE: LazyLock<NotifyService> = LazyLock::new(NotifyService::new);
+
+/// Get the global notify service.
+pub fn global_notify_service() -> &'static NotifyService {
+    &NOTIFY_SERVICE
+}

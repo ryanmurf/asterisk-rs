@@ -52,19 +52,42 @@ impl AppWait {
             seconds, channel.name
         );
 
-        // In a full implementation, we'd use a safe_sleep that monitors
-        // for channel hangup during the wait:
-        //
-        //   match channel.safe_sleep(duration).await {
-        //       Ok(()) => PbxExecResult::Success,
-        //       Err(HangupError) => PbxExecResult::Hangup,
-        //   }
-
         if channel.state == ChannelState::Down {
             return PbxExecResult::Hangup;
         }
 
-        tokio::time::sleep(duration).await;
+        // Sleep in small intervals, checking the channel store for hangup
+        // between each interval. This allows Wait to be interrupted when the
+        // other side of a Local channel pair hangs up (which updates the
+        // channel store copy but not our local Channel object).
+        let poll_interval = Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        let chan_name = channel.name.clone();
+
+        while start.elapsed() < duration {
+            let remaining = duration.saturating_sub(start.elapsed());
+            let sleep_time = remaining.min(poll_interval);
+            tokio::time::sleep(sleep_time).await;
+
+            // Check our own channel state
+            if channel.state == ChannelState::Down || channel.check_hangup() {
+                debug!("Wait: channel '{}' hung up during wait", chan_name);
+                return PbxExecResult::Hangup;
+            }
+
+            // Check the channel store (handles Local channel peer hangup)
+            if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan_name) {
+                let ch = store_chan.lock();
+                if ch.state == ChannelState::Down || ch.check_hangup() {
+                    debug!("Wait: channel '{}' hung up in store during wait", chan_name);
+                    return PbxExecResult::Hangup;
+                }
+            } else {
+                // Channel no longer in store — it was deregistered (hung up)
+                debug!("Wait: channel '{}' no longer in store, treating as hangup", chan_name);
+                return PbxExecResult::Hangup;
+            }
+        }
 
         PbxExecResult::Success
     }
