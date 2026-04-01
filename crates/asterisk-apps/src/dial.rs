@@ -1240,6 +1240,10 @@ impl AppDial {
                                 "Dial: driver.call() succeeded for {}/{}",
                                 leg.destination.technology, leg.destination.resource
                             );
+                            // Sync state to the channel store copy
+                            if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan.name) {
+                                store_chan.lock().state = chan.state;
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -1255,6 +1259,10 @@ impl AppDial {
                 } else {
                     let mut chan = leg.channel.lock().await;
                     chan.state = ChannelState::Dialing;
+                    // Sync state to the channel store copy
+                    if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan.name) {
+                        store_chan.lock().state = chan.state;
+                    }
                     debug!(
                         "Dial: no driver for {}/{}, setting state to Dialing",
                         leg.destination.technology, leg.destination.resource
@@ -1328,7 +1336,7 @@ impl AppDial {
 
                 // Answer the calling channel if not already answered
                 if caller.state != ChannelState::Up {
-                    caller.state = ChannelState::Up;
+                    caller.answer();
                 }
 
                 // Option 'D': send DTMF after answer
@@ -1740,26 +1748,132 @@ impl AppDial {
             answered_chan.name.clone(),
         );
 
-        // Exchange connected line info
-        basic_bridge.exchange_connected_line();
+        // Store BRIDGEPEER on each channel for hold/redirect lookups
+        caller.variables.insert("BRIDGEPEER".to_string(), answered_chan.name.clone());
+        // Also set on the callee in the store
+        let callee_name = answered_chan.name.clone();
+        drop(answered_chan);
+        if let Some(store_callee) = asterisk_core::channel_store::find_by_name(&callee_name) {
+            let mut ch = store_callee.lock();
+            ch.variables.insert("BRIDGEPEER".to_string(), caller.name.clone());
+        }
+        // Set on caller in store too
+        if let Some(store_caller) = asterisk_core::channel_store::find_by_name(&caller.name) {
+            let mut ch = store_caller.lock();
+            ch.variables.insert("BRIDGEPEER".to_string(), callee_name.clone());
+        }
 
         debug!(
             "Dial: bridge active between '{}' and '{}'",
-            caller.name, answered_chan.name
+            caller.name, callee_name
         );
-        drop(answered_chan);
 
-        // The bridge loop would run here. In production, this is where
-        // frames are shuttled between the two channels. The bridge
-        // terminates when either channel hangs up.
-        //
-        // In a full implementation with the bridge event loop:
-        //   let bridge_arc = Arc::new(Mutex::new(basic_bridge.bridge));
-        //   let tech: Arc<dyn BridgeTechnology> = Arc::new(SimpleBridge::new());
-        //   bridge_join(&bridge_arc, &caller_arc, &tech).await;
-        //   bridge_join(&bridge_arc, &callee_arc, &tech).await;
-        //   // Wait for bridge dissolution
-        //   bridge_dissolve(&bridge_arc, &tech).await;
+        // The bridge loop: wait until either channel hangs up or is redirected.
+        // Poll the channel store for state changes.
+        eprintln!("[DEBUG] bridge_channels: entering bridge loop for {} <-> {}", caller.name, leg.destination.resource);
+        loop {
+            // Check if caller hung up
+            if caller.state == ChannelState::Down || caller.check_hangup() {
+                eprintln!("[DEBUG] bridge: caller hung up (state={:?}, hangup={})", caller.state, caller.check_hangup());
+                break;
+            }
+
+            // Check if callee hung up (via channel store)
+            {
+                let answered_chan = leg.channel.lock().await;
+                let callee_name = answered_chan.name.clone();
+                drop(answered_chan);
+                if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&callee_name) {
+                    let ch = store_chan.lock();
+                    if ch.state == ChannelState::Down || ch.check_hangup() {
+                        eprintln!("[DEBUG] bridge: callee hung up (state={:?}, hangup={})", ch.state, ch.check_hangup());
+                        break;
+                    }
+                    // Check for async goto (redirect)
+                    if ch.softhangup_flags & asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO != 0 {
+                        debug!("Dial: bridge ended - callee redirected (async goto)");
+                        break;
+                    }
+                } else {
+                    eprintln!("[DEBUG] bridge: callee channel '{}' not found in store", callee_name);
+                    break;
+                }
+            }
+
+            // Also check caller in store for redirect
+            if let Some(store_caller) = asterisk_core::channel_store::find_by_name(&caller.name) {
+                let ch = store_caller.lock();
+                if ch.check_hangup() || ch.state == ChannelState::Down {
+                    debug!("Dial: bridge ended - caller hung up (store)");
+                    break;
+                }
+                if ch.softhangup_flags & asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO != 0 {
+                    debug!("Dial: bridge ended - caller redirected (async goto)");
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Check if the callee was redirected (ASYNCGOTO) - if so, spawn PBX execution
+        // for the callee at its new dialplan location.
+        {
+            let answered_chan = leg.channel.lock().await;
+            let callee_name = answered_chan.name.clone();
+            drop(answered_chan);
+            if let Some(store_callee) = asterisk_core::channel_store::find_by_name(&callee_name) {
+                let was_redirected = {
+                    let mut ch = store_callee.lock();
+                    if ch.softhangup_flags & asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO != 0 {
+                        // Clear the ASYNCGOTO flag so pbx_run can proceed
+                        ch.softhangup_flags &= !asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if was_redirected {
+                    eprintln!("[DEBUG] Callee {} was redirected, spawning PBX execution", callee_name);
+                    if let Some(dialplan) = asterisk_core::get_global_dialplan() {
+                        // Clone channel data from parking_lot::Mutex into tokio::sync::Mutex
+                        let channel_data = {
+                            let guard = store_callee.lock();
+                            let mut new_ch = asterisk_core::channel::Channel::new(&guard.name);
+                            new_ch.unique_id = guard.unique_id.clone();
+                            new_ch.caller = guard.caller.clone();
+                            new_ch.exten = guard.exten.clone();
+                            new_ch.context = guard.context.clone();
+                            new_ch.state = guard.state;
+                            new_ch.priority = guard.priority;
+                            new_ch.linkedid = guard.linkedid.clone();
+                            new_ch.variables = guard.variables.clone();
+                            new_ch.accountcode = guard.accountcode.clone();
+                            new_ch
+                        };
+                        let callee_name_for_bye = callee_name.clone();
+                        let tokio_channel = Arc::new(tokio::sync::Mutex::new(channel_data));
+                        tokio::spawn(async move {
+                            asterisk_core::pbx_run(tokio_channel, dialplan).await;
+                            // After PBX execution, send BYE to the remote endpoint
+                            if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                                handler.send_bye_for_channel(&callee_name_for_bye).await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // Send BYE for the callee if it wasn't redirected (normal hangup)
+        {
+            let answered_chan = leg.channel.lock().await;
+            let callee_name = answered_chan.name.clone();
+            drop(answered_chan);
+            if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                handler.send_bye_for_channel(&callee_name).await;
+            }
+        }
 
         // Option 'e': execute 'h' extension for peer after call
         if options.peer_h_exten {

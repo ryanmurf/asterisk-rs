@@ -86,12 +86,21 @@ impl AppEcho {
         // Without real frame I/O, we block by polling the channel state.
         // This keeps the dialplan alive so the SIP dialog stays open until
         // the remote side hangs up (softhangup sets state to Down).
+        let chan_name = channel.name.clone();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             if channel.state == ChannelState::Down
                 || channel.check_hangup()
             {
                 break;
+            }
+            // Also check the global channel store for hangup (AMI may set flags there)
+            if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan_name) {
+                let guard = store_chan.lock();
+                if guard.check_hangup() {
+                    channel.softhangup(guard.softhangup_flags);
+                    break;
+                }
             }
         }
 

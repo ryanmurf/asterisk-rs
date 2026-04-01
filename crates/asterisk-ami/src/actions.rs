@@ -780,6 +780,29 @@ fn handle_hangup(
 
     info!("AMI Hangup: channel={} cause={}", channel_name, cause_code);
 
+    // Support regex patterns like /.*/ for hanging up multiple channels
+    if channel_name.starts_with('/') && channel_name.ends_with('/') {
+        let pattern = &channel_name[1..channel_name.len()-1];
+        let re = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(_) => return AmiResponse::error("Invalid regex pattern"),
+        };
+        let mut count = 0;
+        for chan_arc in asterisk_core::channel_store::all_channels() {
+            let mut chan = chan_arc.lock();
+            if re.is_match(&chan.name) {
+                chan.hangup_cause = match cause_code {
+                    0 => asterisk_types::HangupCause::NotDefined,
+                    16 => asterisk_types::HangupCause::NormalClearing,
+                    _ => asterisk_types::HangupCause::NormalClearing,
+                };
+                chan.softhangup(asterisk_core::channel::softhangup::AST_SOFTHANGUP_EXPLICIT);
+                count += 1;
+            }
+        }
+        return AmiResponse::success(format!("Hungup {} channel(s)", count));
+    }
+
     // Look up the channel in the global store and request a soft hangup
     if let Some(chan_arc) = asterisk_core::channel_store::find_by_name(channel_name) {
         let mut chan = chan_arc.lock();
@@ -908,7 +931,7 @@ fn handle_command(
 }
 
 /// Execute a CLI command and return the output lines.
-fn execute_cli_command(command: &str) -> Vec<String> {
+pub fn execute_cli_command(command: &str) -> Vec<String> {
     let cmd_lower = command.trim().to_lowercase();
 
     if cmd_lower.starts_with("core show channels") {
@@ -1288,8 +1311,13 @@ fn handle_getvar(
     };
 
     let value = if channel.is_empty() {
-        // Global variable
-        asterisk_core::pbx::get_global_variable(variable).unwrap_or_default()
+        // Check for dialplan function syntax like DEVICE_STATE(PJSIP/bob)
+        if let Some(func_val) = evaluate_dialplan_function(variable) {
+            func_val
+        } else {
+            // Global variable
+            asterisk_core::pbx::get_global_variable(variable).unwrap_or_default()
+        }
     } else {
         // Channel variable -- try to look up in channel store
         if let Some(chan) = asterisk_core::channel_store::find_by_name(channel) {
@@ -1330,6 +1358,30 @@ fn handle_setvar(
     }
 
     AmiResponse::success("Variable Set")
+}
+
+/// Evaluate a dialplan function like DEVICE_STATE(PJSIP/bob).
+/// Returns Some(value) if the variable matches a known function, None otherwise.
+fn evaluate_dialplan_function(variable: &str) -> Option<String> {
+    // DEVICE_STATE(device) - returns the device state
+    if variable.starts_with("DEVICE_STATE(") && variable.ends_with(')') {
+        let device = &variable[13..variable.len()-1];
+        // Check if the device has an active channel that's Up
+        // Device like "PJSIP/bob" → look for channels starting with "PJSIP/bob-"
+        let prefix = format!("{}-", device);
+        let mut state = "NOT_INUSE";
+        for entry in asterisk_core::channel_store::all_channels() {
+            let ch = entry.lock();
+            if ch.name.starts_with(&prefix) {
+                if ch.state == asterisk_types::ChannelState::Up {
+                    state = "INUSE";
+                    break;
+                }
+            }
+        }
+        return Some(state.to_string());
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

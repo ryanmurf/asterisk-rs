@@ -238,7 +238,13 @@ impl ServerState {
                 output.join("\n")
             }
             None => {
-                format!("No such command '{}' (type 'help' for available commands)", input)
+                // Fall through to AMI-style CLI command handler
+                let output = asterisk_ami::actions::execute_cli_command(input);
+                if output.len() == 1 && output[0].starts_with("No such command") {
+                    format!("No such command '{}' (type 'help' for available commands)", input)
+                } else {
+                    output.join("\n")
+                }
             }
         }
     }
@@ -1458,6 +1464,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
 
     // Register SIP/PJSIP channel driver
     let sip_driver = Arc::new(asterisk_sip::channel_driver::SipChannelDriver::new(sip_bind));
+    let sip_driver_ref = sip_driver.clone();
     TECH_REGISTRY.register(sip_driver);
     info!("Registered PJSIP channel technology");
 
@@ -1509,6 +1516,13 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                 // Get the transport before wrapping in Arc
                 let transport = sip_stack.transport();
 
+                // Share transport with the SIP channel driver for outbound calls
+                sip_driver_ref.set_transport(transport.clone());
+
+                // Share transport and local address with the NOTIFY service
+                asterisk_sip::global_notify_service().set_transport(transport.clone());
+                asterisk_sip::global_notify_service().set_local_addr(sip_stack.local_addr());
+
                 // Take the event receiver before wrapping in Arc
                 let event_rx = sip_stack.take_event_rx();
 
@@ -1547,7 +1561,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                                     response,
                                     remote_addr,
                                 } => {
-                                    event_handler.handle_response(&response, remote_addr);
+                                    event_handler.handle_response(&response, remote_addr).await;
                                     event_handler.handle_reinvite_response(&response, remote_addr).await;
                                 }
                                 asterisk_sip::stack::SipEvent::IncomingBye {

@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::notify::{build_notify_from_template, NotifyConfig, NotifyTemplate};
+use crate::notify::{build_notify_from_template_with_via, NotifyConfig, NotifyTemplate};
 use crate::parser::SipMessage;
 use crate::session::SipSession;
 use crate::transport::SipTransport;
@@ -33,6 +33,8 @@ pub struct NotifyService {
     channel_states: RwLock<HashMap<String, ChannelSipState>>,
     /// SIP transport for sending messages.
     transport: OnceLock<Arc<dyn SipTransport>>,
+    /// Local SIP address.
+    local_addr: OnceLock<SocketAddr>,
     /// NOTIFY template configuration.
     notify_config: NotifyConfig,
 }
@@ -42,6 +44,7 @@ impl NotifyService {
         Self {
             channel_states: RwLock::new(HashMap::new()),
             transport: OnceLock::new(),
+            local_addr: OnceLock::new(),
             notify_config: NotifyConfig::new(),
         }
     }
@@ -49,6 +52,11 @@ impl NotifyService {
     /// Set the SIP transport (called during startup).
     pub fn set_transport(&self, transport: Arc<dyn SipTransport>) {
         let _ = self.transport.set(transport);
+    }
+
+    /// Set the local SIP address.
+    pub fn set_local_addr(&self, addr: SocketAddr) {
+        let _ = self.local_addr.set(addr);
     }
 
     /// Register a channel's SIP state for NOTIFY sending.
@@ -62,6 +70,13 @@ impl NotifyService {
     /// Unregister a channel (on hangup).
     pub fn unregister_channel(&self, channel_name: &str) {
         self.channel_states.write().remove(channel_name);
+    }
+
+    /// Update the remote tag for a channel (called when 1xx/2xx response arrives).
+    pub fn update_remote_tag(&self, channel_name: &str, remote_tag: &str) {
+        if let Some(state) = self.channel_states.write().get_mut(channel_name) {
+            state.remote_tag = remote_tag.to_string();
+        }
     }
 
     /// Get the notify config for loading templates.
@@ -95,7 +110,9 @@ impl NotifyService {
             template.add_item(name, value);
         }
 
-        let notify = build_notify_from_template(
+        let via_addr = self.local_addr.get().map(|a| a.to_string()).unwrap_or_else(|| "127.0.0.1:5060".to_string());
+
+        let notify = build_notify_from_template_with_via(
             &template,
             &state.remote_target,
             &state.local_uri,
@@ -103,6 +120,7 @@ impl NotifyService {
             &state.local_tag,
             &state.remote_tag,
             state.local_seq + 1,
+            &via_addr,
         );
 
         let remote_addr = state.remote_addr;
@@ -128,6 +146,7 @@ impl NotifyService {
         template_name: &str,
         endpoint_name: &str,
     ) -> Result<(), String> {
+        eprintln!("[DEBUG] send_notify_to_endpoint: template={}, endpoint={}", template_name, endpoint_name);
         let template = self
             .notify_config
             .get_template(template_name)
@@ -154,9 +173,8 @@ impl NotifyService {
 
         // Parse the contact URI to get the remote address
         let remote_addr = parse_contact_addr(&contact_uri)?;
-        let local_ip = remote_addr.ip(); // simplified; in real code would use local transport addr
-
-        let from_uri = format!("sip:asterisk@{}", local_ip);
+        let local_addr = self.local_addr.get().copied().unwrap_or_else(|| "127.0.0.1:5060".parse().unwrap());
+        let from_uri = format!("sip:asterisk@{}", local_addr);
         let notify = crate::notify::build_notify_adhoc(
             &contact_uri,
             &from_uri,
@@ -165,6 +183,7 @@ impl NotifyService {
                 .iter()
                 .map(|i| (i.name.clone(), i.value.clone()))
                 .collect::<Vec<_>>(),
+            &local_addr.to_string(),
         );
 
         let endpoint_name = endpoint_name.to_string();
@@ -175,9 +194,13 @@ impl NotifyService {
             "Sending NOTIFY to endpoint"
         );
 
+        eprintln!("[DEBUG] Spawning NOTIFY send to {} at {}", endpoint_name, remote_addr);
         tokio::spawn(async move {
             if let Err(e) = transport.send(&notify, remote_addr).await {
                 warn!("Failed to send NOTIFY to {}: {}", endpoint_name, e);
+                eprintln!("[DEBUG] Failed to send NOTIFY: {}", e);
+            } else {
+                eprintln!("[DEBUG] NOTIFY sent successfully to {}", endpoint_name);
             }
         });
 

@@ -166,6 +166,19 @@ pub fn build_notify_from_template(
     remote_tag: &str,
     cseq: u32,
 ) -> SipMessage {
+    build_notify_from_template_with_via(template, to_uri, from_uri, call_id, from_tag, remote_tag, cseq, "127.0.0.1:5060")
+}
+
+pub fn build_notify_from_template_with_via(
+    template: &NotifyTemplate,
+    to_uri: &str,
+    from_uri: &str,
+    call_id: &str,
+    from_tag: &str,
+    remote_tag: &str,
+    cseq: u32,
+    via_addr: &str,
+) -> SipMessage {
     let branch = format!(
         "z9hG4bK{}",
         &Uuid::new_v4().to_string().replace('-', "")[..16]
@@ -186,7 +199,7 @@ pub fn build_notify_from_template(
     let mut headers = vec![
         SipHeader {
             name: header_names::VIA.to_string(),
-            value: format!("SIP/2.0/UDP placeholder;branch={}", branch),
+            value: format!("SIP/2.0/UDP {};branch={}", via_addr, branch),
         },
         SipHeader {
             name: header_names::MAX_FORWARDS.to_string(),
@@ -246,6 +259,7 @@ pub fn build_notify_adhoc(
     to_uri: &str,
     from_uri: &str,
     variables: &[(String, String)],
+    via_addr: &str,
 ) -> SipMessage {
     let call_id = format!("notify-{}", Uuid::new_v4());
     let from_tag = Uuid::new_v4().to_string()[..8].to_string();
@@ -255,7 +269,7 @@ pub fn build_notify_adhoc(
         template.add_item(name, value);
     }
 
-    build_notify_from_template(
+    build_notify_from_template_with_via(
         &template,
         to_uri,
         from_uri,
@@ -263,6 +277,7 @@ pub fn build_notify_adhoc(
         &from_tag,
         "",
         1,
+        via_addr,
     )
 }
 
