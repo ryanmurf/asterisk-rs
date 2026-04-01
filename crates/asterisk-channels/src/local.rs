@@ -218,8 +218,18 @@ impl ChannelDriver for LocalChannelDriver {
         "Local Proxy Channel Driver"
     }
 
-    async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
-        let (chan1, chan2) = self.request_pair(dest)?;
+    async fn request(&self, dest: &str, caller: Option<&Channel>) -> AsteriskResult<Channel> {
+        let (chan1, mut chan2) = self.request_pair(dest)?;
+
+        // Inherit __ prefixed variables from the calling channel to ;2.
+        if let Some(c) = caller {
+            for (name, value) in &c.variables {
+                if name.starts_with("__") {
+                    chan2.variables.insert(name.clone(), value.clone());
+                }
+            }
+        }
+
         // Store ;2 in the pending map keyed by ;1's name so call() on ;1
         // can retrieve it and start PBX on it. We use name (not unique_id)
         // because register_existing_channel() may reassign the unique_id.
@@ -278,6 +288,7 @@ impl ChannelDriver for LocalChannelDriver {
                     ch.priority = guard.priority;
                     ch.linkedid = guard.linkedid.clone();
                     ch.caller = guard.caller.clone();
+                    ch.variables = guard.variables.clone();
                     Arc::new(tokio::sync::Mutex::new(ch))
                 };
 

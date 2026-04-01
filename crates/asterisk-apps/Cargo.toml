@@ -13,6 +13,7 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
+asterisk-sip = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
 md-5 = { workspace = true }

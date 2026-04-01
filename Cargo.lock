@@ -125,6 +125,7 @@ dependencies = [
  "asterisk-ami",
  "asterisk-core",
  "asterisk-res",
+ "asterisk-sip",
  "asterisk-types",
  "async-trait",
  "dashmap",

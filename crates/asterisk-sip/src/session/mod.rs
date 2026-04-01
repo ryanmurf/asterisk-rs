@@ -128,6 +128,8 @@ pub struct SipSession {
     pub dialog: Option<Dialog>,
     /// Local SDP description.
     pub local_sdp: Option<SessionDescription>,
+    /// The initial local SDP answer (before any re-INVITEs), used by SFU.
+    pub initial_local_sdp: Option<SessionDescription>,
     /// Remote SDP description.
     pub remote_sdp: Option<SessionDescription>,
     /// RTP session for media.
@@ -162,6 +164,7 @@ impl SipSession {
             state: SessionState::Initiated,
             dialog: None,
             local_sdp: None,
+            initial_local_sdp: None,
             remote_sdp: None,
             rtp: None,
             local_addr,
@@ -198,6 +201,7 @@ impl SipSession {
             state: SessionState::Initiated,
             dialog,
             local_sdp: None,
+            initial_local_sdp: None,
             remote_sdp,
             rtp: None,
             local_addr,

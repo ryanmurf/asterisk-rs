@@ -970,6 +970,14 @@ impl AppConfBridge {
         // Get or create the conference
         let conference = Self::get_or_create_conference(&conf_name, bridge_profile_name);
 
+        // Check for CONFBRIDGE(bridge,video_mode) channel variable override
+        // (set by Set(CONFBRIDGE(bridge,video_mode)=sfu) in dialplan).
+        if let Some(vm) = channel.variables.get("CONFBRIDGE(bridge,video_mode)") {
+            let mode = ConferenceVideoMode::from_str_name(vm);
+            let mut conf = conference.write();
+            conf.settings.video_mode = mode;
+        }
+
         // Extract SIP Call-ID and video stream info for SFU
         let sip_call_id = channel.variables.get("__SIP_CALL_ID").cloned();
         let video_streams = Self::extract_video_streams_for_channel(&sip_call_id);
@@ -1071,6 +1079,225 @@ impl AppConfBridge {
         conf
     }
 
+    /// Extract video stream information from the SIP session's remote SDP.
+    fn extract_video_streams_for_channel(sip_call_id: &Option<String>) -> Vec<VideoStreamInfo> {
+        let call_id = match sip_call_id {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+
+        let handler = match asterisk_sip::get_global_event_handler() {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+
+        let remote_sdp = match handler.get_remote_sdp(call_id) {
+            Some(sdp) => sdp,
+            None => return Vec::new(),
+        };
+
+        let mut streams = Vec::new();
+        for media in &remote_sdp.media_descriptions {
+            if media.media_type == "video" && media.port > 0 {
+                for &pt in &media.formats {
+                    if let Some(rtpmap) = media.get_rtpmap(pt) {
+                        // rtpmap value: "34 H263/90000"
+                        let parts: Vec<&str> = rtpmap.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            let codec_parts: Vec<&str> = parts[1].split('/').collect();
+                            let codec_name = codec_parts[0].to_string();
+                            let sample_rate = codec_parts.get(1)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(90000);
+                            streams.push(VideoStreamInfo {
+                                payload_type: pt,
+                                codec_name,
+                                sample_rate,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        streams
+    }
+
+    /// Build an SDP for a re-INVITE in SFU mode.
+    ///
+    /// The SDP contains:
+    /// 1. The participant's own audio m= line
+    /// 2. The participant's own video m= line
+    /// 3. One video m= line for each other participant's video stream
+    ///
+    /// `departed_streams` (if any) get port=0 to signal removal.
+    fn build_sfu_sdp(
+        own_sdp: &asterisk_sip::sdp::SessionDescription,
+        other_video_streams: &[(VideoStreamInfo, bool)], // (stream, is_departed)
+        local_addr: &str,
+    ) -> asterisk_sip::sdp::SessionDescription {
+        use asterisk_sip::sdp::{SessionDescription, Origin, ConnectionData, MediaDescription, MediaDirection};
+
+        let mut sdp = SessionDescription {
+            version: 0,
+            origin: Origin {
+                username: "asterisk".to_string(),
+                session_id: "1".to_string(),
+                session_version: "1".to_string(),
+                net_type: "IN".to_string(),
+                addr_type: "IP4".to_string(),
+                addr: local_addr.to_string(),
+            },
+            session_name: "Asterisk".to_string(),
+            connection: Some(ConnectionData {
+                net_type: "IN".to_string(),
+                addr_type: "IP4".to_string(),
+                addr: local_addr.to_string(),
+            }),
+            time: (0, 0),
+            media_descriptions: Vec::new(),
+            attributes: Vec::new(),
+        };
+
+        // Copy the participant's own media lines from their SDP answer (local_sdp).
+        for media in &own_sdp.media_descriptions {
+            sdp.media_descriptions.push(media.clone());
+        }
+
+        // Assign unique payload types for other participants' video streams.
+        // We need to avoid colliding with payload types already used in the SDP.
+        let mut used_pts: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        for media in &own_sdp.media_descriptions {
+            for &pt in &media.formats {
+                used_pts.insert(pt);
+            }
+        }
+
+        // Add video m= lines for other participants' video streams.
+        // Always assign new dynamic PTs (starting from 99) for additional streams,
+        // matching Asterisk's PJSIP SFU behavior.  Use well-known (static) PTs
+        // (< 96) as-is if they don't collide.
+        let mut next_dynamic_pt: u8 = 99;
+        for (stream, is_departed) in other_video_streams {
+            let pt = if stream.payload_type < 96 && !used_pts.contains(&stream.payload_type) {
+                // Static/well-known PT (e.g. H263=34) — use as-is.
+                stream.payload_type
+            } else {
+                // Dynamic codec — assign from pool.
+                while used_pts.contains(&next_dynamic_pt) && next_dynamic_pt < 127 {
+                    next_dynamic_pt += 1;
+                }
+                let pt = next_dynamic_pt;
+                next_dynamic_pt += 1;
+                pt
+            };
+            used_pts.insert(pt);
+
+            let port = if *is_departed { 0 } else { 4050 };
+
+            let mut attrs = vec![
+                ("rtpmap".to_string(), Some(format!("{} {}/{}", pt, stream.codec_name, stream.sample_rate))),
+            ];
+            if !*is_departed {
+                attrs.push(("sendrecv".to_string(), None));
+            }
+
+            sdp.media_descriptions.push(MediaDescription {
+                media_type: "video".to_string(),
+                port,
+                protocol: "RTP/AVP".to_string(),
+                formats: vec![pt],
+                connection: None,
+                attributes: attrs,
+                direction: if *is_departed { MediaDirection::Inactive } else { MediaDirection::SendRecv },
+                fingerprint: None,
+                setup: None,
+                rtcp_mux: false,
+                ice_candidates: Vec::new(),
+                bandwidth: Vec::new(),
+            });
+        }
+
+        sdp
+    }
+
+    /// Send SFU re-INVITEs to all participants in a conference.
+    ///
+    /// For each participant, build an SDP with their own media lines plus
+    /// video streams from all other participants.
+    async fn send_sfu_reinvites(
+        conference: &Arc<RwLock<Conference>>,
+        departed_channel_id: Option<&ChannelId>,
+        departed_streams: &[VideoStreamInfo],
+    ) {
+        let handler = match asterisk_sip::get_global_event_handler() {
+            Some(h) => h,
+            None => {
+                warn!("ConfBridge SFU: no global SIP event handler available");
+                return;
+            }
+        };
+
+        // Collect participant info under the lock, then release it.
+        let participants: Vec<(String, Option<String>, Vec<VideoStreamInfo>)> = {
+            let conf = conference.read();
+            conf.participants.values().map(|u| {
+                (u.channel_id.0.clone(), u.sip_call_id.clone(), u.video_streams.clone())
+            }).collect()
+        };
+
+        for (ch_id, sip_call_id, _own_streams) in &participants {
+            let call_id = match sip_call_id {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Get the local SDP for this participant (the SDP answer we sent them).
+            let local_sdp = match handler.get_initial_local_sdp(call_id) {
+                Some(sdp) => sdp,
+                None => {
+                    warn!(call_id = %call_id, "ConfBridge SFU: no local SDP for participant");
+                    continue;
+                }
+            };
+
+            let local_addr = handler.local_addr_for_call(call_id)
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+
+            // Collect video streams from all OTHER participants (active and departed).
+            let mut other_streams: Vec<(VideoStreamInfo, bool)> = Vec::new();
+
+            for (other_ch_id, _other_call_id, other_video) in &participants {
+                if other_ch_id == ch_id {
+                    continue; // Skip self
+                }
+                for vs in other_video {
+                    other_streams.push((vs.clone(), false));
+                }
+            }
+
+            // Add departed streams with is_departed=true.
+            if let Some(departed_id) = departed_channel_id {
+                // Only add if this participant is NOT the departed one.
+                if ch_id != &departed_id.0 {
+                    for vs in departed_streams {
+                        other_streams.push((vs.clone(), true));
+                    }
+                }
+            }
+
+            if other_streams.is_empty() {
+                continue; // No other video streams to add
+            }
+
+            let sdp = Self::build_sfu_sdp(&local_sdp, &other_streams, &local_addr);
+            let sent = handler.send_reinvite(call_id, sdp).await;
+            if sent {
+                info!(call_id = %call_id, "ConfBridge SFU: sent re-INVITE with {} other video streams",
+                    other_streams.len());
+            }
+        }
+    }
+
     /// Join a channel to a conference.
     async fn join_conference(
         conference: &Arc<RwLock<Conference>>,
@@ -1079,6 +1306,7 @@ impl AppConfBridge {
     ) -> Result<ConfBridgeResult, String> {
         let is_admin = user.is_admin;
         let is_marked = user.is_marked;
+        let my_channel_id = user.channel_id.clone();
 
         // Check if conference is locked
         {
@@ -1106,11 +1334,13 @@ impl AppConfBridge {
         let conf_name;
         let user_count;
         let wait_for_marked;
+        let is_sfu;
 
         // Add user to conference
         {
             let mut conf = conference.write();
             conf_name = conf.name.clone();
+            is_sfu = conf.settings.video_mode == ConferenceVideoMode::Sfu;
             let channel_id = user.channel_id.clone();
             let channel_name = user.channel_name.clone();
 
@@ -1123,7 +1353,7 @@ impl AppConfBridge {
             wait_for_marked = conf.settings.wait_for_marked && conf.marked_count == 0 && !is_marked;
             if wait_for_marked {
                 user.waiting = true;
-                user.muted = true; // Mute while waiting
+                user.muted = true;
             }
 
             // If conference was all-muted and user is not admin, start muted
@@ -1137,14 +1367,12 @@ impl AppConfBridge {
             // Track marked users
             if is_marked {
                 conf.marked_count += 1;
-                // If this is the first marked user, activate conference
                 if conf.marked_count == 1 && conf.settings.wait_for_marked {
                     info!(
                         "ConfBridge: marked user joined '{}', activating conference",
                         conf.name
                     );
                     conf.active = true;
-                    // Unmute and un-wait all waiting participants
                     for u in conf.participants.values_mut() {
                         if u.waiting {
                             u.waiting = false;
@@ -1155,11 +1383,10 @@ impl AppConfBridge {
             }
 
             info!(
-                "ConfBridge: '{}' joined conference '{}' ({} participants, admin={}, marked={})",
-                channel_name, conf.name, user_count, is_admin, is_marked
+                "ConfBridge: '{}' joined conference '{}' ({} participants, admin={}, marked={}, sfu={})",
+                channel_name, conf.name, user_count, is_admin, is_marked, is_sfu
             );
 
-            // Announce user count if configured
             if conf.settings.announce_user_count && user_count > 1 {
                 debug!(
                     "ConfBridge: there are now {} participants in '{}'",
@@ -1167,7 +1394,6 @@ impl AppConfBridge {
                 );
             }
 
-            // Announce join if configured
             if conf.settings.announce_join_leave {
                 debug!(
                     "ConfBridge: announcing join of '{}' to conference '{}'",
@@ -1184,18 +1410,102 @@ impl AppConfBridge {
             marked: is_marked,
         });
 
-        // If waiting for marked user, play MOH/waiting message
         if wait_for_marked {
             debug!(
                 "ConfBridge: '{}' is waiting for marked user in '{}'",
                 channel.name, conf_name
             );
-            // In production: play "conf-waitforleader" and start MOH
         }
 
-        // In a real implementation, this would enter the bridge event loop
-        // (see the comment block in the original code). For now, return immediately.
-        Ok(ConfBridgeResult::Hangup)
+        // SFU mode: send re-INVITEs when a new participant joins
+        if is_sfu && user_count > 1 {
+            // Brief delay to allow the ACK for the initial INVITE to be processed.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Self::send_sfu_reinvites(conference, None, &[]).await;
+        }
+
+        // Subscribe to SFU events and wait for hangup.
+        let mut sfu_rx = SFU_EVENT_TX.subscribe();
+
+        // Broadcast that we joined (so other participants can react).
+        let _ = SFU_EVENT_TX.send(SfuEvent::ParticipantJoined {
+            conference_name: conf_name.clone(),
+            joined_channel_id: my_channel_id.clone(),
+        });
+
+        // Register a hangup notification for this channel.
+        let hangup_notify = Arc::new(tokio::sync::Notify::new());
+        let hangup_notify_clone = hangup_notify.clone();
+        let my_uid = channel.unique_id.0.clone();
+        asterisk_core::channel::register_hangup_callback(Box::new(move |uid, _cause| {
+            if uid == my_uid {
+                hangup_notify_clone.notify_one();
+            }
+        }));
+
+        // Also detect softhangup by polling (for BYE-triggered hangup).
+        let channel_name_for_poll = channel.name.clone();
+        let my_sip_call_id = channel.variables.get("__SIP_CALL_ID").cloned();
+
+        // Subscribe to SIP call hangup events (BYE received on the SIP side).
+        let mut sip_hangup_rx = asterisk_sip::subscribe_sip_hangup();
+
+        // Block in the conference until hangup or SFU event.
+        let result = loop {
+            tokio::select! {
+                _ = hangup_notify.notified() => {
+                    info!("ConfBridge: '{}' received hangup in conference '{}'", channel_name_for_poll, conf_name);
+                    break ConfBridgeResult::Hangup;
+                }
+                sip_id = sip_hangup_rx.recv() => {
+                    if let Ok(id) = sip_id {
+                        if my_sip_call_id.as_deref() == Some(id.as_str()) {
+                            info!("ConfBridge: '{}' SIP BYE received (call_id={})", channel_name_for_poll, id);
+                            break ConfBridgeResult::Hangup;
+                        }
+                    }
+                }
+                event = sfu_rx.recv() => {
+                    match event {
+                        Ok(SfuEvent::ParticipantJoined { conference_name, joined_channel_id })
+                            if conference_name == conf_name && joined_channel_id != my_channel_id =>
+                        {
+                            // Another participant joined — they will trigger the re-INVITEs
+                            // from their own join_conference call above, so we just continue.
+                            debug!("ConfBridge SFU: noticed join of {:?} in '{}'", joined_channel_id, conf_name);
+                        }
+                        Ok(SfuEvent::ParticipantLeft { conference_name, left_channel_id, departed_video_streams })
+                            if conference_name == conf_name && left_channel_id != my_channel_id =>
+                        {
+                            info!("ConfBridge SFU: participant {:?} left '{}', sending re-INVITEs", left_channel_id, conf_name);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Self::send_sfu_reinvites(conference, Some(&left_channel_id), &departed_video_streams).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break ConfBridgeResult::Hangup;
+                        }
+                        _ => {
+                            // Event for a different conference or from ourselves, ignore.
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    // Poll for softhangup
+                    if let Some(ch_arc) = asterisk_core::channel::store::find_by_name(&channel_name_for_poll) {
+                        let ch = ch_arc.lock();
+                        if ch.check_hangup() {
+                            info!("ConfBridge: '{}' softhangup detected in conference '{}'", channel_name_for_poll, conf_name);
+                            break ConfBridgeResult::Hangup;
+                        }
+                    } else {
+                        // Channel no longer exists
+                        break ConfBridgeResult::Hangup;
+                    }
+                }
+            }
+        };
+
+        Ok(result)
     }
 
     /// Remove a channel from a conference.
@@ -1206,9 +1516,12 @@ impl AppConfBridge {
     ) {
         let mut should_destroy = false;
         let mut end_marked = false;
+        let mut departed_video_streams = Vec::new();
+        let mut is_sfu = false;
 
         {
             let mut conf = conference.write();
+            is_sfu = conf.settings.video_mode == ConferenceVideoMode::Sfu;
             let user = conf.participants.remove(channel_id);
             conf.bridge.remove_channel(channel_id);
             let remaining = conf.participants.len();
@@ -1221,6 +1534,9 @@ impl AppConfBridge {
             }
 
             if let Some(ref user) = user {
+                // Capture video streams for SFU departure notification.
+                departed_video_streams = user.video_streams.clone();
+
                 // Emit leave event
                 emit_event(ConfBridgeEvent::ConfbridgeLeave {
                     conference: conf_name.to_string(),
@@ -1287,6 +1603,15 @@ impl AppConfBridge {
             if conf.participants.is_empty() {
                 should_destroy = true;
             }
+        }
+
+        // Broadcast SFU participant left event so remaining participants get re-INVITEd.
+        if is_sfu && !departed_video_streams.is_empty() {
+            let _ = SFU_EVENT_TX.send(SfuEvent::ParticipantLeft {
+                conference_name: conf_name.to_string(),
+                left_channel_id: channel_id.clone(),
+                departed_video_streams,
+            });
         }
 
         if should_destroy {
@@ -2127,6 +2452,8 @@ mod tests {
             talking_volume_adjustment: 0,
             profile_name: "default".to_string(),
             menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
         };
 
         let waiting_user = ConferenceUser {
@@ -2145,6 +2472,8 @@ mod tests {
             talking_volume_adjustment: 0,
             profile_name: "default".to_string(),
             menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
         };
 
         conf.participants
@@ -2246,6 +2575,8 @@ mod tests {
                 talking_volume_adjustment: 0,
                 profile_name: "default".to_string(),
                 menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
             };
             conf.participants.insert(user.channel_id.clone(), user);
             conf.marked_count += 1;
@@ -2480,6 +2811,8 @@ mod tests {
             talking_volume_adjustment: 0,
             profile_name: "default".to_string(),
             menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
         };
         let mut c = conf;
         c.participants.insert(chan_id.clone(), user);
@@ -2651,6 +2984,8 @@ mod tests {
             talking_volume_adjustment: 0,
             profile_name: "default".to_string(),
             menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
         });
 
         let user_id = ChannelId::from_name("user");
@@ -2670,6 +3005,8 @@ mod tests {
             talking_volume_adjustment: 0,
             profile_name: "default".to_string(),
             menu_name: "default".to_string(),
+            sip_call_id: None,
+            video_streams: Vec::new(),
         });
 
         CONFERENCES.insert("kickall_test_conf".to_string(), Arc::new(RwLock::new(conf)));

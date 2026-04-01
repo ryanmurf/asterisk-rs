@@ -266,7 +266,12 @@ pub fn register_all_apps() {
         |channel, args| {
             Box::pin(async move {
                 let (result, _conf_result) = AppConfBridge::exec(channel, args).await;
-                result
+                // ConfBridge returns Hangup when the participant leaves (BYE/hangup).
+                // This is normal completion — map to Success so dialplan continues.
+                match result {
+                    PbxExecResult::Hangup => PbxExecResult::Success,
+                    other => other,
+                }
             })
         },
     )));

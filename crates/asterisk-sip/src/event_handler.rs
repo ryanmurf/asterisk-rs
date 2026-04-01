@@ -232,7 +232,8 @@ impl SipEventHandler {
                 10000, // RTP port (will be overridden if RTP session is created)
                 &self.supported_codecs,
             );
-            session.local_sdp = Some(answer_sdp);
+            session.local_sdp = Some(answer_sdp.clone());
+            session.initial_local_sdp = Some(answer_sdp);
         }
 
         // 8. Store the SIP session state for later signaling (200 OK, BYE)
@@ -331,6 +332,7 @@ impl SipEventHandler {
                 new_ch.state = guard.state;
                 new_ch.priority = guard.priority;
                 new_ch.linkedid = guard.linkedid.clone();
+                new_ch.variables = guard.variables.clone();
                 new_ch
             };
 
@@ -499,6 +501,9 @@ impl SipEventHandler {
             // Clean up
             self.callid_map.write().remove(&call_id);
             self.call_states.write().remove(&call_id);
+
+            // Notify any SFU conferences that this SIP call was hung up.
+            crate::notify_sip_hangup(&call_id);
         }
     }
 
@@ -544,16 +549,10 @@ impl SipEventHandler {
             return;
         }
 
-        // Check if this is a response to a re-INVITE we sent (CSeq > 1 INVITE).
+        // We only receive 200 OK INVITE responses for re-INVITEs we initiated.
+        // (For inbound calls, WE send the 200 OK, so we never receive one for the initial INVITE.)
         let cseq = response.cseq().unwrap_or_default();
         if !cseq.ends_with("INVITE") {
-            return;
-        }
-        let cseq_num: u32 = cseq.split_whitespace().next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
-        if cseq_num <= 1 {
-            // This is the initial INVITE response, not a re-INVITE.
             return;
         }
 
@@ -582,6 +581,22 @@ impl SipEventHandler {
         // We need to try_lock since we're in a sync context
         let cs = cs_arc.try_lock().ok()?;
         cs.session.remote_sdp.clone()
+    }
+
+    /// Get the local SDP for an active call (the SDP answer we sent in 200 OK).
+    pub fn get_local_sdp(&self, call_id: &str) -> Option<SessionDescription> {
+        let states = self.call_states.read();
+        let cs_arc = states.get(call_id)?;
+        let cs = cs_arc.try_lock().ok()?;
+        cs.session.local_sdp.clone()
+    }
+
+    /// Get the initial local SDP (before any re-INVITEs) for SFU.
+    pub fn get_initial_local_sdp(&self, call_id: &str) -> Option<SessionDescription> {
+        let states = self.call_states.read();
+        let cs_arc = states.get(call_id)?;
+        let cs = cs_arc.try_lock().ok()?;
+        cs.session.initial_local_sdp.clone().or_else(|| cs.session.local_sdp.clone())
     }
 
     /// Get the local address for generating SDP.

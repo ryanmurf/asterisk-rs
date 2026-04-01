@@ -152,3 +152,18 @@ pub fn set_global_event_handler(handler: Arc<SipEventHandler>) {
 pub fn get_global_event_handler() -> Option<Arc<SipEventHandler>> {
     GLOBAL_EVENT_HANDLER.get().cloned()
 }
+
+// Global broadcast for SIP call hangup events (BYE received).
+// ConfBridge subscribes to detect when a remote UA hangs up.
+static SIP_HANGUP_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<String>> =
+    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(64).0);
+
+/// Broadcast that a SIP call was hung up (BYE received). The payload is the SIP Call-ID.
+pub fn notify_sip_hangup(call_id: &str) {
+    let _ = SIP_HANGUP_TX.send(call_id.to_string());
+}
+
+/// Subscribe to SIP call hangup events.
+pub fn subscribe_sip_hangup() -> tokio::sync::broadcast::Receiver<String> {
+    SIP_HANGUP_TX.subscribe()
+}

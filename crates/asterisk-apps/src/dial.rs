@@ -1143,6 +1143,14 @@ impl AppDial {
                 debug!("Dial: forcing callerID presentation (option u)");
             }
 
+            // Inherit channel variables with __ prefix (double-underscore = inherit
+            // through Dial and Local channels, per Asterisk convention).
+            for (name, value) in &caller.variables {
+                if name.starts_with("__") {
+                    outbound.variables.insert(name.clone(), value.clone());
+                }
+            }
+
             let outbound = Arc::new(Mutex::new(outbound));
 
             // Option 'b': pre-dial GoSub on callee channel
