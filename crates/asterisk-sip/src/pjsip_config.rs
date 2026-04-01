@@ -98,6 +98,10 @@ pub struct EndpointConfig {
     pub allow_transfer: bool,
     /// Trust ID inbound (PAI/RPID).
     pub trust_id_inbound: bool,
+    /// Allow overlap dialing (send 484 Address Incomplete for partial matches).
+    pub allow_overlap: bool,
+    /// Account code for CDR/billing.
+    pub accountcode: String,
 }
 
 impl Default for EndpointConfig {
@@ -125,6 +129,8 @@ impl Default for EndpointConfig {
             send_pai: false,
             allow_transfer: true,
             trust_id_inbound: false,
+            allow_overlap: true,
+            accountcode: String::new(),
         }
     }
 }
@@ -495,6 +501,7 @@ fn parse_endpoint(cat: &asterisk_config::Category) -> EndpointConfig {
     ep.send_pai = parse_bool(get_last_variable(cat,"send_pai"), false);
     ep.allow_transfer = parse_bool(get_last_variable(cat,"allow_transfer"), true);
     ep.trust_id_inbound = parse_bool(get_last_variable(cat,"trust_id_inbound"), false);
+    ep.allow_overlap = parse_bool(get_last_variable(cat,"allow_overlap"), true);
 
     if let Some(v) = get_last_variable(cat,"dtmf_mode") {
         ep.dtmf_mode = v.to_lowercase();
@@ -516,6 +523,9 @@ fn parse_endpoint(cat: &asterisk_config::Category) -> EndpointConfig {
     }
     if let Some(v) = get_last_variable(cat,"transport") {
         ep.transport = Some(v.to_string());
+    }
+    if let Some(v) = get_last_variable(cat,"accountcode") {
+        ep.accountcode = v.to_string();
     }
 
     ep
@@ -698,6 +708,13 @@ impl PjsipConfig {
         self.find_endpoint(endpoint_name)
             .map(|e| e.context.as_str())
             .unwrap_or("default")
+    }
+
+    /// Get the accountcode for an endpoint, falling back to "".
+    pub fn endpoint_accountcode(&self, endpoint_name: &str) -> &str {
+        self.find_endpoint(endpoint_name)
+            .map(|e| e.accountcode.as_str())
+            .unwrap_or("")
     }
 
     /// Get the allowed codecs for an endpoint.

@@ -1280,6 +1280,62 @@ fn load_dialplan(config_dir: &str) -> Arc<asterisk_core::pbx::Dialplan> {
     Arc::new(dialplan)
 }
 
+/// Parse pjsip_notify.conf content into notify templates.
+///
+/// Format:
+/// ```text
+/// [template-name]
+/// Event=>value
+/// Content-Type=value
+/// Content=line1
+/// Content=line2
+/// Content=>
+/// ```
+fn load_pjsip_notify_config(
+    content: &str,
+    config: &asterisk_sip::notify::NotifyConfig,
+) {
+    let mut _current_name: Option<String> = None;
+    let mut current_template: Option<asterisk_sip::notify::NotifyTemplate> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            // Save previous template
+            if let Some(tpl) = current_template.take() {
+                config.add_template(tpl);
+            }
+            let name = &line[1..line.len() - 1];
+            _current_name = Some(name.to_string());
+            current_template = Some(asterisk_sip::notify::NotifyTemplate::new(name));
+            continue;
+        }
+
+        if let Some(ref mut tpl) = current_template {
+            // Handle "Key=>value" (with >) or "Key=value"
+            if let Some(pos) = line.find('=') {
+                let key = line[..pos].trim();
+                let rest = &line[pos + 1..];
+                let value = if rest.starts_with('>') {
+                    rest[1..].trim()
+                } else {
+                    rest.trim()
+                };
+                tpl.add_item(key, value);
+            }
+        }
+    }
+
+    // Save last template
+    if let Some(tpl) = current_template.take() {
+        config.add_template(tpl);
+    }
+}
+
 /// Perform the startup sequence.
 async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     info!("Loading configuration from: {}", config_dir);
@@ -1364,6 +1420,25 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     // Store PJSIP config globally so AMI actions can read it
     if let Some(ref cfg) = pjsip_config {
         asterisk_sip::set_global_pjsip_config(cfg.clone());
+    }
+
+    // Load pjsip_notify.conf templates
+    {
+        let notify_svc = asterisk_sip::global_notify_service();
+        notify_svc.notify_config().load_defaults();
+
+        let notify_path = std::path::Path::new(config_dir).join("pjsip_notify.conf");
+        if notify_path.exists() {
+            match std::fs::read_to_string(&notify_path) {
+                Ok(content) => {
+                    load_pjsip_notify_config(&content, notify_svc.notify_config());
+                    info!("Loaded pjsip_notify.conf from {}", notify_path.display());
+                }
+                Err(e) => {
+                    warn!("Failed to read pjsip_notify.conf: {}", e);
+                }
+            }
+        }
     }
 
     // Determine SIP bind address from pjsip.conf transports or use default
@@ -1455,6 +1530,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                             transport_for_handler,
                         ),
                     );
+                    asterisk_sip::set_global_event_handler(event_handler.clone());
                     tokio::spawn(async move {
                         while let Some(event) = rx.recv().await {
                             match event {
@@ -1472,6 +1548,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                                     remote_addr,
                                 } => {
                                     event_handler.handle_response(&response, remote_addr);
+                                    event_handler.handle_reinvite_response(&response, remote_addr).await;
                                 }
                                 asterisk_sip::stack::SipEvent::IncomingBye {
                                     call_id: _,

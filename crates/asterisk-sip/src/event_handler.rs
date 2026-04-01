@@ -90,6 +90,10 @@ impl SipEventHandler {
         // 3. Extract Call-ID for tracking
         let call_id = request.call_id()?.to_string();
         eprintln!("[DEBUG] handle_incoming_invite: call_id={}, exten={}, caller={}", call_id, exten, caller_num);
+        eprintln!("[DEBUG] All headers:");
+        for h in &request.headers {
+            eprintln!("[DEBUG]   {}: {}", h.name, h.value);
+        }
 
         // 4. Authenticate the request against configured endpoints.
         //    Build credentials from all endpoints that have auth configured.
@@ -206,6 +210,12 @@ impl SipEventHandler {
         }
 
         let channel = store::register_existing_channel(new_ch);
+
+        // Store the SIP Call-ID on the channel so ConfBridge SFU can correlate.
+        {
+            let mut ch = channel.lock();
+            ch.variables.insert("__SIP_CALL_ID".to_string(), call_id.clone());
+        }
 
         // 6. Register Call-ID mapping for response routing
         {

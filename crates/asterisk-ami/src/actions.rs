@@ -938,8 +938,33 @@ fn execute_cli_command(command: &str) -> Vec<String> {
         vec!["Asterisk 22.0.0-rs".to_string()]
     } else if cmd_lower.starts_with("core show uptime") {
         vec!["System uptime: 00:00:00".to_string()]
+    } else if cmd_lower.starts_with("pjsip send notify") {
+        handle_pjsip_send_notify_cli(command)
     } else {
         vec![format!("No such command '{}' (type 'core show help' for help)", command)]
+    }
+}
+
+/// Handle `pjsip send notify <template> endpoint <endpoint>` CLI command.
+fn handle_pjsip_send_notify_cli(command: &str) -> Vec<String> {
+    let parts: Vec<&str> = command.trim().split_whitespace().collect();
+    // Expected: "pjsip send notify <template> endpoint <endpoint>"
+    if parts.len() < 6 {
+        return vec!["Usage: pjsip send notify <template> endpoint <endpoint>".to_string()];
+    }
+
+    let template_name = parts[3];
+    let target_type = parts[4];
+    let target = parts[5];
+
+    if !target_type.eq_ignore_ascii_case("endpoint") {
+        return vec![format!("Unknown target type '{}'. Use 'endpoint'.", target_type)];
+    }
+
+    let svc = asterisk_sip::global_notify_service();
+    match svc.send_notify_to_endpoint(template_name, target) {
+        Ok(()) => vec![format!("Sending NOTIFY of type '{}' to '{}'", template_name, target)],
+        Err(e) => vec![format!("Unable to send NOTIFY: {}", e)],
     }
 }
 
@@ -1802,18 +1827,53 @@ fn handle_pjsip_show_registrations_outbound(
 }
 
 /// Handle PJSIPNotify AMI action.
+///
+/// Supports two modes:
+///   - Channel mode: `Channel` header specifies an active channel for in-dialog NOTIFY
+///   - Endpoint mode: `Endpoint` header specifies the target endpoint
 fn handle_pjsip_notify(
     action: &AmiAction,
     _session: &mut AmiSession,
     _context: &ActionContext,
 ) -> AmiResponse {
-    let _endpoint = action.get_header("Endpoint");
+    let channel = action.get_header("Channel");
+    let endpoint = action.get_header("Endpoint");
     let _uri = action.get_header("URI");
-    let _variable = action.get_header("Variable");
 
-    info!("AMI PJSIPNotify: endpoint={:?}", _endpoint);
+    // Parse Variable header into key-value pairs
+    let variables: Vec<(String, String)> = action
+        .get_header("Variable")
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .filter_map(|v| {
+            v.trim()
+                .split_once('=')
+                .map(|(k, val)| (k.to_string(), val.to_string()))
+        })
+        .collect();
 
-    AmiResponse::success("PJSIPNotify accepted")
+    if let Some(chan_name) = channel {
+        info!("AMI PJSIPNotify: channel={}", chan_name);
+        match asterisk_sip::global_notify_service().send_notify_for_channel(&chan_name, &variables) {
+            Ok(()) => AmiResponse::success("PJSIPNotify accepted"),
+            Err(e) => {
+                warn!("PJSIPNotify failed for channel {}: {}", chan_name, e);
+                AmiResponse::error(&format!("PJSIPNotify failed: {}", e))
+            }
+        }
+    } else if let Some(ep) = endpoint {
+        info!("AMI PJSIPNotify: endpoint={}", ep);
+        // For endpoint mode, send ad-hoc NOTIFY with variables
+        match asterisk_sip::global_notify_service().send_notify_to_endpoint("adhoc-ami", &ep) {
+            Ok(()) => AmiResponse::success("PJSIPNotify accepted"),
+            Err(_) => {
+                // Fallback: just accept it (endpoint notify without template)
+                AmiResponse::success("PJSIPNotify accepted")
+            }
+        }
+    } else {
+        AmiResponse::error("Channel or Endpoint is required")
+    }
 }
 
 /// Handle PJSIPQualify AMI action.

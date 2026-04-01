@@ -111,6 +111,7 @@ pub fn alloc_channel(name: impl Into<String>) -> Arc<Mutex<Channel>> {
         ("ChannelState", "0"),
         ("ChannelStateDesc", "Down"),
         ("CallerIDNum", ""),
+        ("AccountCode", ""),
         ("Uniqueid", &uid),
         ("Linkedid", &uid),
     ]);
@@ -136,6 +137,7 @@ pub fn register_existing_channel(mut channel: Channel) -> Arc<Mutex<Channel>> {
     let state_num = (channel.state as u8).to_string();
     let state_desc = channel.state.to_string();
     let caller_num = channel.caller.id.number.number.clone();
+    let accountcode = channel.accountcode.clone();
 
     let arc = Arc::new(Mutex::new(channel));
     CHANNEL_STORE.register(Arc::clone(&arc));
@@ -147,6 +149,7 @@ pub fn register_existing_channel(mut channel: Channel) -> Arc<Mutex<Channel>> {
         ("ChannelState", &state_num),
         ("ChannelStateDesc", &state_desc),
         ("CallerIDNum", &caller_num),
+        ("AccountCode", &accountcode),
         ("Uniqueid", &uid),
         ("Linkedid", &uid),
     ]);

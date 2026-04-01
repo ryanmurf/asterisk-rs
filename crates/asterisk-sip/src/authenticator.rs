@@ -103,6 +103,7 @@ impl InboundAuthenticator {
 
         // Look for an Authorization header in the request.
         let auth_hdr = request.get_header(auth_header_name);
+        eprintln!("[DEBUG] Auth header name={}, present={}", auth_header_name, auth_hdr.is_some());
 
         if auth_hdr.is_none() {
             // No credentials provided -- send a challenge.
@@ -171,6 +172,8 @@ impl InboundAuthenticator {
 
         // Extract the response= value from the expected header.
         let expected_response = extract_response_value(&expected);
+        eprintln!("[DEBUG] Auth verify: username={}, method={}, uri={}, realm={}, nonce={}, expected_response={}, parsed_response={}", 
+                  cred.username, method, parsed.uri, realm, parsed.nonce, expected_response, parsed.response);
         if expected_response == parsed.response {
             debug!(username = %cred.username, "Authentication successful");
             Ok(())
@@ -335,19 +338,19 @@ impl OutboundAuthenticator {
 
 /// Parsed Authorization header fields.
 #[derive(Debug)]
-struct ParsedAuth {
-    username: String,
-    realm: String,
-    nonce: String,
-    uri: String,
-    response: String,
-    algorithm: DigestAlgorithm,
-    qop: Option<String>,
-    opaque: Option<String>,
+pub struct ParsedAuth {
+    pub username: String,
+    pub realm: String,
+    pub nonce: String,
+    pub uri: String,
+    pub response: String,
+    pub algorithm: DigestAlgorithm,
+    pub qop: Option<String>,
+    pub opaque: Option<String>,
 }
 
 /// Parse an Authorization or Proxy-Authorization header value.
-fn parse_authorization(value: &str) -> Option<ParsedAuth> {
+pub fn parse_authorization(value: &str) -> Option<ParsedAuth> {
     let value = value.trim();
     let rest = value.strip_prefix("Digest")?.trim();
 

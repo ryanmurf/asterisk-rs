@@ -146,6 +146,7 @@ fn map_result(r: PbxExecResult) -> PbxResult {
 /// the core `DialplanApp` trait, then registers it in `APP_REGISTRY`.
 pub fn register_all_apps() {
     use crate::answer::AppAnswer;
+    use crate::confbridge::AppConfBridge;
     use crate::dial::AppDial;
     use crate::echo::AppEcho;
     use crate::exec::{AppExec, AppExecIf, AppTryExec};
@@ -256,6 +257,18 @@ pub fn register_all_apps() {
         "Echo",
         "Echo audio, video, DTMF back to the calling party",
         |channel, _args| Box::pin(AppEcho::exec(channel)),
+    )));
+
+    // ConfBridge - async exec, blocks while in conference
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "ConfBridge",
+        "N-way conference bridge",
+        |channel, args| {
+            Box::pin(async move {
+                let (result, _conf_result) = AppConfBridge::exec(channel, args).await;
+                result
+            })
+        },
     )));
 
     // Wait - async exec (takes &Channel not &mut Channel)
@@ -481,9 +494,8 @@ fn register_stub_apps() {
         };
     }
 
-    // Dial, Playback, Echo are registered as real adapters above
+    // Dial, Playback, Echo, ConfBridge are registered as real adapters above
     register_stub!("Record", "Record to a file");
-    register_stub!("ConfBridge", "N-way conference bridge");
     register_stub!("Queue", "Queue a call for a call queue");
     register_stub!("VoiceMail", "Leave a voicemail");
     register_stub!("Transfer", "Transfer caller to a new extension");

@@ -68,6 +68,7 @@ pub mod messaging;
 pub mod refer;
 pub mod mwi;
 pub mod notify;
+pub mod notify_service;
 pub mod dtmf_info;
 pub mod diversion;
 pub mod acl;
@@ -130,9 +131,24 @@ pub use turn::TurnClient;
 pub use rtp::ice_transport::IceRtpTransport;
 pub use pjsip_config::{PjsipConfig, TransportConfig, EndpointConfig, AorConfig, AuthConfig, IdentifyConfig, RegistrationConfig, set_global_pjsip_config, get_global_pjsip_config};
 pub use rtp::mos::{MosEstimator, CallQuality, QualityRating, CodecType, RtpMetrics};
+pub use notify_service::{global_notify_service, NotifyService, ChannelSipState};
 pub use stir_shaken::{
     AttestationLevel, StirIdentity, PASSporT, PASSporTHeader, PASSporTPayload,
     TelephoneNumber, VerificationResult, VerificationStatus, StirShakenError,
     CryptoBackend, HmacPlaceholderBackend, StubBackend, CertificateCache,
     StirShakenVars,
 };
+
+// Global SIP event handler, stored at startup so ConfBridge can send re-INVITEs.
+use std::sync::{Arc, OnceLock};
+static GLOBAL_EVENT_HANDLER: OnceLock<Arc<SipEventHandler>> = OnceLock::new();
+
+/// Store the SIP event handler globally for use by ConfBridge SFU.
+pub fn set_global_event_handler(handler: Arc<SipEventHandler>) {
+    let _ = GLOBAL_EVENT_HANDLER.set(handler);
+}
+
+/// Retrieve the global SIP event handler.
+pub fn get_global_event_handler() -> Option<Arc<SipEventHandler>> {
+    GLOBAL_EVENT_HANDLER.get().cloned()
+}

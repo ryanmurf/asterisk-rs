@@ -1210,6 +1210,7 @@ impl AppDial {
                     store_ch.unique_id = chan.unique_id.clone();
                     store_ch.linkedid = chan.linkedid.clone();
                     store_ch.state = chan.state;
+                    store_ch.accountcode = chan.accountcode.clone();
                     drop(chan);
                     let store_chan = asterisk_core::channel_store::register_existing_channel(store_ch);
                     // The store may assign a new unique_id, update our copy

@@ -119,7 +119,8 @@ impl ChannelDriver for SipChannelDriver {
     async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
         let transport = self.get_transport()?;
 
-        // Parse destination to determine remote address.
+        // Parse destination to determine remote address and endpoint config.
+        let endpoint_config = crate::pjsip_config::get_global_pjsip_config();
         let (_to_uri, remote_addr) = if dest.starts_with("sip:") || dest.starts_with("sips:") {
             let uri = crate::parser::SipUri::parse(dest)
                 .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid SIP URI: {}", e.0)))?;
@@ -128,8 +129,8 @@ impl ChannelDriver for SipChannelDriver {
                 .parse()
                 .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid address: {}", e)))?;
             (dest.to_string(), addr)
-        } else {
-            // Treat as user@host
+        } else if dest.contains('@') || dest.contains(':') {
+            // Treat as user@host or host:port
             let addr_str = if dest.contains(':') {
                 dest.to_string()
             } else {
@@ -139,6 +140,24 @@ impl ChannelDriver for SipChannelDriver {
                 .parse()
                 .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid dest: {}", e)))?;
             (format!("sip:{}", dest), addr)
+        } else {
+            // Treat as endpoint name -- look up AOR contact from config
+            let config = endpoint_config.as_ref()
+                .ok_or_else(|| AsteriskError::NotFound(format!("No PJSIP config loaded for endpoint '{}'", dest)))?;
+            let ep = config.find_endpoint(dest)
+                .ok_or_else(|| AsteriskError::NotFound(format!("Endpoint '{}' not found", dest)))?;
+            let aor_name = ep.aors.as_deref().unwrap_or(dest);
+            let aor = config.find_aor(aor_name);
+            let contact_uri = aor.and_then(|a| a.contact.first()).cloned()
+                .unwrap_or_else(|| format!("sip:{}@127.0.0.1:5060", dest));
+            // Parse the contact URI to get the remote address
+            let uri = crate::parser::SipUri::parse(&contact_uri)
+                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid contact URI: {}", e.0)))?;
+            let port = uri.port.unwrap_or(5060);
+            let addr: SocketAddr = format!("{}:{}", uri.host, port)
+                .parse()
+                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid contact address: {}", e)))?;
+            (contact_uri, addr)
         };
 
         // Create RTP session
@@ -158,7 +177,15 @@ impl ChannelDriver for SipChannelDriver {
         sip_session.local_sdp = Some(sdp);
 
         let chan_name = format!("PJSIP/{}", dest);
-        let channel = Channel::new(chan_name);
+        let mut channel = Channel::new(chan_name);
+
+        // Apply endpoint config (accountcode, etc.) if available
+        if let Some(ref config) = endpoint_config {
+            if let Some(ep) = config.find_endpoint(dest) {
+                channel.accountcode = ep.accountcode.clone();
+            }
+        }
+
         let channel_id = channel.unique_id.as_str().to_string();
 
         let priv_data = Arc::new(SipChannelPrivate {

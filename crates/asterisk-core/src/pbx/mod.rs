@@ -207,6 +207,32 @@ impl Context {
         self.find_extension_with_cid(exten, None)
     }
 
+    /// Check if the given string could match an extension with more digits appended.
+    ///
+    /// Returns true if `exten` is a proper prefix of any extension name in this context.
+    /// Used for overlap dialing: if a partial number could become a valid extension,
+    /// we respond with 484 Address Incomplete instead of 404 Not Found.
+    pub fn could_match(&self, exten: &str) -> bool {
+        for ext in self.extensions.values() {
+            let name = &ext.name;
+            // For literal extensions, check if exten is a proper prefix
+            if !name.starts_with('_') {
+                if name.len() > exten.len() && name.starts_with(exten) {
+                    return true;
+                }
+            }
+            // For pattern extensions (e.g. _NXXNXXXXXX), a short exten could
+            // always potentially match with more digits, so we consider it a
+            // prefix match if the pattern is longer than the exten.
+            if let Some(pattern) = name.strip_prefix('_') {
+                if pattern.len() > exten.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Find an extension matching the given exten and optional caller ID.
     ///
     /// Search order:
@@ -282,6 +308,41 @@ impl Dialplan {
     /// Find an extension in a context (searches includes recursively).
     pub fn find_extension(&self, context_name: &str, exten: &str) -> Option<(&Context, &Extension)> {
         self.find_extension_recursive(context_name, exten, &mut Vec::new())
+    }
+
+    /// Check if the given exten could match an extension with more digits
+    /// in the specified context (searches includes recursively).
+    pub fn could_match(&self, context_name: &str, exten: &str) -> bool {
+        self.could_match_recursive(context_name, exten, &mut Vec::new())
+    }
+
+    fn could_match_recursive(
+        &self,
+        context_name: &str,
+        exten: &str,
+        visited: &mut Vec<String>,
+    ) -> bool {
+        if visited.contains(&context_name.to_string()) {
+            return false;
+        }
+        visited.push(context_name.to_string());
+
+        let ctx = match self.contexts.get(context_name) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        if ctx.could_match(exten) {
+            return true;
+        }
+
+        for include in &ctx.includes {
+            if self.could_match_recursive(include, exten, visited) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn find_extension_recursive<'a>(

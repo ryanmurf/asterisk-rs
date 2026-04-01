@@ -20,6 +20,29 @@ use uuid::Uuid;
 static CONFERENCES: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<Conference>>>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
+/// Global SFU event broadcast sender.  Every conference participant subscribes.
+static SFU_EVENT_TX: once_cell::sync::Lazy<tokio::sync::broadcast::Sender<SfuEvent>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::broadcast::channel(64).0);
+
+/// SFU event: a participant joined or left a conference.
+#[derive(Debug, Clone)]
+pub enum SfuEvent {
+    /// A new participant joined — all other participants should be re-INVITEd.
+    ParticipantJoined {
+        conference_name: String,
+        /// The channel ID of the participant that just joined.
+        joined_channel_id: ChannelId,
+    },
+    /// A participant left — remaining participants should be re-INVITEd.
+    ParticipantLeft {
+        conference_name: String,
+        /// The channel ID of the participant that left.
+        left_channel_id: ChannelId,
+        /// Video streams the departed participant had (to set port=0 in re-INVITE).
+        departed_video_streams: Vec<VideoStreamInfo>,
+    },
+}
+
 /// Global registry of user profiles loaded from confbridge.conf.
 static USER_PROFILES: once_cell::sync::Lazy<DashMap<String, UserProfile>> =
     once_cell::sync::Lazy::new(DashMap::new);
@@ -645,6 +668,21 @@ pub fn get_events() -> Vec<ConfBridgeEvent> {
 }
 
 // ---------------------------------------------------------------------------
+// Video Stream Info (for SFU)
+// ---------------------------------------------------------------------------
+
+/// Info about a participant's video stream, extracted from their SDP offer.
+#[derive(Debug, Clone)]
+pub struct VideoStreamInfo {
+    /// RTP payload type number (e.g. 34 for H263, 96 for H264)
+    pub payload_type: u8,
+    /// Codec name (e.g. "H263", "H264")
+    pub codec_name: String,
+    /// Sample rate (typically 90000 for video)
+    pub sample_rate: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Conference User
 // ---------------------------------------------------------------------------
 
@@ -681,6 +719,10 @@ pub struct ConferenceUser {
     pub profile_name: String,
     /// Menu profile name
     pub menu_name: String,
+    /// SIP Call-ID (for SFU re-INVITE routing).
+    pub sip_call_id: Option<String>,
+    /// Video codec info from the participant's SDP offer (media_type, payload_type, codec_name, sample_rate).
+    pub video_streams: Vec<VideoStreamInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +970,10 @@ impl AppConfBridge {
         // Get or create the conference
         let conference = Self::get_or_create_conference(&conf_name, bridge_profile_name);
 
+        // Extract SIP Call-ID and video stream info for SFU
+        let sip_call_id = channel.variables.get("__SIP_CALL_ID").cloned();
+        let video_streams = Self::extract_video_streams_for_channel(&sip_call_id);
+
         // Create the conference user
         let conf_user = ConferenceUser {
             channel_id: channel.unique_id.clone(),
@@ -945,6 +991,8 @@ impl AppConfBridge {
             talking_volume_adjustment: 0,
             profile_name: user_profile_name.to_string(),
             menu_name: menu_name.to_string(),
+            sip_call_id,
+            video_streams,
         };
 
         // Join the conference

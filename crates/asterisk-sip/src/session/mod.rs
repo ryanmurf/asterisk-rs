@@ -505,6 +505,104 @@ impl SipSession {
         })
     }
 
+    /// Build an in-dialog re-INVITE with a new SDP offer.
+    ///
+    /// Used by the SFU ConfBridge to add/remove video streams for participants.
+    pub fn build_reinvite(&mut self, sdp: &SessionDescription) -> Option<SipMessage> {
+        let dialog = self.dialog.as_mut()?;
+        let cseq = dialog.next_cseq();
+
+        // Build the Request-URI from the remote target (Contact of the remote side).
+        let uri = SipUri::parse(&dialog.remote_target).ok().unwrap_or_else(|| SipUri {
+            scheme: "sip".to_string(),
+            user: None,
+            password: None,
+            host: self.remote_addr.ip().to_string(),
+            port: Some(self.remote_addr.port()),
+            parameters: Default::default(),
+            headers: Default::default(),
+        });
+
+        let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
+
+        // For UAS (inbound call), From = our local tag, To = remote tag.
+        let from_value = format!("<sip:asterisk@{}>;tag={}", self.local_addr, dialog.local_tag);
+        let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
+
+        let body = sdp.to_string();
+
+        let headers = vec![
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
+            SipHeader { name: header_names::FROM.to_string(), value: from_value },
+            SipHeader { name: header_names::TO.to_string(), value: to_value },
+            SipHeader { name: header_names::CALL_ID.to_string(), value: self.call_id.clone() },
+            SipHeader { name: header_names::CSEQ.to_string(), value: format!("{} INVITE", cseq) },
+            SipHeader { name: header_names::CONTACT.to_string(), value: format!("<sip:asterisk@{}>", self.local_addr) },
+            SipHeader { name: header_names::CONTENT_TYPE.to_string(), value: "application/sdp".to_string() },
+            SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: body.len().to_string() },
+        ];
+
+        // Store the new local SDP.
+        self.local_sdp = Some(sdp.clone());
+
+        Some(SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: SipMethod::Invite,
+                uri,
+                version: "SIP/2.0".to_string(),
+            }),
+            headers,
+            body,
+        })
+    }
+
+    /// Build an ACK for a received 200 OK to our re-INVITE.
+    pub fn build_reinvite_ack(&self, response: &SipMessage) -> Option<SipMessage> {
+        let dialog = self.dialog.as_ref()?;
+
+        let uri = SipUri::parse(&dialog.remote_target).ok().unwrap_or_else(|| SipUri {
+            scheme: "sip".to_string(),
+            user: None,
+            password: None,
+            host: self.remote_addr.ip().to_string(),
+            port: Some(self.remote_addr.port()),
+            parameters: Default::default(),
+            headers: Default::default(),
+        });
+
+        let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
+
+        let from_value = format!("<sip:asterisk@{}>;tag={}", self.local_addr, dialog.local_tag);
+        let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
+
+        // CSeq from the response we're ACKing.
+        let cseq_num = response.cseq()
+            .and_then(|cs| cs.split_whitespace().next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(1);
+
+        let headers = vec![
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
+            SipHeader { name: header_names::FROM.to_string(), value: from_value },
+            SipHeader { name: header_names::TO.to_string(), value: to_value },
+            SipHeader { name: header_names::CALL_ID.to_string(), value: self.call_id.clone() },
+            SipHeader { name: header_names::CSEQ.to_string(), value: format!("{} ACK", cseq_num) },
+            SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: "0".to_string() },
+        ];
+
+        Some(SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: SipMethod::Ack,
+                uri,
+                version: "SIP/2.0".to_string(),
+            }),
+            headers,
+            body: String::new(),
+        })
+    }
+
     /// Terminate the session.
     pub fn terminate(&mut self) {
         self.state = SessionState::Terminated;
