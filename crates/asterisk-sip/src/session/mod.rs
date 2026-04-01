@@ -217,11 +217,18 @@ impl SipSession {
 
     /// Build an INVITE request for an outbound session.
     pub fn build_invite(&mut self, to_uri: &str) -> SipMessage {
+        self.build_invite_with_uri(to_uri, to_uri)
+    }
+
+    /// Build an INVITE with separate Request-URI and To header value.
+    /// The request_uri is used as the actual SIP Request-URI (typically the
+    /// contact address), while to_uri is used in the To header.
+    pub fn build_invite_with_uri(&mut self, request_uri: &str, to_uri: &str) -> SipMessage {
         let from_uri = format!("sip:asterisk@{}", self.local_addr);
         let contact_uri = format!("sip:asterisk@{}", self.local_addr);
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
-        let uri = SipUri::parse(to_uri).unwrap_or_else(|_| SipUri {
+        let uri = SipUri::parse(request_uri).unwrap_or_else(|_| SipUri {
             scheme: "sip".to_string(),
             user: None,
             password: None,

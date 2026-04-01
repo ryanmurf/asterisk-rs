@@ -95,6 +95,21 @@ impl SipEventHandler {
             eprintln!("[DEBUG]   {}: {}", h.name, h.value);
         }
 
+        // 3b. Check if this is a re-INVITE (in-dialog INVITE for hold/unhold/media update).
+        //     A re-INVITE has a To tag (established dialog), while a new INVITE does not.
+        //     We must check the To tag to avoid misidentifying a new inbound INVITE as a
+        //     re-INVITE when Asterisk calls itself (same Call-ID for outbound and inbound).
+        {
+            let has_to_tag = request.get_header("To")
+                .and_then(crate::parser::extract_tag)
+                .is_some();
+            let existing = self.call_states.read().contains_key(&call_id);
+            if existing && has_to_tag {
+                eprintln!("[DEBUG] re-INVITE detected for call_id={}", call_id);
+                return self.handle_reinvite_request(request, remote_addr, session).await;
+            }
+        }
+
         // 4. Authenticate the request against configured endpoints.
         //    Build credentials from all endpoints that have auth configured.
         let pjsip_config = crate::pjsip_config::get_global_pjsip_config();
@@ -191,7 +206,13 @@ impl SipEventHandler {
         // 7. Create the channel and register it in the global store.
         //    We use register_existing_channel so that all fields (including
         //    accountcode) are set before the Newchannel AMI event is emitted.
-        let channel_name = format!("PJSIP/{}-{:08x}", caller_num, rand_id());
+        //    In real Asterisk, the inbound PJSIP channel is named after the
+        //    matched endpoint (e.g. PJSIP/alice-00000001), not the caller.
+        let matched_endpoint_name = pjsip_config.as_ref()
+            .and_then(|cfg| cfg.identify_endpoint_by_ip(&remote_addr.ip().to_string()))
+            .map(|s| s.to_string());
+        let chan_label = matched_endpoint_name.as_deref().unwrap_or(&caller_num);
+        let channel_name = format!("PJSIP/{}-{:08x}", chan_label, rand_id());
         let mut new_ch = asterisk_core::channel::Channel::new(&channel_name);
         new_ch.caller.id.number.number = caller_num.clone();
         new_ch.caller.id.name.name = caller_name;
@@ -201,8 +222,7 @@ impl SipEventHandler {
 
         // Look up accountcode from the matched endpoint
         if let Some(ref cfg) = pjsip_config {
-            let ep_name = cfg.identify_endpoint_by_ip(&remote_addr.ip().to_string());
-            if let Some(ep_name) = ep_name {
+            if let Some(ref ep_name) = matched_endpoint_name {
                 if let Some(ep) = cfg.find_endpoint(ep_name) {
                     new_ch.accountcode = ep.accountcode.clone();
                 }
@@ -386,14 +406,25 @@ impl SipEventHandler {
                 hangup_notify.notified(),
             ).await;
 
-            // Do NOT eagerly send BYE.  The SIP dialog stays alive so
-            // that SIPp (or any remote UA) can send additional in-dialog
-            // messages.  The remote will send BYE when it is done, and
-            // handle_bye() will clean up.
-            //
-            // We only clean up after a generous timeout (32s, matching
-            // SIP Timer B / Timer F) to avoid leaking state if the
-            // remote disappears without sending BYE.
+            // Send BYE to the remote endpoint to tear down the SIP dialog.
+            {
+                let cs_arc_opt = {
+                    let states = call_states_ref.read();
+                    states.get(&call_id_for_task).cloned()
+                };
+                if let Some(cs_arc) = cs_arc_opt {
+                    let mut cs = cs_arc.lock().await;
+                    if let Some(bye) = cs.session.build_bye() {
+                        if let Err(e) = transport.send(&bye, cs.remote_addr).await {
+                            warn!(call_id = %call_id_for_task, "Failed to send BYE: {}", e);
+                        } else {
+                            eprintln!("[DEBUG] Sent BYE for call_id={}", call_id_for_task);
+                        }
+                    }
+                }
+            }
+
+            // Wait for remote 200 OK to our BYE, or clean up after timeout.
             let call_id_for_cleanup = call_id_for_task.clone();
             let call_states_cleanup = call_states_ref.clone();
             let callid_map_cleanup = callid_map_ref.clone();
@@ -427,8 +458,25 @@ impl SipEventHandler {
         Some(call_id)
     }
 
+    /// Register a Call-ID → channel name mapping for outbound calls.
+    /// This allows SIP responses to be routed back to the correct channel.
+    pub fn register_outbound_callid(&self, call_id: &str, channel_name: &str) {
+        self.callid_map.write().insert(call_id.to_string(), channel_name.to_string());
+        tracing::debug!(call_id, channel_name, "registered outbound Call-ID mapping");
+    }
+
+    /// Register an outbound call's session so we can send ACK/BYE later.
+    pub fn register_outbound_session(&self, call_id: &str, channel_name: &str, session: SipSession, remote_addr: SocketAddr) {
+        let call_state = Arc::new(tokio::sync::Mutex::new(CallState {
+            session,
+            remote_addr,
+            channel_name: channel_name.to_string(),
+        }));
+        self.call_states.write().insert(call_id.to_string(), call_state);
+    }
+
     /// Handle a SIP response (180/200/4xx/5xx) for outbound calls.
-    pub fn handle_response(&self, response: &SipMessage, _remote_addr: SocketAddr) {
+    pub async fn handle_response(&self, response: &SipMessage, remote_addr: SocketAddr) {
         let call_id = match response.call_id() {
             Some(id) => id.to_string(),
             None => return,
@@ -445,23 +493,61 @@ impl SipEventHandler {
 
         if let Some(channel) = store::find_by_name(&channel_name) {
             let status_code = response.status_code().unwrap_or(0);
-            let mut ch = channel.lock();
-            match status_code {
-                180 | 183 => {
-                    ch.set_state(ChannelState::Ringing);
+            let cseq_method = response.get_header("CSeq")
+                .and_then(|c| c.split_whitespace().last())
+                .map(|m| m.to_uppercase())
+                .unwrap_or_default();
+            // Handle channel state update only for INVITE responses
+            if cseq_method == "INVITE" {
+                let mut ch = channel.lock();
+                match status_code {
+                    180 | 183 => {
+                        ch.set_state(ChannelState::Ringing);
+                    }
+                    200 => {
+                        ch.set_state(ChannelState::Up);
+                    }
+                    486 => {
+                        ch.set_state(ChannelState::Busy);
+                        ch.hangup_cause = HangupCause::UserBusy;
+                    }
+                    _ if status_code >= 400 => {
+                        ch.hangup_cause = HangupCause::NormalClearing;
+                        ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
+                    _ => {}
                 }
-                200 => {
-                    ch.set_state(ChannelState::Up);
+            }
+            // Update NOTIFY service with remote tag from response
+            if let Some(to_tag) = response.get_header("To")
+                .and_then(crate::parser::extract_tag) {
+                let notify_svc = crate::notify_service::global_notify_service();
+                notify_svc.update_remote_tag(&channel_name, &to_tag);
+            }
+            // Send ACK for 200 OK on outbound INVITE only (not NOTIFY 200 OK)
+            let cseq_is_invite = response.get_header("CSeq")
+                .map(|c| c.to_uppercase().contains("INVITE"))
+                .unwrap_or(false);
+            if status_code == 200 && cseq_is_invite {
+                let cs_arc = {
+                    let states = self.call_states.read();
+                    states.get(&call_id).cloned()
+                };
+                if let Some(cs_arc) = cs_arc {
+                    let mut cs = cs_arc.lock().await;
+                    if cs.session.is_outbound {
+                        cs.session.on_response(response);
+                        if let Some(ack) = cs.session.build_ack() {
+                            if let Err(e) = self.transport.send(&ack, remote_addr).await {
+                                warn!(call_id = %call_id, "Failed to send ACK: {}", e);
+                            } else {
+                                eprintln!("[DEBUG] Sent ACK for 200 OK call_id={}", call_id);
+                            }
+                        } else {
+                            eprintln!("[DEBUG] Failed to build ACK for call_id={}", call_id);
+                        }
+                    }
                 }
-                486 => {
-                    ch.set_state(ChannelState::Busy);
-                    ch.hangup_cause = HangupCause::UserBusy;
-                }
-                _ if status_code >= 400 => {
-                    ch.hangup_cause = HangupCause::NormalClearing;
-                    ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
-                }
-                _ => {}
             }
         }
     }
@@ -565,6 +651,10 @@ impl SipEventHandler {
         };
 
         let cs = cs_arc.lock().await;
+        // Skip outbound calls — handle_response already sends their ACK
+        if cs.session.is_outbound {
+            return;
+        }
         if let Some(ack) = cs.session.build_reinvite_ack(response) {
             if let Err(e) = self.transport.send(&ack, remote_addr).await {
                 warn!(call_id = %call_id, "Failed to send ACK for re-INVITE 200 OK: {}", e);
@@ -572,6 +662,128 @@ impl SipEventHandler {
                 debug!(call_id = %call_id, "Sent ACK for re-INVITE 200 OK");
             }
         }
+    }
+
+    /// Handle an incoming re-INVITE (in-dialog INVITE for hold/unhold/media update).
+    async fn handle_reinvite_request(
+        &self,
+        request: &SipMessage,
+        remote_addr: SocketAddr,
+        mut session: SipSession,
+    ) -> Option<String> {
+        let call_id = request.call_id()?.to_string();
+
+        // Get existing call state to update session SDP
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(&call_id)?.clone()
+        };
+
+        // Parse the re-INVITE's SDP offer
+        let remote_sdp = session.remote_sdp.clone();
+
+        // Check if this is a hold (a=sendonly or a=inactive in the SDP)
+        let is_hold = if let Some(ref sdp) = remote_sdp {
+            let sdp_str = sdp.to_string();
+            sdp_str.contains("a=sendonly") || sdp_str.contains("a=inactive")
+        } else {
+            false
+        };
+
+        // Generate SDP answer
+        let local_ip = session.local_addr.ip().to_string();
+        let answer_sdp = if let Some(ref offer) = remote_sdp {
+            let answer = SessionDescription::create_answer(
+                offer,
+                &local_ip,
+                10000,
+                &self.supported_codecs,
+            );
+            Some(answer)
+        } else {
+            // No SDP in re-INVITE; use the existing local SDP
+            let cs = cs_arc.lock().await;
+            cs.session.local_sdp.clone()
+        };
+
+        // Build 200 OK response
+        let mut ok_resp = request.create_response(200, "OK").ok()?;
+
+        // Add Contact header
+        ok_resp.add_header("Contact", &format!("<sip:asterisk@{}>", session.local_addr));
+
+        // Add SDP body
+        if let Some(ref sdp) = answer_sdp {
+            let sdp_str = sdp.to_string();
+            ok_resp.add_header("Content-Type", "application/sdp");
+            ok_resp.add_header("Content-Length", &sdp_str.len().to_string());
+            ok_resp.body = sdp_str;
+        }
+
+        // Send 200 OK
+        if let Err(e) = self.transport.send(&ok_resp, remote_addr).await {
+            warn!(call_id = %call_id, "Failed to send 200 OK for re-INVITE: {}", e);
+            return None;
+        }
+        eprintln!("[DEBUG] Sent 200 OK for re-INVITE call_id={}", call_id);
+
+        // Emit Hold/Unhold AMI event
+        let _channel_name = {
+            let cs = cs_arc.lock().await;
+            cs.channel_name.clone()
+        };
+        if is_hold {
+            eprintln!("[DEBUG] Hold detected on channel {}", _channel_name);
+            // Find the bridged peer channel and emit DeviceStateChange for its endpoint
+            if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&_channel_name) {
+                let ch = store_chan.lock();
+                if let Some(peer_name) = ch.variables.get("BRIDGEPEER") {
+                    // Extract device name from peer channel name (PJSIP/bob-00000001 → PJSIP/bob)
+                    let device = peer_name.rsplit_once('-')
+                        .map(|(prefix, _)| prefix.to_string())
+                        .unwrap_or_else(|| peer_name.clone());
+                    eprintln!("[DEBUG] Emitting DeviceStateChange for {} = ONHOLD", device);
+                    asterisk_core::channel::publish_channel_event("DeviceStateChange", &[
+                        ("Device", &device),
+                        ("State", "ONHOLD"),
+                    ]);
+                }
+            }
+        }
+
+        Some(call_id)
+    }
+
+    /// Send BYE for a channel by looking up its Call-ID in the callid_map.
+    pub async fn send_bye_for_channel(&self, channel_name: &str) {
+        // Find Call-ID for this channel
+        let call_id = {
+            let map = self.callid_map.read();
+            map.iter().find(|(_, name)| name.as_str() == channel_name)
+                .map(|(cid, _)| cid.clone())
+        };
+        let call_id = match call_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(&call_id).cloned()
+        };
+        if let Some(cs_arc) = cs_arc {
+            let mut cs = cs_arc.lock().await;
+            if let Some(bye) = cs.session.build_bye() {
+                if let Err(e) = self.transport.send(&bye, cs.remote_addr).await {
+                    warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
+                } else {
+                    eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
+                }
+            }
+        }
+        // Clean up
+        self.callid_map.write().remove(&call_id);
+        self.call_states.write().remove(&call_id);
     }
 
     /// Get the remote SDP for an active call (the SDP from the initial INVITE offer).

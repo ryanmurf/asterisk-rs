@@ -429,12 +429,19 @@ impl Parser {
 }
 
 /// Strip inline comments. A semicolon (;) that is not inside quotes ends the line.
+/// A backslash-escaped semicolon (\;) is treated as a literal semicolon per
+/// Asterisk convention.
 fn strip_inline_comment(line: &str) -> &str {
     let mut in_quotes = false;
-    for (i, ch) in line.char_indices() {
-        if ch == '"' {
+    let bytes = line.as_bytes();
+    for (i, &ch) in bytes.iter().enumerate() {
+        if ch == b'"' {
             in_quotes = !in_quotes;
-        } else if ch == ';' && !in_quotes {
+        } else if ch == b';' && !in_quotes {
+            if i > 0 && bytes[i - 1] == b'\\' {
+                // Escaped semicolon -- not a comment
+                continue;
+            }
             return &line[..i];
         }
     }
@@ -503,6 +510,7 @@ fn parse_category_header(
 }
 
 /// Parse a variable line like `key = value` or `key => value`.
+/// Unescapes `\;` to `;` in the value (Asterisk convention for literal semicolons).
 fn parse_variable(
     line: &str,
     filename: &str,
@@ -511,7 +519,7 @@ fn parse_variable(
     // Try => first (object assignment)
     if let Some(pos) = line.find("=>") {
         let name = line[..pos].trim().to_string();
-        let value = line[pos + 2..].trim().to_string();
+        let value = line[pos + 2..].trim().replace("\\;", ";");
         if name.is_empty() {
             return Err(ConfigError::ParseError {
                 file: filename.to_string(),
@@ -525,7 +533,7 @@ fn parse_variable(
     // Try = (regular assignment)
     if let Some(pos) = line.find('=') {
         let name = line[..pos].trim().to_string();
-        let value = line[pos + 1..].trim().to_string();
+        let value = line[pos + 1..].trim().replace("\\;", ";");
         if name.is_empty() {
             return Err(ConfigError::ParseError {
                 file: filename.to_string(),
@@ -609,6 +617,19 @@ secret = "pass;word" ; semicolons in quotes are preserved
         assert_eq!(
             config.get_variable("general", "secret"),
             Some("\"pass;word\"")
+        );
+    }
+
+    #[test]
+    fn test_escaped_semicolons() {
+        let content = r#"
+[alice]
+contact=sip:alice@127.0.0.1:5060\;transport=udp
+"#;
+        let config = AsteriskConfig::from_str(content, "test.conf").unwrap();
+        assert_eq!(
+            config.get_variable("alice", "contact"),
+            Some("sip:alice@127.0.0.1:5060;transport=udp")
         );
     }
 

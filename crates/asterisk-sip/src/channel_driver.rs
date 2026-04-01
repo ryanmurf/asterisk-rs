@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -38,6 +39,9 @@ impl fmt::Debug for SipChannelPrivate {
     }
 }
 
+/// Global counter for outbound channel naming (like Asterisk's chan_pjsip counter).
+static CHANNEL_COUNTER: AtomicU32 = AtomicU32::new(1);
+
 /// The SIP channel driver.
 ///
 /// Port of chan_pjsip.c. Implements the ChannelDriver trait for SIP calls.
@@ -47,7 +51,7 @@ pub struct SipChannelDriver {
     /// Active channels.
     channels: RwLock<HashMap<String, Arc<SipChannelPrivate>>>,
     /// SIP transport.
-    transport: Option<Arc<dyn SipTransport>>,
+    transport: RwLock<Option<Arc<dyn SipTransport>>>,
     /// Supported codecs.
     codecs: Vec<Codec>,
 }
@@ -67,7 +71,7 @@ impl SipChannelDriver {
         Self {
             local_addr,
             channels: RwLock::new(HashMap::new()),
-            transport: None,
+            transport: RwLock::new(None),
             codecs: vec![
                 codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
@@ -76,28 +80,33 @@ impl SipChannelDriver {
     }
 
     /// Initialize the transport layer.
-    pub async fn init_transport(&mut self) -> AsteriskResult<()> {
+    pub async fn init_transport(&self) -> AsteriskResult<()> {
         let transport = UdpTransport::bind(self.local_addr).await.map_err(|e| {
             AsteriskError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!("Failed to bind SIP transport: {}", e),
             ))
         })?;
-        self.transport = Some(Arc::new(transport));
+        *self.transport.write() = Some(Arc::new(transport));
         info!(addr = %self.local_addr, "SIP channel driver initialized");
         Ok(())
     }
 
-    fn get_private(&self, id: &str) -> Option<Arc<SipChannelPrivate>> {
-        self.channels.read().get(id).cloned()
+    /// Set an externally-created transport (shared with the SIP stack).
+    pub fn set_transport(&self, transport: Arc<dyn SipTransport>) {
+        *self.transport.write() = Some(transport);
     }
 
-    fn remove_private(&self, id: &str) -> Option<Arc<SipChannelPrivate>> {
-        self.channels.write().remove(id)
+    fn get_private(&self, name: &str) -> Option<Arc<SipChannelPrivate>> {
+        self.channels.read().get(name).cloned()
+    }
+
+    fn remove_private(&self, name: &str) -> Option<Arc<SipChannelPrivate>> {
+        self.channels.write().remove(name)
     }
 
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
-        self.transport.clone().ok_or_else(|| {
+        self.transport.read().clone().ok_or_else(|| {
             AsteriskError::Internal("SIP transport not initialized".into())
         })
     }
@@ -176,7 +185,8 @@ impl ChannelDriver for SipChannelDriver {
         );
         sip_session.local_sdp = Some(sdp);
 
-        let chan_name = format!("PJSIP/{}", dest);
+        let counter = CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let chan_name = format!("PJSIP/{}-{:08}", dest, counter);
         let mut channel = Channel::new(chan_name);
 
         // Apply endpoint config (accountcode, etc.) if available
@@ -186,7 +196,7 @@ impl ChannelDriver for SipChannelDriver {
             }
         }
 
-        let channel_id = channel.unique_id.as_str().to_string();
+        let channel_name = channel.name.clone();
 
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(sip_session),
@@ -194,24 +204,39 @@ impl ChannelDriver for SipChannelDriver {
             transport,
         });
 
-        self.channels.write().insert(channel_id, priv_data);
+        self.channels.write().insert(channel_name, priv_data);
         Ok(channel)
     }
 
     /// Initiate the outbound call (send INVITE).
     async fn call(&self, channel: &mut Channel, dest: &str, _timeout: i32) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let mut session = priv_data.session.lock().await;
+        // Build the Request-URI. Use the full contact address so the
+        // inbound side can extract the user part as the dialed extension.
+        let request_uri = if dest.starts_with("sip:") || dest.starts_with("sips:") {
+            dest.to_string()
+        } else {
+            // Look up AOR contact for a proper Request-URI with user@host
+            let endpoint_config = crate::pjsip_config::get_global_pjsip_config();
+            let contact = endpoint_config.as_ref().and_then(|cfg| {
+                let ep = cfg.find_endpoint(dest)?;
+                let aor_name = ep.aors.as_deref().unwrap_or(dest);
+                let aor = cfg.find_aor(aor_name)?;
+                aor.contact.first().cloned()
+            });
+            contact.unwrap_or_else(|| format!("sip:{}@{}", dest, session.remote_addr))
+        };
         let to_uri = if dest.starts_with("sip:") {
             dest.to_string()
         } else {
             format!("sip:{}", dest)
         };
 
-        let invite = session.build_invite(&to_uri);
+        let invite = session.build_invite_with_uri(&request_uri, &to_uri);
 
         // Send the INVITE
         priv_data
@@ -219,6 +244,51 @@ impl ChannelDriver for SipChannelDriver {
             .send(&invite, session.remote_addr)
             .await
             .map_err(|e| AsteriskError::Internal(format!("Failed to send INVITE: {}", e)))?;
+
+        // Register Call-ID mapping and session so responses can be routed
+        // and ACK/BYE can be sent later
+        if let Some(handler) = crate::get_global_event_handler() {
+            handler.register_outbound_callid(&session.call_id, &channel.name);
+            // Create a lightweight session copy for ACK/BYE
+            let session_copy = crate::session::SipSession {
+                id: session.id.clone(),
+                state: session.state.clone(),
+                dialog: session.dialog.clone(),
+                local_sdp: session.local_sdp.clone(),
+                initial_local_sdp: None,
+                remote_sdp: session.remote_sdp.clone(),
+                rtp: None,
+                local_addr: session.local_addr,
+                remote_addr: session.remote_addr,
+                invite: session.invite.clone(),
+                is_outbound: session.is_outbound,
+                call_id: session.call_id.clone(),
+                local_tag: session.local_tag.clone(),
+                early_media: session.early_media.clone(),
+                early_media_config: session.early_media_config.clone(),
+            };
+            handler.register_outbound_session(
+                &session.call_id,
+                &channel.name,
+                session_copy,
+                session.remote_addr,
+            );
+        }
+
+        // Register outbound channel in NOTIFY service for in-dialog NOTIFY
+        {
+            let notify_state = crate::notify_service::ChannelSipState {
+                call_id: session.call_id.clone(),
+                local_tag: session.local_tag.clone(),
+                remote_tag: String::new(), // Updated when 1xx/2xx arrives
+                local_uri: format!("sip:asterisk@{}", session.local_addr),
+                remote_target: to_uri.clone(),
+                remote_addr: session.remote_addr,
+                local_seq: 100,
+            };
+            crate::notify_service::global_notify_service()
+                .register_channel(&channel.name, notify_state);
+        }
 
         channel.set_state(ChannelState::Dialing);
         info!(call_id = %session.call_id, dest, "SIP INVITE sent");
@@ -228,7 +298,7 @@ impl ChannelDriver for SipChannelDriver {
     /// Answer an inbound call (send 200 OK).
     async fn answer(&self, channel: &mut Channel) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let mut session = priv_data.session.lock().await;
@@ -251,7 +321,7 @@ impl ChannelDriver for SipChannelDriver {
 
     /// Hang up the call (send BYE).
     async fn hangup(&self, channel: &mut Channel) -> AsteriskResult<()> {
-        let priv_data = match self.remove_private(channel.unique_id.as_str()) {
+        let priv_data = match self.remove_private(&channel.name) {
             Some(p) => p,
             None => return Ok(()),
         };
@@ -273,7 +343,7 @@ impl ChannelDriver for SipChannelDriver {
     /// Read a frame (from RTP).
     async fn read_frame(&self, channel: &mut Channel) -> AsteriskResult<Frame> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let rtp_guard = priv_data.rtp.lock().await;
@@ -287,7 +357,7 @@ impl ChannelDriver for SipChannelDriver {
     /// Write a frame (to RTP).
     async fn write_frame(&self, channel: &mut Channel, frame: &Frame) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let rtp_guard = priv_data.rtp.lock().await;
@@ -301,7 +371,7 @@ impl ChannelDriver for SipChannelDriver {
     /// Send DTMF via RFC 2833.
     async fn send_digit_end(&self, channel: &mut Channel, digit: char, duration: u32) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let rtp_guard = priv_data.rtp.lock().await;
@@ -317,7 +387,7 @@ impl ChannelDriver for SipChannelDriver {
     /// Indicate a condition (send SIP signaling).
     async fn indicate(&self, channel: &mut Channel, condition: i32, _data: &[u8]) -> AsteriskResult<()> {
         let priv_data = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
         let session = priv_data.session.lock().await;
