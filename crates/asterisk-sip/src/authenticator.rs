@@ -89,6 +89,7 @@ impl InboundAuthenticator {
     ///
     /// Returns `Ok(())` if authentication succeeds, or `Err(challenge_response)`
     /// containing a 401 or 407 response to send.
+    #[allow(clippy::result_large_err)]
     pub fn verify(
         &self,
         request: &SipMessage,
@@ -217,8 +218,8 @@ impl InboundAuthenticator {
 
         let nonce = generate_nonce();
 
-        // Add a challenge for each supported algorithm.
-        for algo in &self.supported_algorithms {
+        // Add a challenge for the first preferred algorithm.
+        if let Some(algo) = self.supported_algorithms.first() {
             let challenge_value = format!(
                 "Digest realm=\"{}\", nonce=\"{}\", algorithm={}, qop=\"auth\"",
                 realm, nonce, algo.as_str()
@@ -227,8 +228,6 @@ impl InboundAuthenticator {
                 name: header_name.to_string(),
                 value: challenge_value,
             });
-            // Usually we only send one challenge (first preferred algorithm).
-            break;
         }
 
         response

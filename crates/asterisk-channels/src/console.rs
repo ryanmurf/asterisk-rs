@@ -58,6 +58,7 @@ pub enum ConsoleState {
 
 /// Per-channel private data for console channels.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ConsolePrivate {
     config: ConsoleConfig,
     state: ConsoleState,

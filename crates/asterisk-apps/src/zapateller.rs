@@ -92,6 +92,7 @@ impl DialplanApp for AppZapateller {
 
 impl AppZapateller {
     /// Execute the Zapateller application.
+    #[allow(unused_assignments)]
     pub async fn exec(channel: &mut Channel, args: &str) -> PbxExecResult {
         let options = ZapatellerOptions::parse(args);
 

@@ -86,6 +86,7 @@ pub enum HoldState {
 }
 
 /// Technology-private data for a single PJSIP channel.
+#[allow(dead_code)]
 struct PjsipPrivate {
     /// SIP Call-ID.
     call_id: String,
@@ -124,6 +125,7 @@ impl fmt::Debug for PjsipPrivate {
 
 /// Internal session state (simplified from full SIP dialog FSM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum PjsipSessionState {
     /// Channel created, INVITE not yet sent/received.
     Idle,
@@ -193,10 +195,12 @@ impl PjsipChannelDriver {
     fn resolve_dest(dest: &str) -> AsteriskResult<(String, SocketAddr)> {
         if dest.starts_with("sip:") || dest.starts_with("sips:") {
             // Full SIP URI -- extract host:port.
-            let without_scheme = if dest.starts_with("sips:") {
-                &dest[5..]
+            let without_scheme = if let Some(rest) = dest.strip_prefix("sips:") {
+                rest
+            } else if let Some(rest) = dest.strip_prefix("sip:") {
+                rest
             } else {
-                &dest[4..]
+                unreachable!()
             };
             let host_part = without_scheme.split(';').next().unwrap_or(without_scheme);
             let host_part = if let Some((_user, host)) = host_part.split_once('@') {

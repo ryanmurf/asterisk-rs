@@ -60,7 +60,7 @@ impl ResourceType {
 
     /// Convert to the libc `rlimit` resource constant.
     #[cfg(unix)]
-    fn to_rlimit_resource(&self) -> libc::c_int {
+    fn to_rlimit_resource(self) -> libc::c_int {
         match self {
             Self::OpenFiles => libc::RLIMIT_NOFILE as libc::c_int,
             Self::CoreSize => libc::RLIMIT_CORE as libc::c_int,

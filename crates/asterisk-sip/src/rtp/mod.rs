@@ -550,7 +550,7 @@ impl ComfortNoise {
     ///
     /// Returns i16 PCM samples shaped to approximate background noise.
     pub fn generate_audio(&mut self, num_samples: usize) -> Vec<i16> {
-        if self.level >= 127 {
+        if self.level == 127 {
             // Digital silence
             return vec![0i16; num_samples];
         }
@@ -639,10 +639,13 @@ impl Default for ComfortNoise {
 const RTCP_PT_RANGE_START: u8 = 200;
 const RTCP_PT_RANGE_END: u8 = 213;
 /// RTCP SDES type.
+#[allow(dead_code)]
 const RTCP_PT_SDES: u8 = 202;
 /// RTCP BYE type.
+#[allow(dead_code)]
 const RTCP_PT_BYE: u8 = 203;
 /// RTCP APP type.
+#[allow(dead_code)]
 const RTCP_PT_APP: u8 = 204;
 
 /// Result of demuxing a packet on a muxed socket.

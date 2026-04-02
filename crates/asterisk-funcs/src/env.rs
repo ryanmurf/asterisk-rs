@@ -119,7 +119,7 @@ impl DialplanFunc for FuncStat {
                     .and_then(|m| m.accessed())
                     .and_then(|t| {
                         t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map_err(|e| std::io::Error::other(e))
+                            .map_err(std::io::Error::other)
                     })
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
@@ -130,7 +130,7 @@ impl DialplanFunc for FuncStat {
                     .and_then(|m| m.modified())
                     .and_then(|t| {
                         t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map_err(|e| std::io::Error::other(e))
+                            .map_err(std::io::Error::other)
                     })
                     .map(|d| d.as_secs())
                     .unwrap_or(0);

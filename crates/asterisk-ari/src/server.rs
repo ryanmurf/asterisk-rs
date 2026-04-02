@@ -210,6 +210,7 @@ pub struct RestHandler {
     /// Whether this segment is a path variable (starts with '{').
     pub is_wildcard: bool,
     /// Handler callbacks by HTTP method.
+    #[allow(clippy::type_complexity)]
     pub callbacks: DashMap<HttpMethod, Arc<dyn Fn(&AriRequest, &AriServer) -> AriResponse + Send + Sync>>,
     /// Child handlers.
     pub children: RwLock<Vec<Arc<RestHandler>>>,

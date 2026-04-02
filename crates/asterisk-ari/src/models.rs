@@ -460,6 +460,7 @@ pub struct EventBase {
 /// All ARI events that can be sent to WebSocket clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum AriEvent {
     // Stasis lifecycle
     StasisStart {

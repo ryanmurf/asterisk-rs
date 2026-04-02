@@ -901,9 +901,9 @@ fn extract_display_name(header: &str) -> Option<String> {
     let header = header.trim();
 
     // Check for quoted display name: "Name" <sip:...>
-    if header.starts_with('"') {
-        if let Some(end_quote) = header[1..].find('"') {
-            let name = &header[1..end_quote + 1];
+    if let Some(inner) = header.strip_prefix('"') {
+        if let Some(end_quote) = inner.find('"') {
+            let name = &inner[..end_quote];
             if !name.is_empty() {
                 return Some(name.to_string());
             }

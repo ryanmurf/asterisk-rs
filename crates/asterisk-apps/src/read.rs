@@ -265,6 +265,7 @@ impl AppRead {
         let mut status = ReadStatus::Timeout;
 
         // Attempt loop
+        #[allow(clippy::never_loop)]
         for attempt in 0..parsed.attempts {
             if channel.state == ChannelState::Down {
                 status = ReadStatus::Hangup;

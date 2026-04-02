@@ -158,7 +158,7 @@ impl FollowMeOptions {
                 'B' => {
                     // Consume up to next option letter or end
                     let mut arg = String::new();
-                    while let Some(&c) = chars.peek() {
+                    if let Some(&c) = chars.peek() {
                         if c == '(' {
                             chars.next();
                             for inner in chars.by_ref() {
@@ -167,9 +167,7 @@ impl FollowMeOptions {
                                 }
                                 arg.push(inner);
                             }
-                            break;
                         }
-                        break;
                     }
                     if !arg.is_empty() {
                         result.predial_caller = Some(arg);
@@ -177,7 +175,7 @@ impl FollowMeOptions {
                 }
                 'b' => {
                     let mut arg = String::new();
-                    while let Some(&c) = chars.peek() {
+                    if let Some(&c) = chars.peek() {
                         if c == '(' {
                             chars.next();
                             for inner in chars.by_ref() {
@@ -186,9 +184,7 @@ impl FollowMeOptions {
                                 }
                                 arg.push(inner);
                             }
-                            break;
                         }
-                        break;
                     }
                     if !arg.is_empty() {
                         result.predial_callee = Some(arg);

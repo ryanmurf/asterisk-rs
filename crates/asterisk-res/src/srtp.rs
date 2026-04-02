@@ -329,6 +329,7 @@ impl SdesCrypto {
 /// this would use `aes`, `hmac`, and `sha1` crates, or bind to libsrtp2.
 /// The interface and key management are fully implemented.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SrtpSession {
     /// Cipher suite in use.
     suite: SrtpSuite,

@@ -179,6 +179,7 @@ struct CacheEntry {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum CachedData {
     /// Resolved IP addresses.
     Addresses(Vec<IpAddr>),
@@ -198,6 +199,7 @@ impl CacheEntry {
 
 /// TTL-based DNS cache with negative caching.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct DnsCache {
     entries: RwLock<HashMap<String, CacheEntry>>,
     /// Default TTL for negative cache entries.
@@ -231,6 +233,7 @@ impl DnsCache {
     }
 
     /// Store SRV records.
+    #[allow(dead_code)]
     fn put_srv(&self, name: &str, records: Vec<SrvRecord>, ttl: Duration) {
         let entry = CacheEntry {
             data: CachedData::Srv(records),
@@ -240,6 +243,7 @@ impl DnsCache {
     }
 
     /// Store a negative (NXDOMAIN) entry.
+    #[allow(dead_code)]
     fn put_nxdomain(&self, name: &str) {
         let entry = CacheEntry {
             data: CachedData::NxDomain,
@@ -262,6 +266,7 @@ impl DnsCache {
     }
 
     /// Retrieve SRV records if cached and not expired.
+    #[allow(dead_code)]
     fn get_srv(&self, name: &str) -> Option<Vec<SrvRecord>> {
         let entries = self.entries.read();
         let entry = entries.get(name)?;

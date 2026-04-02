@@ -156,6 +156,7 @@ impl Default for AggregatedMwi {
 ///
 /// This creates the full SIP NOTIFY message with a
 /// `application/simple-message-summary` body.
+#[allow(clippy::too_many_arguments)]
 pub fn build_mwi_notify(
     to_uri: &str,
     from_uri: &str,

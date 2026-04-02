@@ -70,6 +70,7 @@ impl BridgeMediaType {
 
 /// Shared state between the two halves of a bridge media pair.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct BridgeMediaPair {
     pair_id: u64,
     media_type: BridgeMediaType,

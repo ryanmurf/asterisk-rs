@@ -182,6 +182,7 @@ pub struct OdbcColumnInfo {
 /// and field criteria, executed via ODBC. In this Rust port the actual ODBC
 /// connection is stubbed; the SQL generation and interface are complete.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OdbcRealtimeDriver {
     /// DSN configurations keyed by database name.
     dsn_map: RwLock<HashMap<String, OdbcConnectionConfig>>,

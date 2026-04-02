@@ -189,19 +189,19 @@ impl LiveRecording {
         if self.state.is_terminal() {
             return Err(RecordingError::InvalidTransition(self.state, new_state));
         }
-        let valid = match (self.state, new_state) {
-            (RecordingState::Queued, RecordingState::Recording) => true,
-            (RecordingState::Recording, RecordingState::Paused) => true,
-            (RecordingState::Recording, RecordingState::Complete) => true,
-            (RecordingState::Recording, RecordingState::Failed) => true,
-            (RecordingState::Recording, RecordingState::Canceled) => true,
-            (RecordingState::Paused, RecordingState::Recording) => true,
-            (RecordingState::Paused, RecordingState::Complete) => true,
-            (RecordingState::Paused, RecordingState::Canceled) => true,
-            (RecordingState::Queued, RecordingState::Failed) => true,
-            (RecordingState::Queued, RecordingState::Canceled) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (self.state, new_state),
+            (RecordingState::Queued, RecordingState::Recording)
+                | (RecordingState::Recording, RecordingState::Paused)
+                | (RecordingState::Recording, RecordingState::Complete)
+                | (RecordingState::Recording, RecordingState::Failed)
+                | (RecordingState::Recording, RecordingState::Canceled)
+                | (RecordingState::Paused, RecordingState::Recording)
+                | (RecordingState::Paused, RecordingState::Complete)
+                | (RecordingState::Paused, RecordingState::Canceled)
+                | (RecordingState::Queued, RecordingState::Failed)
+                | (RecordingState::Queued, RecordingState::Canceled)
+        );
         if !valid {
             return Err(RecordingError::InvalidTransition(self.state, new_state));
         }

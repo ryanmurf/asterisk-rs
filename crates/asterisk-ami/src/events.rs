@@ -122,6 +122,7 @@ pub struct EventBuilder;
 
 impl EventBuilder {
     /// Create a Newchannel event.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_channel(
         channel: &str,
         channel_state: &str,
@@ -172,6 +173,7 @@ impl EventBuilder {
     }
 
     /// Create a Dial event.
+    #[allow(clippy::too_many_arguments)]
     pub fn dial(
         sub_event: &str,
         channel: &str,

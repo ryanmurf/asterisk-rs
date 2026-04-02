@@ -652,6 +652,7 @@ pub fn encode_channel_data(channel: u16, data: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
     buf.extend_from_slice(data);
     // Pad to 4-byte boundary
+    #[allow(clippy::same_item_push)]
     for _ in data.len()..padded_len {
         buf.push(0);
     }

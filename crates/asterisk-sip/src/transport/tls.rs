@@ -80,7 +80,8 @@ impl Default for TlsConfig {
 
 /// State of a pooled TLS connection.
 #[derive(Debug)]
-struct TlsConnection {
+#[allow(dead_code)]
+pub(crate) struct TlsConnection {
     /// The underlying TCP stream.
     /// In a real implementation, this would be wrapped by a TLS layer
     /// (e.g., tokio_rustls::TlsStream or openssl::ssl::SslStream).
@@ -130,6 +131,7 @@ impl ConnectionPool {
     }
 
     /// Remove a connection from the pool.
+    #[allow(dead_code)]
     fn remove(&mut self, addr: &SocketAddr) {
         if let Some(conns) = self.connections.get_mut(addr) {
             if !conns.is_empty() {
@@ -162,6 +164,7 @@ impl fmt::Debug for TlsTransport {
     }
 }
 
+#[allow(dead_code)]
 impl TlsTransport {
     /// Bind a TLS transport to the given address.
     pub async fn bind(
@@ -185,7 +188,7 @@ impl TlsTransport {
     ///
     /// Performs the TLS handshake and returns the first SIP message
     /// received on the connection.
-    pub async fn accept(
+    pub(crate) async fn accept(
         &self,
     ) -> Result<(SipMessage, SocketAddr, Arc<TlsConnection>), TransportError> {
         let (stream, addr) = self.listener.accept().await?;
@@ -332,11 +335,13 @@ impl SipTransport for TlsTransport {
 }
 
 /// Find the end of headers (\r\n\r\n) in a buffer.
+#[allow(dead_code)]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 /// Extract Content-Length from raw header text.
+#[allow(dead_code)]
 fn extract_content_length(headers: &str) -> usize {
     for line in headers.lines() {
         let lower = line.to_lowercase();

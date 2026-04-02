@@ -152,6 +152,7 @@ impl StatsdClient {
     }
 
     /// Build the full metric name with prefix.
+    #[allow(dead_code)]
     fn full_name(&self, name: &str) -> String {
         let config = self.config.read();
         if config.prefix.is_empty() {

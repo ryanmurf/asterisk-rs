@@ -298,6 +298,7 @@ impl RawAttribute {
         buf.extend_from_slice(&(attr_len as u16).to_be_bytes());
         buf.extend_from_slice(&self.value);
         // Pad to 4-byte boundary
+        #[allow(clippy::same_item_push)]
         for _ in attr_len..padded {
             buf.push(0);
         }

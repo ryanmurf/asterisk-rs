@@ -12,7 +12,7 @@ use asterisk_types::ChannelState;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
@@ -192,7 +192,7 @@ impl GreetingState {
     }
 
     /// Get the file path for a greeting within a mailbox directory.
-    pub fn greeting_path(mailbox_dir: &PathBuf, gtype: GreetingType) -> PathBuf {
+    pub fn greeting_path(mailbox_dir: &Path, gtype: GreetingType) -> PathBuf {
         mailbox_dir.join(gtype.file_name())
     }
 }
@@ -353,7 +353,7 @@ impl PlaybackState {
     }
 
     /// Move to the next message. Returns false if at end.
-    pub fn next(&mut self) -> bool {
+    pub fn advance(&mut self) -> bool {
         if self.current_message_index + 1 < self.total_messages {
             self.current_message_index += 1;
             self.heard = false;
@@ -2271,14 +2271,14 @@ mod tests {
         let mut state = PlaybackState::new(VoicemailFolder::Inbox, 3);
         assert_eq!(state.current_message_index, 0);
 
-        assert!(state.next());
+        assert!(state.advance());
         assert_eq!(state.current_message_index, 1);
 
-        assert!(state.next());
+        assert!(state.advance());
         assert_eq!(state.current_message_index, 2);
 
         // At end, can't go further
-        assert!(!state.next());
+        assert!(!state.advance());
         assert_eq!(state.current_message_index, 2);
 
         // Go back
@@ -2727,7 +2727,7 @@ format=wav
     #[test]
     fn test_adversarial_playback_zero_messages() {
         let mut state = PlaybackState::new(VoicemailFolder::Inbox, 0);
-        assert!(!state.next());
+        assert!(!state.advance());
         assert!(!state.previous());
         assert_eq!(state.current_message_index, 0);
     }
@@ -2736,7 +2736,7 @@ format=wav
     #[test]
     fn test_adversarial_playback_one_message() {
         let mut state = PlaybackState::new(VoicemailFolder::Inbox, 1);
-        assert!(!state.next()); // Only one message, can't go forward
+        assert!(!state.advance()); // Only one message, can't go forward
         assert!(!state.previous()); // Can't go back from 0
         assert_eq!(state.current_message_index, 0);
     }

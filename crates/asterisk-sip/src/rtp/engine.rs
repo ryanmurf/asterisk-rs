@@ -222,6 +222,7 @@ pub struct RtpGlue {
     /// Module name providing this glue.
     pub module_name: &'static str,
     /// Callback to get the RTP instance from a channel.
+    #[allow(clippy::type_complexity)]
     get_rtp: Box<dyn Fn(&str) -> Option<Arc<RtpInstance>> + Send + Sync>,
 }
 
