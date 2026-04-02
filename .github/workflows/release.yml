@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: asterisk
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: asterisk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.artifact }} dist/ || true
+          cp LICENSE README.md dist/
+          tar czf asterisk-rs-${{ matrix.target }}.tar.gz -C dist .
+      - name: Upload Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: asterisk-rs-*.tar.gz
