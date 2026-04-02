@@ -332,10 +332,10 @@ mod tests {
     #[tokio::test]
     async fn test_agi_standard() {
         let mut channel = Channel::new("SIP/test-002");
-        // The script doesn't exist, so exec_standard returns Failed (NOTFOUND)
+        // The script doesn't exist, so exec_standard returns Failed
         let result = AppAgi::exec(&mut channel, "/tmp/test.sh,arg1,arg2").await;
         assert_eq!(result, PbxExecResult::Failed);
-        assert_eq!(channel.get_variable("AGISTATUS"), Some("NOTFOUND"));
+        assert_eq!(channel.get_variable("AGISTATUS"), Some("FAILURE"));
     }
 
     #[tokio::test]

@@ -145,6 +145,7 @@ pub fn parse_update_sdp(msg: &SipMessage) -> Option<SessionDescription> {
 mod tests {
     use super::*;
     use crate::dialog::{Dialog, DialogState};
+    use crate::parser::StartLine;
     use crate::sdp::SessionDescription;
     use asterisk_codecs::Codec;
 
