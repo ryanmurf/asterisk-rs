@@ -27,7 +27,7 @@ impl DialplanFunc for FuncSrvQuery {
         "SRVQUERY"
     }
 
-    fn read(&self, ctx: &FuncContext, args: &str) -> FuncResult {
+    fn read(&self, _ctx: &FuncContext, args: &str) -> FuncResult {
         let service = args.trim();
         if service.is_empty() {
             return Err(FuncError::InvalidArgument(
@@ -39,7 +39,7 @@ impl DialplanFunc for FuncSrvQuery {
         // Store a query ID in channel variables
         let query_id = format!("srv_{}", service.replace('.', "_"));
         // Store 0 results by default
-        let count_var = format!("{}_count", query_id);
+        let _count_var = format!("{}_count", query_id);
         // We can't mutate ctx here (read-only), so just return the ID
         // In production, results would be stored in a channel datastore
         Ok(query_id)

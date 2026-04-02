@@ -71,8 +71,7 @@ impl DialplanFunc for FuncTimeout {
 
         // Read from channel variables; return default if not set
         let value = ctx
-            .get_variable(timeout_type.var_name())
-            .map(|v| v.clone())
+            .get_variable(timeout_type.var_name()).cloned()
             .unwrap_or_else(|| format!("{:.6}", timeout_type.default_seconds()));
 
         Ok(value)

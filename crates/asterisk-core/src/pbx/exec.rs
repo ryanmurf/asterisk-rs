@@ -244,14 +244,13 @@ pub async fn pbx_run(
                     );
 
                     // Try error extension 'e'
-                    if exten != "e" {
-                        if dialplan.find_extension(&context, "e").is_some() {
+                    if exten != "e"
+                        && dialplan.find_extension(&context, "e").is_some() {
                             let mut chan = channel.lock().await;
                             chan.exten = "e".to_string();
                             chan.priority = 1;
                             continue;
                         }
-                    }
 
                     error = true;
                     break;

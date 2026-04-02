@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 ///
 /// Port of `static struct ao2_container *bridges;` from bridge.c.
 static BRIDGE_STORE: LazyLock<DashMap<String, Arc<Mutex<Bridge>>>> =
-    LazyLock::new(|| DashMap::new());
+    LazyLock::new(DashMap::new);
 
 /// Find a bridge by its unique ID.
 pub fn find_bridge(id: &str) -> Option<Arc<Mutex<Bridge>>> {
@@ -431,11 +431,7 @@ pub async fn bridge_leave(
             false // Already dissolving.
         } else if br.flags.contains(BridgeFlags::DISSOLVE_EMPTY) && br.num_channels() == 0 {
             true
-        } else if br.flags.contains(BridgeFlags::DISSOLVE_HANGUP) && br.num_channels() < 2 {
-            true
-        } else {
-            false
-        }
+        } else { br.flags.contains(BridgeFlags::DISSOLVE_HANGUP) && br.num_channels() < 2 }
     };
 
     if should_dissolve {

@@ -20,8 +20,10 @@ static HOLDING_BRIDGES: once_cell::sync::Lazy<DashMap<String, Arc<RwLock<Holding
 
 /// Entertainment mode for channels in a holding bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EntertainmentMode {
     /// Play music on hold (default).
+    #[default]
     MusicOnHold,
     /// Ring without pause.
     Ringing,
@@ -57,16 +59,13 @@ impl EntertainmentMode {
     }
 }
 
-impl Default for EntertainmentMode {
-    fn default() -> Self {
-        Self::MusicOnHold
-    }
-}
 
 /// Role of a channel in a holding bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum HoldingRole {
     /// A normal participant being held.
+    #[default]
     Participant,
     /// An announcer whose audio is played to all participants.
     Announcer,
@@ -82,11 +81,6 @@ impl HoldingRole {
     }
 }
 
-impl Default for HoldingRole {
-    fn default() -> Self {
-        Self::Participant
-    }
-}
 
 /// Options for BridgeWait.
 #[derive(Debug, Clone)]

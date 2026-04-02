@@ -4,7 +4,6 @@
 //! with the Realtime configuration engine: load, update, store, and
 //! destroy operations against realtime backends (ODBC, PostgreSQL, etc.).
 
-use std::collections::HashMap;
 
 use thiserror::Error;
 use tracing::debug;

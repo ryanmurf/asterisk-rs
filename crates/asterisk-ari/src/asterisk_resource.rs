@@ -69,16 +69,16 @@ pub fn build_asterisk_routes() -> Arc<RestHandler> {
     );
 
     // /asterisk
-    let asterisk = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("asterisk")
             .child(ping)
             .child(info)
             .child(modules)
             .child(variable)
             .child(config),
-    );
-
-    asterisk
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -101,10 +101,10 @@ fn handle_get_info(req: &AriRequest, _server: &AriServer) -> AriResponse {
     let only: Vec<&str> = req.query_params_multi("only");
 
     let include_all = only.is_empty();
-    let include_build = include_all || only.iter().any(|s| *s == "build");
-    let include_system = include_all || only.iter().any(|s| *s == "system");
-    let include_config = include_all || only.iter().any(|s| *s == "config");
-    let include_status = include_all || only.iter().any(|s| *s == "status");
+    let include_build = include_all || only.contains(&"build");
+    let include_system = include_all || only.contains(&"system");
+    let include_config = include_all || only.contains(&"config");
+    let include_status = include_all || only.contains(&"status");
 
     let info = AsteriskInfo {
         build: if include_build {

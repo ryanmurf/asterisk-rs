@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -241,7 +241,7 @@ impl XmppClient {
     }
 
     /// Send a message to a JID (JabberSend application).
-    pub fn send_message(&self, to: &str, body: &str) -> XmppResult<()> {
+    pub fn send_message(&self, to: &str, _body: &str) -> XmppResult<()> {
         if !self.is_connected() {
             return Err(XmppError::ConnectionError("not connected".to_string()));
         }

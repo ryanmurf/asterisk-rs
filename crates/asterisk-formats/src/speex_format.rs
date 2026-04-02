@@ -16,10 +16,8 @@
 //! operations return errors until the dependencies are linked.
 
 use crate::traits::{FileFormat, FileStream, FileWriter, FormatError};
-use asterisk_codecs::builtin_codecs::{CODEC_SPEEX8, ID_SPEEX8};
+use asterisk_codecs::builtin_codecs::CODEC_SPEEX8;
 use asterisk_codecs::format::Format;
-use asterisk_types::Frame;
-use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
 

@@ -257,12 +257,12 @@ impl G726State {
         };
 
         // Update step size index
-        self.step_index = (self.step_index + adapt_idx).max(0).min(48);
+        self.step_index = (self.step_index + adapt_idx).clamp(0, 48);
 
         // Update step size from index
         // Step sizes roughly double every 8 steps
         self.step_size = 8 * (1 << (self.step_index / 4));
-        self.step_size = self.step_size.max(1).min(32767);
+        self.step_size = self.step_size.clamp(1, 32767);
 
         // Update predictor poles
         let p0 = self.poles[0];
@@ -283,7 +283,7 @@ impl G726State {
             };
 
         // Clamp poles
-        self.poles[0] = self.poles[0].max(-12288).min(12288);
+        self.poles[0] = self.poles[0].clamp(-12288, 12288);
         let limit = 12288i32.min(15360 - self.poles[0].abs());
         self.poles[1] = self.poles[1].max(-limit).min(limit);
 
@@ -310,7 +310,7 @@ impl G726State {
         let sp = self.poles[0] as i64 * self.prev_sr[0] as i64
             + self.poles[1] as i64 * self.prev_sr[1] as i64;
         self.predicted = ((sp + sz) >> 14) as i32;
-        self.predicted = self.predicted.max(-32768).min(32767);
+        self.predicted = self.predicted.clamp(-32768, 32767);
 
         self.prev_sr[1] = self.prev_sr[0];
         self.prev_sr[0] = sr;
@@ -323,7 +323,7 @@ impl G726State {
         let d = sample as i32 - self.predicted;
         let code = self.quantize(d);
         let dq = self.inverse_quantize(code);
-        let sr = (self.predicted + dq).max(-32768).min(32767);
+        let sr = (self.predicted + dq).clamp(-32768, 32767);
         self.adapt(code, dq, sr);
         code
     }
@@ -331,7 +331,7 @@ impl G726State {
     /// Decode one ADPCM code to a PCM sample.
     pub fn decode_sample(&mut self, code: i32) -> i16 {
         let dq = self.inverse_quantize(code);
-        let sr = (self.predicted + dq).max(-32768).min(32767);
+        let sr = (self.predicted + dq).clamp(-32768, 32767);
         self.adapt(code, dq, sr);
         sr as i16
     }

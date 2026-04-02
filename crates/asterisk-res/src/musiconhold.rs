@@ -39,8 +39,10 @@ pub type MohResult<T> = Result<T, MohError>;
 
 /// Music on Hold playback mode (from `res_musiconhold.c` MOH_* flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MohMode {
     /// Play audio files from a directory. This is the most common mode.
+    #[default]
     Files,
     /// Use a custom external application to stream audio.
     Custom,
@@ -73,11 +75,6 @@ impl MohMode {
     }
 }
 
-impl Default for MohMode {
-    fn default() -> Self {
-        Self::Files
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Sort mode
@@ -85,8 +82,10 @@ impl Default for MohMode {
 
 /// How files are ordered within a MOH class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MohSortMode {
     /// Linear playback in filesystem order.
+    #[default]
     Linear,
     /// Fully random selection each time.
     Random,
@@ -117,11 +116,6 @@ impl MohSortMode {
     }
 }
 
-impl Default for MohSortMode {
-    fn default() -> Self {
-        Self::Linear
-    }
-}
 
 // ---------------------------------------------------------------------------
 // MOH class flags (mirror C MOH_* flags)
@@ -522,7 +516,7 @@ impl MohManager {
 
     /// Check if a channel currently has MOH active.
     pub fn is_moh_active(&self, channel_id: &str) -> bool {
-        self.players.read().get(channel_id).map_or(false, |p| p.active)
+        self.players.read().get(channel_id).is_some_and(|p| p.active)
     }
 
     /// Get the number of active MOH sessions.

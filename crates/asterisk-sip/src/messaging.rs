@@ -280,13 +280,13 @@ pub fn build_message(
 
 fn extract_from(msg: &SipMessage) -> String {
     msg.from_header()
-        .and_then(|h| extract_uri(h))
+        .and_then(extract_uri)
         .unwrap_or_default()
 }
 
 fn extract_to(msg: &SipMessage) -> String {
     msg.to_header()
-        .and_then(|h| extract_uri(h))
+        .and_then(extract_uri)
         .unwrap_or_default()
 }
 

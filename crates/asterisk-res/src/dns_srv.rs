@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::net;
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Core record types
@@ -322,7 +322,7 @@ impl Default for DnsCache {
 /// Records with weight 0 have a small but non-zero chance of being selected.
 /// The probability of selecting a record is proportional to its weight
 /// relative to the sum of all weights in the group.
-pub fn weighted_select<'a>(records: &'a [SrvRecord]) -> Option<&'a SrvRecord> {
+pub fn weighted_select(records: &[SrvRecord]) -> Option<&SrvRecord> {
     if records.is_empty() {
         return None;
     }

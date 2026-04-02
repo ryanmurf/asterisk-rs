@@ -119,7 +119,7 @@ fn substitute_recursive(
                             Ok(expr_result) => result.push_str(&expr_result),
                             Err(e) => {
                                 tracing::warn!("Expression evaluation error: {}", e);
-                                result.push_str("0");
+                                result.push('0');
                             }
                         }
 

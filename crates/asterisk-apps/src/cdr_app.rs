@@ -6,7 +6,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Options for the ResetCDR application.
 #[derive(Debug, Clone, Default)]

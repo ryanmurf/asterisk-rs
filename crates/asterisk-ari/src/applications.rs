@@ -352,13 +352,13 @@ pub fn build_applications_routes() -> Arc<RestHandler> {
     );
 
     // /applications
-    let applications = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("applications")
             .on(HttpMethod::Get, handle_list)
             .child(app_by_name),
-    );
-
-    applications
+    )
 }
 
 /// GET /applications -- list all Stasis applications.

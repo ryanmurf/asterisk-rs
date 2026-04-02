@@ -372,9 +372,8 @@ fn json_get_string(json: &str, key: &str) -> Option<String> {
     let start = json.find(&pattern)?;
     let after_key = start + pattern.len();
     let rest = json[after_key..].trim_start();
-    if rest.starts_with('"') {
+    if let Some(inner) = rest.strip_prefix('"') {
         // String value — find the closing quote (handle escaped quotes).
-        let inner = &rest[1..];
         let mut result = String::new();
         let mut chars = inner.chars();
         loop {
@@ -432,22 +431,19 @@ fn json_get_tn(json: &str, outer_key: &str) -> Option<String> {
     let tn_start = obj.find(tn_pattern)?;
     let tn_rest = obj[tn_start + tn_pattern.len()..].trim_start();
 
-    if tn_rest.starts_with('[') {
+    if let Some(inner) = tn_rest.strip_prefix('[') {
         // Array form: ["12345"]
-        let inner = &tn_rest[1..];
         let arr_end = inner.find(']')?;
         let arr_content = inner[..arr_end].trim();
         // Extract first string in array.
-        if arr_content.starts_with('"') {
-            let s = &arr_content[1..];
+        if let Some(s) = arr_content.strip_prefix('"') {
             let end = s.find('"')?;
             Some(s[..end].to_string())
         } else {
             None
         }
-    } else if tn_rest.starts_with('"') {
+    } else if let Some(inner) = tn_rest.strip_prefix('"') {
         // Direct string form: "12345"
-        let inner = &tn_rest[1..];
         let end = inner.find('"')?;
         Some(inner[..end].to_string())
     } else {

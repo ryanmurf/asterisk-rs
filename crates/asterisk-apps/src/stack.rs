@@ -256,9 +256,9 @@ impl AppGoSub {
 
         // Set arguments as channel variables ARG1, ARG2, etc.
         // Also set ARGC to the number of arguments
-        channel.set_variable("ARGC", &dest.arguments.len().to_string());
+        channel.set_variable("ARGC", dest.arguments.len().to_string());
         for (i, arg) in dest.arguments.iter().enumerate() {
-            channel.set_variable(&format!("ARG{}", i + 1), arg);
+            channel.set_variable(format!("ARG{}", i + 1), arg);
         }
 
         // Update channel position
@@ -422,7 +422,7 @@ impl AppGoSubIf {
         };
 
         // Evaluate condition: non-empty, non-zero string is true
-        let is_true = !condition.is_empty() && condition != "0" && condition != "";
+        let is_true = !condition.is_empty() && condition != "0" && !condition.is_empty();
 
         let target = if is_true {
             // Use label before ':'

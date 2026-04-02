@@ -5,11 +5,10 @@
 //! and delete configuration rows from a database.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config_curl::ConfigRealtimeDriver;
 

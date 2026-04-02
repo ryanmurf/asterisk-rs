@@ -114,11 +114,7 @@ impl MediaUri {
             Some(Self::Digits(rest.to_string()))
         } else if let Some(rest) = uri.strip_prefix("characters:") {
             Some(Self::Characters(rest.to_string()))
-        } else if let Some(rest) = uri.strip_prefix("tone:") {
-            Some(Self::Tone(rest.to_string()))
-        } else {
-            None
-        }
+        } else { uri.strip_prefix("tone:").map(|rest| Self::Tone(rest.to_string())) }
     }
 
     /// Convert back to URI string.

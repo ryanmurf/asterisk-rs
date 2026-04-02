@@ -74,7 +74,7 @@ impl PgsqlCdrBackend {
     }
 
     /// Generate parameterized INSERT.
-    pub fn build_insert_sql(&self, cdr: &Cdr) -> String {
+    pub fn build_insert_sql(&self, _cdr: &Cdr) -> String {
         format!(
             "INSERT INTO {} (accountcode,src,dst,dcontext,clid,channel,dstchannel,lastapp,lastdata,duration,billsec,disposition,amaflags,uniqueid,userfield,linkedid,peeraccount,sequence) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
             self.config.table,

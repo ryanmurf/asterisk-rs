@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;

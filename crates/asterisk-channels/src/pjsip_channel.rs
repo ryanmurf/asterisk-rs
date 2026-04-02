@@ -22,8 +22,10 @@ use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, 
 
 /// DTMF delivery method for a PJSIP channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum DtmfMode {
     /// RFC 2833 telephone-event RTP payloads.
+    #[default]
     Rfc2833,
     /// SIP INFO messages carrying `application/dtmf-relay`.
     Info,
@@ -33,16 +35,13 @@ pub enum DtmfMode {
     Auto,
 }
 
-impl Default for DtmfMode {
-    fn default() -> Self {
-        Self::Rfc2833
-    }
-}
 
 /// T.38 fax gateway state (stub).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum T38State {
     /// T.38 not active.
+    #[default]
     Disabled,
     /// Local side proposed T.38.
     LocalReinvite,
@@ -54,11 +53,6 @@ pub enum T38State {
     Rejected,
 }
 
-impl Default for T38State {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 /// Endpoint-level configuration applied to every channel created for this
 /// PJSIP endpoint.

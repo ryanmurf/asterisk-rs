@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use tracing::{debug, info};
 
 use asterisk_core::channel::{Channel, ChannelDriver};
-use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
+use asterisk_types::{AsteriskResult, ChannelState, Frame};
 
 /// Console channel configuration.
 #[derive(Debug, Clone)]

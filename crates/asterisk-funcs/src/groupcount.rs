@@ -122,11 +122,10 @@ impl DialplanFunc for FuncGroupList {
                 if cat.starts_with("LIST_") {
                     continue; // Skip list metadata
                 }
-                if filter_category.is_empty() || cat == filter_category {
-                    if !value.is_empty() {
+                if (filter_category.is_empty() || cat == filter_category)
+                    && !value.is_empty() {
                         result.push(format!("{}@{}", value, cat));
                     }
-                }
             }
         }
 

@@ -156,6 +156,7 @@ impl NoiseSuppressor {
     ///
     /// Input frame should be `fft_size` samples.
     /// Returns a noise-suppressed frame of `fft_size / 2` samples (due to overlap-add with 50% overlap).
+    #[allow(clippy::needless_range_loop)]
     pub fn process(&mut self, frame: &[i16]) -> Vec<i16> {
         let n = self.fft_size;
         let half = n / 2 + 1;
@@ -280,6 +281,7 @@ impl NoiseSuppressor {
 /// Compute the real-valued FFT of a signal using radix-2 DIT.
 ///
 /// Returns (real, imaginary) parts for bins 0..=N/2.
+#[allow(clippy::needless_range_loop)]
 fn real_fft(signal: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
     // DFT via direct computation (O(N^2) but correct for small N)
     let half = n / 2 + 1;
@@ -302,6 +304,7 @@ fn real_fft(signal: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 /// Compute the inverse FFT, returning real-valued samples.
+#[allow(clippy::needless_range_loop)]
 fn real_ifft(re: &[f32], im: &[f32], n: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; n];
     let inv_n = 1.0 / n as f32;

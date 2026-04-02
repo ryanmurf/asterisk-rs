@@ -3,9 +3,7 @@
 //! Port of `res/res_statsd.c`. Provides a UDP client for sending metrics
 //! (counters, gauges, timers, meters, sets) to a StatsD server.
 
-use std::fmt;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 
 use parking_lot::RwLock;
 use thiserror::Error;

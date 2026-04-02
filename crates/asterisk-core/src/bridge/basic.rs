@@ -132,8 +132,10 @@ impl BasicBridgePersonality {
 
 /// After-bridge action: what to do when a channel leaves the bridge.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum AfterBridgeAction {
     /// No action -- channel returns to dialplan.
+    #[default]
     None,
     /// GoTo a specific dialplan location after bridge.
     GoTo {
@@ -148,11 +150,6 @@ pub enum AfterBridgeAction {
     },
 }
 
-impl Default for AfterBridgeAction {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// A basic bridge -- the standard two-party bridge used by Dial().
 ///

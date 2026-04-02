@@ -58,14 +58,14 @@ pub fn build_bridges_routes() -> Arc<RestHandler> {
     );
 
     // /bridges
-    let bridges = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("bridges")
             .on(HttpMethod::Get, handle_list)
             .on(HttpMethod::Post, handle_create)
             .child(bridge_by_id),
-    );
-
-    bridges
+    )
 }
 
 // ---------------------------------------------------------------------------

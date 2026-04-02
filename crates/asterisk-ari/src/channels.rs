@@ -4,14 +4,14 @@
 //! ARI endpoints: list, originate, get, hangup, answer, ring, DTMF,
 //! mute, hold, play, record, variable get/set, snoop, and dial.
 
-use crate::error::{AriErrorKind, AriResult};
+use crate::error::AriErrorKind;
 use crate::models::*;
 use crate::server::{AriRequest, AriResponse, AriServer, HttpMethod, RestHandler};
 use std::sync::Arc;
 
 /// Build the /channels route subtree.
 pub fn build_channels_routes() -> Arc<RestHandler> {
-    let channels = Arc::new(
+    let _channels = Arc::new(
         RestHandler::new("channels")
             .on(HttpMethod::Get, handle_list)
             .on(HttpMethod::Post, handle_originate),
@@ -23,7 +23,7 @@ pub fn build_channels_routes() -> Arc<RestHandler> {
     );
 
     // /channels/{channelId}
-    let channel_by_id = Arc::new(
+    let _channel_by_id = Arc::new(
         RestHandler::new("{channelId}")
             .on(HttpMethod::Get, handle_get)
             .on(HttpMethod::Post, handle_originate_with_id)
@@ -132,15 +132,15 @@ pub fn build_channels_routes() -> Arc<RestHandler> {
             .child(move_handler),
     );
 
-    let channels = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("channels")
             .on(HttpMethod::Get, handle_list)
             .on(HttpMethod::Post, handle_originate)
             .child(create)
             .child(channel_by_id),
-    );
-
-    channels
+    )
 }
 
 // ---------------------------------------------------------------------------

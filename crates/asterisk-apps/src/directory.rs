@@ -45,8 +45,10 @@ impl DirectoryResult {
 
 /// Search mode for the directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum DirectorySearchMode {
     /// Search by last name (default).
+    #[default]
     LastName,
     /// Search by first name.
     FirstName,
@@ -54,11 +56,6 @@ pub enum DirectorySearchMode {
     Both,
 }
 
-impl Default for DirectorySearchMode {
-    fn default() -> Self {
-        Self::LastName
-    }
-}
 
 /// Options for the Directory application.
 #[derive(Debug, Clone)]

@@ -119,7 +119,7 @@ impl SoftmixData {
 
         // Step 1: Compute the total sum of all channels.
         let mut total_mix = vec![0i32; num_samples];
-        for (_, chan_data) in &self.channel_buffers {
+        for chan_data in self.channel_buffers.values() {
             if chan_data.have_audio {
                 for i in 0..num_samples {
                     if i < chan_data.our_buf.len() {

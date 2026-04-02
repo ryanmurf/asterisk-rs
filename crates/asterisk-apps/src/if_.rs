@@ -226,11 +226,10 @@ fn evaluate_time_spec(spec: &str) -> bool {
     }
 
     // Check weekdays (e.g. "mon-fri")
-    if parts[1] != "*" {
-        if !weekday_range_matches(parts[1], weekday) {
+    if parts[1] != "*"
+        && !weekday_range_matches(parts[1], weekday) {
             return false;
         }
-    }
 
     // Check month days (e.g. "1-15")
     if parts[2] != "*" {
@@ -242,11 +241,10 @@ fn evaluate_time_spec(spec: &str) -> bool {
     }
 
     // Check months (e.g. "jan-dec")
-    if parts[3] != "*" {
-        if !month_range_matches(parts[3], month) {
+    if parts[3] != "*"
+        && !month_range_matches(parts[3], month) {
             return false;
         }
-    }
 
     true
 }
@@ -285,7 +283,7 @@ fn approximate_month_day(secs: u64) -> (u32, u32) {
 }
 
 fn is_leap_year(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 fn parse_time_of_day(s: &str) -> Option<i32> {

@@ -220,10 +220,12 @@ impl SmdiMwiMessage {
 
 /// Serial port baud rates supported by SMDI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SmdiSpeed {
     B1200,
     B2400,
     B4800,
+    #[default]
     B9600,
 }
 
@@ -248,11 +250,6 @@ impl SmdiSpeed {
     }
 }
 
-impl Default for SmdiSpeed {
-    fn default() -> Self {
-        Self::B9600
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SMDI interface

@@ -156,7 +156,7 @@ impl AppTransfer {
         );
 
         channel.set_variable("TRANSFERSTATUS", status.as_str());
-        channel.set_variable("TRANSFERSTATUSPROTOCOL", &protocol_code.to_string());
+        channel.set_variable("TRANSFERSTATUSPROTOCOL", protocol_code.to_string());
 
         PbxExecResult::Success
     }

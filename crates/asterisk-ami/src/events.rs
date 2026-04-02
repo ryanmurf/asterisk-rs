@@ -153,7 +153,7 @@ impl EventBuilder {
         AmiEvent::new("Hangup", EventCategory::CALL.0)
             .with_header("Channel", channel)
             .with_header("Uniqueid", unique_id)
-            .with_header("Cause", &cause.to_string())
+            .with_header("Cause", cause.to_string())
             .with_header("Cause-txt", cause_txt)
     }
 
@@ -224,7 +224,7 @@ impl EventBuilder {
         AmiEvent::new("DTMFBegin", EventCategory::DTMF.0)
             .with_header("Channel", channel)
             .with_header("Uniqueid", unique_id)
-            .with_header("Digit", &digit.to_string())
+            .with_header("Digit", digit.to_string())
             .with_header("Direction", direction)
     }
 
@@ -239,8 +239,8 @@ impl EventBuilder {
         AmiEvent::new("DTMFEnd", EventCategory::DTMF.0)
             .with_header("Channel", channel)
             .with_header("Uniqueid", unique_id)
-            .with_header("Digit", &digit.to_string())
-            .with_header("DurationMs", &duration_ms.to_string())
+            .with_header("Digit", digit.to_string())
+            .with_header("DurationMs", duration_ms.to_string())
             .with_header("Direction", direction)
     }
 
@@ -277,7 +277,7 @@ impl EventBuilder {
             .with_header("Queue", queue)
             .with_header("MemberName", member_name)
             .with_header("Interface", interface)
-            .with_header("Status", &status.to_string())
+            .with_header("Status", status.to_string())
             .with_header("Paused", if paused { "1" } else { "0" })
     }
 

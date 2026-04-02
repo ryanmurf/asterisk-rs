@@ -190,7 +190,7 @@ impl OutboundRegistration {
                     let refresh_point = Duration::from_secs(
                         (self.config.expiration as f64 * 0.9) as u64,
                     );
-                    if self.last_sent.map_or(true, |s| s.elapsed() >= refresh_point) {
+                    if self.last_sent.is_none_or(|s| s.elapsed() >= refresh_point) {
                         self.state = RegistrationState::Refreshing;
                         return Some(self.build_register(false));
                     }

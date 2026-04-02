@@ -5,11 +5,10 @@
 //! Supports attribute name mapping and LDAP search filters.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config_curl::ConfigRealtimeDriver;
 

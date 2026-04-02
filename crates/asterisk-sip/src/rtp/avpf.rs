@@ -195,7 +195,7 @@ impl NackPacket {
 
             while j < lost.len() {
                 let offset = lost[j].wrapping_sub(pid);
-                if offset >= 1 && offset <= 16 {
+                if (1..=16).contains(&offset) {
                     blp |= 1 << (offset - 1);
                     j += 1;
                 } else {

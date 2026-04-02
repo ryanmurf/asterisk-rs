@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, info};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Wizard object types

@@ -33,10 +33,12 @@ pub const CODEC2_FRAME_LEN: usize = 6;
 
 /// Codec2 operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Codec2Mode {
     /// 3200 bps: 160 samples, 8 bytes
     Mode3200,
     /// 2400 bps: 160 samples, 6 bytes (default)
+    #[default]
     Mode2400,
     /// 1600 bps: 320 samples, 8 bytes
     Mode1600,
@@ -82,11 +84,6 @@ impl Codec2Mode {
     }
 }
 
-impl Default for Codec2Mode {
-    fn default() -> Self {
-        Codec2Mode::Mode2400
-    }
-}
 
 /// Codec2 encoder (stub).
 ///

@@ -380,18 +380,15 @@ pub struct HttpCredentials {
 
 /// Authentication configuration.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum AuthConfig {
     /// No authentication required.
+    #[default]
     None,
     /// Basic authentication.
     Basic(Vec<HttpCredentials>),
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 impl AuthConfig {
     /// Check if a request is authenticated.

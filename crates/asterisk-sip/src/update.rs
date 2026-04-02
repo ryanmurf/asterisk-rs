@@ -12,7 +12,7 @@
 //! - Early media parameter updates (before final response)
 
 use crate::dialog::Dialog;
-use crate::parser::{SipMessage, SipMethod, StartLine, RequestLine, SipUri, SipHeader};
+use crate::parser::{SipMessage, SipMethod};
 use crate::sdp::SessionDescription;
 
 /// Build an UPDATE request within an existing dialog.

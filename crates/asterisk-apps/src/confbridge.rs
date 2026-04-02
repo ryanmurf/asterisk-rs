@@ -252,7 +252,9 @@ pub struct BridgeProfile {
 
 /// Sample rate setting for the conference bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SampleRate {
+    #[default]
     Auto,
     Rate8000,
     Rate16000,
@@ -261,11 +263,6 @@ pub enum SampleRate {
     Rate48000,
 }
 
-impl Default for SampleRate {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 impl SampleRate {
     pub fn from_str_name(s: &str) -> Self {

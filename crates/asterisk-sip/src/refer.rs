@@ -209,14 +209,14 @@ fn url_decode(input: &str) -> String {
 
 /// Build a 202 Accepted response to a REFER request.
 pub fn build_refer_accepted(request: &SipMessage) -> SipMessage {
-    let response = request
-        .create_response(202, "Accepted")
-        .unwrap_or_else(|_| make_error(request, 500, "Internal Server Error"));
+    
 
     // Per RFC 3515, we must include a Require: norefersub or rely on
     // implicit subscription.  Most implementations just send 202 with
     // implicit subscription.
-    response
+    request
+        .create_response(202, "Accepted")
+        .unwrap_or_else(|_| make_error(request, 500, "Internal Server Error"))
 }
 
 /// Build a NOTIFY with sipfrag body to report transfer progress.

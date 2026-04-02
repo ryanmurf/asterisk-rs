@@ -9,7 +9,7 @@ use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
 use asterisk_types::ChannelState;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Operating mode of the dictation machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -591,8 +591,8 @@ impl CelEngine {
         }
 
         // For APP_START/APP_END, check if the app is tracked.
-        if matches!(event.event_type, CelEventType::AppStart | CelEventType::AppEnd) {
-            if !config.tracked_apps.is_empty() {
+        if matches!(event.event_type, CelEventType::AppStart | CelEventType::AppEnd)
+            && !config.tracked_apps.is_empty() {
                 let app_lower = event.application.to_lowercase();
                 if !config
                     .tracked_apps
@@ -602,7 +602,6 @@ impl CelEngine {
                     return;
                 }
             }
-        }
         drop(config);
 
         let backends = self.backends.read();

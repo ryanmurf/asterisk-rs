@@ -4,7 +4,6 @@
 //! identity changes (e.g., after a transfer) between SIP and the internal
 //! channel representation using re-INVITE or UPDATE methods.
 
-use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Connected line info
@@ -96,7 +95,7 @@ impl ConnectedLine {
 
     /// Whether this connected line has usable information.
     pub fn is_valid(&self) -> bool {
-        self.number.as_ref().map_or(false, |n| !n.is_empty())
+        self.number.as_ref().is_some_and(|n| !n.is_empty())
     }
 
     /// Check if this connected line differs from another.

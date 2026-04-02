@@ -252,7 +252,7 @@ impl ChannelDriver for SipChannelDriver {
             // Create a lightweight session copy for ACK/BYE
             let session_copy = crate::session::SipSession {
                 id: session.id.clone(),
-                state: session.state.clone(),
+                state: session.state,
                 dialog: session.dialog.clone(),
                 local_sdp: session.local_sdp.clone(),
                 initial_local_sdp: None,

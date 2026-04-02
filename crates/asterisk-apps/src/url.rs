@@ -21,10 +21,7 @@ impl SendUrlOptions {
     pub fn parse(opts: &str) -> Self {
         let mut result = Self::default();
         for ch in opts.chars() {
-            match ch {
-                'w' => result.wait = true,
-                _ => {}
-            }
+            if ch == 'w' { result.wait = true }
         }
         result
     }

@@ -129,7 +129,7 @@ impl DialplanFunc for FuncAstConfig {
         if let Some(val) = ctx.get_variable(&base_key) {
             if index == -1 {
                 // Return last value (comma-separated list)
-                return Ok(val.split(',').last().unwrap_or("").to_string());
+                return Ok(val.split(',').next_back().unwrap_or("").to_string());
             }
             let vals: Vec<&str> = val.split(',').collect();
             let idx = index as usize;

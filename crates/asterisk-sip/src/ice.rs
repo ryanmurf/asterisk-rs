@@ -17,7 +17,7 @@ use rand::Rng;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-use crate::stun::{self, MessageClass, Method, StunAttrValue, StunMessage, TransactionId};
+use crate::stun::{self, MessageClass, StunAttrValue, StunMessage, TransactionId};
 use crate::turn::TurnClient;
 
 // ---------------------------------------------------------------------------

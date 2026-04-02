@@ -40,8 +40,10 @@ pub type ParkingResult<T> = Result<T, ParkingError>;
 
 /// Strategy for assigning a parking space when no specific space is requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum FindSlotStrategy {
     /// Always use the lowest available space.
+    #[default]
     First,
     /// Track the last used space and use the next one.
     Next,
@@ -57,11 +59,6 @@ impl FindSlotStrategy {
     }
 }
 
-impl Default for FindSlotStrategy {
-    fn default() -> Self {
-        Self::First
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Courtesy tone target
@@ -69,8 +66,10 @@ impl Default for FindSlotStrategy {
 
 /// Who receives the courtesy tone when a parked call is retrieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CourtesyToneTarget {
     No,
+    #[default]
     Caller,
     Callee,
     Both,
@@ -87,11 +86,6 @@ impl CourtesyToneTarget {
     }
 }
 
-impl Default for CourtesyToneTarget {
-    fn default() -> Self {
-        Self::Caller
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Parking lot mode (lifecycle state)

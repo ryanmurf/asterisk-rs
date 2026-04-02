@@ -216,11 +216,10 @@ impl Context {
         for ext in self.extensions.values() {
             let name = &ext.name;
             // For literal extensions, check if exten is a proper prefix
-            if !name.starts_with('_') {
-                if name.len() > exten.len() && name.starts_with(exten) {
+            if !name.starts_with('_')
+                && name.len() > exten.len() && name.starts_with(exten) {
                     return true;
                 }
-            }
             // For pattern extensions (e.g. _NXXNXXXXXX), a short exten could
             // always potentially match with more digits, so we consider it a
             // prefix match if the pattern is longer than the exten.

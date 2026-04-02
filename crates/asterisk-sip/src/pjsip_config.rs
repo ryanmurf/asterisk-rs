@@ -206,6 +206,7 @@ impl Default for AuthConfig {
 
 /// IP-based endpoint identification.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct IdentifyConfig {
     /// Section name.
     pub name: String,
@@ -217,16 +218,6 @@ pub struct IdentifyConfig {
     pub match_header: Option<String>,
 }
 
-impl Default for IdentifyConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            endpoint: String::new(),
-            matches: Vec::new(),
-            match_header: None,
-        }
-    }
-}
 
 /// Outbound registration configuration.
 #[derive(Debug, Clone)]

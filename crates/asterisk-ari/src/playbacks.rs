@@ -5,7 +5,6 @@
 //! reverse, forward).
 
 use crate::error::AriErrorKind;
-use crate::models::*;
 use crate::server::{AriRequest, AriResponse, AriServer, HttpMethod, RestHandler};
 use std::sync::Arc;
 
@@ -25,12 +24,12 @@ pub fn build_playbacks_routes() -> Arc<RestHandler> {
     );
 
     // /playbacks
-    let playbacks = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("playbacks")
             .child(playback_by_id),
-    );
-
-    playbacks
+    )
 }
 
 // ---------------------------------------------------------------------------

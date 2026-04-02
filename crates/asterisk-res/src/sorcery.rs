@@ -201,7 +201,7 @@ impl SorceryWizard for MemorySorcery {
         object_type: &str,
         fields: &[(&str, &str)],
     ) -> SorceryResult<SorceryObject> {
-        let prefix = format!("{}/", object_type);
+        let _prefix = format!("{}/", object_type);
         self.objects
             .read()
             .values()
@@ -471,7 +471,7 @@ impl SorceryWizard for RealtimeSorcery {
     fn retrieve_fields(
         &self,
         object_type: &str,
-        fields: &[(&str, &str)],
+        _fields: &[(&str, &str)],
     ) -> SorceryResult<SorceryObject> {
         debug!(
             family = %self.family,
@@ -622,7 +622,7 @@ impl SorceryWizard for AstDbSorcery {
 
     fn retrieve_fields(
         &self,
-        object_type: &str,
+        _object_type: &str,
         _fields: &[(&str, &str)],
     ) -> SorceryResult<SorceryObject> {
         Err(SorceryError::WizardError(

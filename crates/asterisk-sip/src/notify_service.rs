@@ -11,8 +11,6 @@ use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::notify::{build_notify_from_template_with_via, NotifyConfig, NotifyTemplate};
-use crate::parser::SipMessage;
-use crate::session::SipSession;
 use crate::transport::SipTransport;
 
 /// Per-channel SIP state needed for in-dialog NOTIFY.

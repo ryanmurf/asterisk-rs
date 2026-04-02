@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Errors

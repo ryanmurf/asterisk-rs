@@ -92,21 +92,13 @@ pub fn adpcm_decode(encoded: i32, state: &mut AdpcmState) -> i16 {
 
     state.signal += diff;
 
-    if state.signal > 2047 {
-        state.signal = 2047;
-    } else if state.signal < -2047 {
-        state.signal = -2047;
-    }
+    state.signal = state.signal.clamp(-2047, 2047);
 
     state.next_flag = 0;
 
     // Update step size index
     state.ssindex += INDEX_SHIFT[magnitude as usize];
-    if state.ssindex < 0 {
-        state.ssindex = 0;
-    } else if state.ssindex > 48 {
-        state.ssindex = 48;
-    }
+    state.ssindex = state.ssindex.clamp(0, 48);
 
     // Output is signal shifted left by 4 (scale to 16-bit range)
     (state.signal << 4) as i16

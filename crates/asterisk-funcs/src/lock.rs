@@ -9,7 +9,7 @@
 
 use crate::{DialplanFunc, FuncContext, FuncError, FuncResult};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Global lock manager for dialplan named locks.
 ///

@@ -58,11 +58,11 @@ pub fn noun_suffix(count: i32, language: &str) -> &'static str {
         let last_two = abs % 100;
         let last_one = abs % 10;
 
-        if last_two >= 11 && last_two <= 19 {
+        if (11..=19).contains(&last_two) {
             "x2" // genitive plural for teens
         } else if last_one == 1 {
             "" // nominative singular
-        } else if last_one >= 2 && last_one <= 4 {
+        } else if (2..=4).contains(&last_one) {
             "x1" // genitive singular
         } else {
             "x2" // genitive plural

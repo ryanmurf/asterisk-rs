@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::parser::SipMessage;
 use crate::transport::{SipTransport, TransportError};
@@ -123,7 +123,7 @@ impl ConnectionPool {
         let entry = self
             .connections
             .entry(conn.peer_addr)
-            .or_insert_with(Vec::new);
+            .or_default();
         if entry.len() < self.max_per_peer {
             entry.push(conn);
         }
