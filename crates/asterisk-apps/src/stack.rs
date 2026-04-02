@@ -422,7 +422,7 @@ impl AppGoSubIf {
         };
 
         // Evaluate condition: non-empty, non-zero string is true
-        let is_true = !condition.is_empty() && condition != "0" && !condition.is_empty();
+        let is_true = !condition.is_empty() && condition != "0";
 
         let target = if is_true {
             // Use label before ':'
