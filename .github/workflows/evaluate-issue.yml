@@ -1,0 +1,140 @@
+name: Evaluate Issue for Copilot
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+  models: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate issue with AI
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+
+            // Skip issues from bots to avoid loops
+            if (issue.user.type === 'Bot') {
+              console.log('Skipping bot-created issue');
+              return;
+            }
+
+            // If body is empty or missing, label as needs-human
+            if (!issue.body || issue.body.trim().length === 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['needs-human']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: '🤖 **Auto-triage:** This issue has no description. A human should review and add details before it can be worked on.'
+              });
+              return;
+            }
+
+            // Call GitHub Models API for evaluation
+            const systemPrompt = `You evaluate GitHub issues for the open-source Rust library "asterisk-rs" (Asterisk AMI/ARI bindings).
+            Decide if an automated coding agent could resolve this issue.
+
+            Answer YES if:
+            - It's a well-defined bug with reproduction steps or clear error
+            - It's a small, scoped feature or enhancement
+            - It's a docs fix, typo, or straightforward refactor
+            - There's enough context to act without asking clarifying questions
+
+            Answer NO if:
+            - It's a vague feature request or discussion/question
+            - It requires architectural decisions or design input from maintainers
+            - It needs external system access or credentials to test
+            - The issue body is empty or just a title with no detail
+
+            Respond with JSON only:
+            {"automatable": true|false, "confidence": "high"|"medium"|"low", "reason": "one sentence explanation"}`;
+
+            const userPrompt = `Issue #${issue.number}\nTitle: ${issue.title}\n\nBody:\n${issue.body}`;
+
+            let result;
+            try {
+              const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o',
+                  messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                  ],
+                  temperature: 0.1
+                })
+              });
+
+              if (!response.ok) {
+                throw new Error(`GitHub Models API returned ${response.status}: ${await response.text()}`);
+              }
+
+              const data = await response.json();
+              const content = data.choices[0].message.content.trim();
+              // Strip markdown code fences if present
+              const jsonStr = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+              result = JSON.parse(jsonStr);
+            } catch (error) {
+              console.error('Evaluation failed:', error.message);
+              // On failure, label needs-human so nothing is missed
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['needs-human']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `🤖 **Auto-triage:** Automated evaluation failed. A human should review this issue.\n\n<details><summary>Error</summary>\n\n\`\`\`\n${error.message}\n\`\`\`\n</details>`
+              });
+              return;
+            }
+
+            // Apply labels and comment based on evaluation
+            if (result.automatable && result.confidence !== 'low') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['agent-approved']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `🤖 **Auto-triage:** This issue looks suitable for an automated fix (confidence: **${result.confidence}**).\n\n**Reason:** ${result.reason}\n\nAssigning to Copilot.`
+              });
+            } else {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['needs-human']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `🤖 **Auto-triage:** This issue likely needs human attention.\n\n**Reason:** ${result.reason}\n\n_Confidence: ${result.confidence}_`
+              });
+            }
