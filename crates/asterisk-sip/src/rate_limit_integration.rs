@@ -130,7 +130,7 @@ t=0 0\r\n\
 m=audio 3456 RTP/AVP 0\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
 
-    SipMessage::parse(raw_message).expect("Failed to parse test INVITE")
+    SipMessage::parse(raw_message.as_bytes()).expect("Failed to parse test INVITE")
 }
 
 /// Example of how to integrate rate limiting in different scenarios
@@ -167,13 +167,21 @@ pub mod scenarios {
         }
     }
 
-    /// Demonstration of progressive rate limiting based on time of day
+    /// Demonstration of progressive rate limiting based on time of day.
+    ///
+    /// Uses wall-clock UTC hour to switch between business-hours and
+    /// off-hours profiles. No external crate (e.g. chrono) is required.
     pub async fn time_based_rate_limiting(rate_limiter: Arc<SipRateLimiter>) {
         loop {
-            let current_hour = chrono::Local::now().hour();
-            
+            // Derive current UTC hour from SystemTime without chrono.
+            let secs_since_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let current_hour = ((secs_since_epoch % 86400) / 3600) as u32;
+
             let config = match current_hour {
-                // Business hours (9 AM - 5 PM): Higher limits
+                // Business hours (9 AM - 5 PM UTC): Higher limits
                 9..=17 => RateLimitConfig {
                     invite_rate_limit: 50,
                     scanner_threshold: 100,
@@ -190,7 +198,7 @@ pub mod scenarios {
             };
 
             rate_limiter.update_config(config);
-            
+
             // Check again in an hour
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }

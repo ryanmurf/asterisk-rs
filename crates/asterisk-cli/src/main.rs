@@ -10,6 +10,7 @@
 //! real Asterisk binary's CLI interface.
 
 use clap::Parser;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -189,6 +190,7 @@ impl ServerState {
         self.register_command(Box::new(CmdCoreShowBridges));
         self.register_command(Box::new(CmdModuleShow));
         self.register_command(Box::new(CmdDialplanShow));
+        self.register_command(Box::new(CmdDialplanReload));
         self.register_command(Box::new(CmdHelp));
         self.register_command(Box::new(CmdCoreStopNow));
         self.register_command(Box::new(CmdCoreStopGracefully));
@@ -428,6 +430,15 @@ impl CliCommand for CmdDialplanShow {
 
         lines.push(format!("-= {} extension(s) in {} context(s). =-", total_ext, total_ctx));
         lines
+    }
+}
+
+struct CmdDialplanReload;
+impl CliCommand for CmdDialplanReload {
+    fn command(&self) -> &str { "dialplan reload" }
+    fn description(&self) -> &str { "Reload the dialplan from extensions.conf" }
+    fn execute(&self, _args: &[&str], state: &ServerState) -> Vec<String> {
+        reload_dialplan(&state.config_dir)
     }
 }
 
@@ -1213,8 +1224,18 @@ fn create_buildopts_h(include_dir: &str) {
 // ============================================================================
 
 /// Initialize the logging/tracing subsystem.
-fn init_logging(verbose: u8, debug: u8, quiet: bool) {
-    let filter = if quiet {
+///
+/// When the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable is set (or
+/// defaults to localhost:4317), an OpenTelemetry layer is added to the
+/// tracing subscriber so that spans are exported via OTLP.  The returned
+/// guard must be kept alive for the lifetime of the application -- dropping
+/// it flushes and shuts down the tracer provider.
+fn init_logging(
+    verbose: u8,
+    debug: u8,
+    quiet: bool,
+) -> Option<asterisk_core::telemetry::TelemetryGuard> {
+    let filter_str = if quiet {
         "error"
     } else {
         match (debug, verbose) {
@@ -1226,16 +1247,33 @@ fn init_logging(verbose: u8, debug: u8, quiet: bool) {
         }
     };
 
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter_str));
+
+    // If OTEL is explicitly enabled via env, use the telemetry-aware
+    // subscriber that includes the OpenTelemetry layer.
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        match asterisk_core::telemetry::init_telemetry(env_filter) {
+            Ok(guard) => return Some(guard),
+            Err(e) => {
+                // Fall through to plain logging if OTel init fails.
+                eprintln!("Warning: OpenTelemetry init failed ({}), using plain logging", e);
+            }
+        }
+    }
+
+    // Plain fmt subscriber (no OpenTelemetry).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter_str));
+
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
+        .with_env_filter(env_filter)
         .with_target(false)
         .with_thread_ids(false)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).ok();
+    None
 }
 
 /// Print the startup banner.
@@ -1284,6 +1322,116 @@ fn load_dialplan(config_dir: &str) -> Arc<asterisk_core::pbx::Dialplan> {
     let mut dialplan = asterisk_core::pbx::Dialplan::new();
     dialplan.add_context(asterisk_core::pbx::Context::new("default"));
     Arc::new(dialplan)
+}
+
+/// Reload the dialplan from extensions.conf, log what changed, and swap it in.
+///
+/// The old `Arc<Dialplan>` remains valid for any in-flight calls that hold a
+/// clone -- `set_global_dialplan` only replaces the pointer, it does not
+/// invalidate existing references.
+///
+/// Returns a list of human-readable lines describing what happened.
+fn reload_dialplan(config_dir: &str) -> Vec<String> {
+    let mut output = Vec::new();
+
+    // Snapshot the old context names and their extension counts for diffing
+    let old_contexts: std::collections::HashMap<String, usize> =
+        if let Some(old_dp) = asterisk_core::get_global_dialplan() {
+            old_dp
+                .contexts
+                .iter()
+                .map(|(name, ctx)| (name.clone(), ctx.extensions.len()))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    let new_dp = load_dialplan(config_dir);
+
+    // Build new context name -> extension count map
+    let new_contexts: std::collections::HashMap<String, usize> = new_dp
+        .contexts
+        .iter()
+        .map(|(name, ctx)| (name.clone(), ctx.extensions.len()))
+        .collect();
+
+    // Compute diff
+    let old_names: HashSet<&String> = old_contexts.keys().collect();
+    let new_names: HashSet<&String> = new_contexts.keys().collect();
+
+    let added: Vec<&&String> = {
+        let mut v: Vec<_> = new_names.difference(&old_names).collect();
+        v.sort();
+        v
+    };
+    let removed: Vec<&&String> = {
+        let mut v: Vec<_> = old_names.difference(&new_names).collect();
+        v.sort();
+        v
+    };
+
+    // Contexts present in both -- check if extension count changed
+    let mut modified: Vec<&String> = Vec::new();
+    for name in old_names.intersection(&new_names) {
+        let old_ext_count = old_contexts[*name];
+        let new_ext_count = new_contexts[*name];
+        if old_ext_count != new_ext_count {
+            modified.push(name);
+        } else if let (Some(old_dp), Some(new_ctx)) = (
+            asterisk_core::get_global_dialplan(),
+            new_dp.contexts.get(name.as_str()),
+        ) {
+            // Even if extension count is the same, check if the extension
+            // names differ (quick heuristic without deep priority comparison)
+            if let Some(old_ctx) = old_dp.contexts.get(name.as_str()) {
+                let old_ext_names: HashSet<&String> = old_ctx.extensions.keys().collect();
+                let new_ext_names: HashSet<&String> = new_ctx.extensions.keys().collect();
+                if old_ext_names != new_ext_names {
+                    modified.push(name);
+                }
+            }
+        }
+    }
+    modified.sort();
+
+    // Swap in the new dialplan (atomic Arc replacement)
+    asterisk_core::set_global_dialplan(new_dp);
+
+    // Build output
+    let total_contexts = new_contexts.len();
+    let total_extensions: usize = new_contexts.values().sum();
+    output.push(format!(
+        "Dialplan reloaded: {} context(s), {} extension(s)",
+        total_contexts, total_extensions
+    ));
+
+    if added.is_empty() && removed.is_empty() && modified.is_empty() {
+        output.push("  No changes detected.".to_string());
+    } else {
+        for name in &added {
+            let ext_count = new_contexts[**name];
+            info!("dialplan reload: context '{}' added ({} extension(s))", name, ext_count);
+            output.push(format!("  Context '{}' added ({} extension(s))", name, ext_count));
+        }
+        for name in &removed {
+            info!("dialplan reload: context '{}' removed", name);
+            output.push(format!("  Context '{}' removed", name));
+        }
+        for name in &modified {
+            let old_n = old_contexts.get(name.as_str()).copied().unwrap_or(0);
+            let new_n = new_contexts.get(name.as_str()).copied().unwrap_or(0);
+            info!(
+                "dialplan reload: context '{}' modified ({} -> {} extension(s))",
+                name, old_n, new_n
+            );
+            output.push(format!(
+                "  Context '{}' modified ({} -> {} extension(s))",
+                name, old_n, new_n
+            ));
+        }
+    }
+
+    output
 }
 
 /// Parse pjsip_notify.conf content into notify templates.
@@ -1790,7 +1938,7 @@ async fn main() {
     if args.remote {
         if let Some(ref cmd_str) = args.execute {
             // Remote execute mode: connect to control socket, send command, print result
-            init_logging(0, 0, true); // quiet logging for remote mode
+            let _otel_guard = init_logging(0, 0, true); // quiet logging for remote mode
             match remote_execute(args.config_file.as_deref(), cmd_str).await {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
@@ -1804,7 +1952,7 @@ async fn main() {
     // Handle -x without -r (execute locally, full startup)
     if let Some(ref cmd_str) = args.execute {
         // Initialize logging
-        init_logging(args.verbose, args.debug, args.quiet);
+        let _otel_guard = init_logging(args.verbose, args.debug, args.quiet);
 
         // Run startup sequence
         startup_sequence(&config_dir, &dirs).await;
@@ -1831,8 +1979,9 @@ async fn main() {
         }
     }
 
-    // Initialize logging
-    init_logging(args.verbose, args.debug, args.quiet);
+    // Initialize logging (and optionally OpenTelemetry tracing).
+    // The guard must live until shutdown to keep the OTLP exporter alive.
+    let _otel_guard = init_logging(args.verbose, args.debug, args.quiet);
 
     // Print startup banner
     print_banner(args.quiet);
@@ -1865,6 +2014,24 @@ async fn main() {
             warn!("Forced exit after shutdown timeout");
             std::process::exit(0);
         });
+    });
+
+    // Set up SIGHUP handler for dialplan hot-reload
+    let config_dir_for_sighup = config_dir.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sighup = signal(SignalKind::hangup())
+            .expect("failed to register SIGHUP handler");
+
+        loop {
+            sighup.recv().await;
+            info!("Received SIGHUP, reloading dialplan...");
+            let lines = reload_dialplan(&config_dir_for_sighup);
+            for line in &lines {
+                info!("SIGHUP reload: {}", line);
+            }
+        }
     });
 
     // Create server state and register CLI commands BEFORE starting anything

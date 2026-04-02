@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -168,10 +169,10 @@ impl BlockedIp {
 pub struct SipRateLimiter {
     /// Configuration
     config: RwLock<RateLimitConfig>,
-    /// Per-IP tracking data
-    ip_tracking: DashMap<IpAddr, IpTrackingData>,
-    /// Currently blocked IPs
-    blocked_ips: DashMap<IpAddr, BlockedIp>,
+    /// Per-IP tracking data (Arc-wrapped so the cleanup task can reference it)
+    ip_tracking: Arc<DashMap<IpAddr, IpTrackingData>>,
+    /// Currently blocked IPs (Arc-wrapped so the cleanup task can reference it)
+    blocked_ips: Arc<DashMap<IpAddr, BlockedIp>>,
     /// Statistics
     total_requests: AtomicU64,
     blocked_requests: AtomicU64,
@@ -189,8 +190,8 @@ impl SipRateLimiter {
     pub fn with_config(config: RateLimitConfig) -> Self {
         Self {
             config: RwLock::new(config),
-            ip_tracking: DashMap::new(),
-            blocked_ips: DashMap::new(),
+            ip_tracking: Arc::new(DashMap::new()),
+            blocked_ips: Arc::new(DashMap::new()),
             total_requests: AtomicU64::new(0),
             blocked_requests: AtomicU64::new(0),
             rate_limited_requests: AtomicU64::new(0),
@@ -335,7 +336,8 @@ impl SipRateLimiter {
         let mut expired_ips = Vec::new();
         
         for item in self.blocked_ips.iter() {
-            let (ip, blocked) = item.pair();
+            let ip = item.key();
+            let blocked = item.value();
             if blocked.is_expired() {
                 expired_ips.push(*ip);
             } else {
@@ -358,7 +360,8 @@ impl SipRateLimiter {
 
         // Find stale tracking data
         for item in self.ip_tracking.iter() {
-            let (ip, tracking) = item.pair();
+            let ip = item.key();
+            let tracking = item.value();
             if tracking.is_stale(now) {
                 stale_ips.push(*ip);
             }
@@ -374,7 +377,8 @@ impl SipRateLimiter {
         // Clean up expired blocks
         let mut expired_blocks = Vec::new();
         for item in self.blocked_ips.iter() {
-            let (ip, blocked) = item.pair();
+            let ip = item.key();
+            let blocked = item.value();
             if blocked.is_expired() {
                 expired_blocks.push(*ip);
             }
@@ -432,7 +436,8 @@ impl SipRateLimiter {
 
                 // Find stale tracking data
                 for item in ip_tracking.iter() {
-                    let (ip, tracking) = item.pair();
+                    let ip = item.key();
+                    let tracking = item.value();
                     if tracking.is_stale(now) {
                         stale_ips.push(*ip);
                     }
@@ -440,7 +445,8 @@ impl SipRateLimiter {
 
                 // Find expired blocks
                 for item in blocked_ips.iter() {
-                    let (ip, blocked) = item.pair();
+                    let ip = item.key();
+                    let blocked = item.value();
                     if blocked.is_expired() {
                         expired_blocks.push(*ip);
                     }
@@ -529,7 +535,7 @@ mod tests {
              Content-Length: 0\r\n\r\n",
             method, method
         );
-        SipMessage::parse(&raw).expect("Failed to parse test message")
+        SipMessage::parse(raw.as_bytes()).expect("Failed to parse test message")
     }
 
     #[test]

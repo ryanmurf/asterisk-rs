@@ -96,8 +96,11 @@ pub mod service_route;
 pub mod prack;
 pub mod update;
 pub mod stir_shaken;
+pub mod rate_limit;
+pub mod rate_limit_integration;
 
 pub use parser::{SipMessage, SipMethod, SipUri, StartLine};
+pub use rate_limit::{SipRateLimiter, RateLimitConfig, RateLimiterStats};
 pub use transport::SipTransport;
 pub use transaction::{ClientTransaction, ServerTransaction};
 pub use dialog::{Dialog, DialogState};

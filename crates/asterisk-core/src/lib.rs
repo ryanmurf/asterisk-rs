@@ -13,6 +13,7 @@ pub mod pbx;
 pub mod taskprocessor;
 pub mod scheduler;
 pub mod module;
+pub mod telemetry;
 
 // Re-exports for convenience
 pub use channel::{Channel, ChannelDriver, ChannelId, ChannelSnapshot, HangupCallback, register_hangup_callback, ChannelEventPublisher, register_channel_event_publisher};
