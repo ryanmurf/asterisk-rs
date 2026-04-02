@@ -52,6 +52,7 @@ impl DeviceState {
     }
 
     /// Parse a device state from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_uppercase().as_str() {
             "NOT_INUSE" | "IDLE" => DeviceState::NotInuse,
@@ -118,6 +119,7 @@ impl PresenceState {
     }
 
     /// Parse a presence state from a string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "available" => PresenceState::Available,

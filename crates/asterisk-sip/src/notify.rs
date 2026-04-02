@@ -169,6 +169,7 @@ pub fn build_notify_from_template(
     build_notify_from_template_with_via(template, to_uri, from_uri, call_id, from_tag, remote_tag, cseq, "127.0.0.1:5060")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_notify_from_template_with_via(
     template: &NotifyTemplate,
     to_uri: &str,

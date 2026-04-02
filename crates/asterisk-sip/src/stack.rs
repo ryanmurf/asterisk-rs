@@ -23,6 +23,7 @@ use crate::transport::{SipTransport, TransportError, UdpTransport};
 
 /// Events emitted by the SIP stack for the application layer.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum SipEvent {
     /// A new incoming INVITE (new session).
     IncomingInvite {
@@ -161,7 +162,6 @@ struct DialogManager {
 }
 
 #[allow(dead_code)]
-
 impl DialogManager {
     fn new() -> Self {
         Self {

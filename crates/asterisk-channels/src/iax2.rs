@@ -873,6 +873,7 @@ pub enum Iax2CallState {
 }
 
 /// Per-call private data.
+#[allow(dead_code)]
 struct Iax2Private {
     /// Our call number.
     our_callno: u16,
@@ -958,11 +959,8 @@ impl Iax2Driver {
     }
 
     fn allocate_callno(&self) -> u16 {
-        loop {
-            let n = self.next_callno.fetch_add(1, Ordering::Relaxed);
-            let callno = (n % (IAX_MAX_CALLS - 1)) + 1; // 1..32767
-            return callno;
-        }
+        let n = self.next_callno.fetch_add(1, Ordering::Relaxed);
+        (n % (IAX_MAX_CALLS - 1)) + 1 // 1..32767
     }
 
     fn get_private(&self, id: &str) -> Option<Arc<Iax2Private>> {

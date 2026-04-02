@@ -107,7 +107,7 @@ impl AmiServer {
         const MAX_PORT_ATTEMPTS: usize = 10;
         let original_port = self.config.bind_addr.port();
         let mut current_addr = self.config.bind_addr;
-        let mut last_error = None;
+        let mut _last_error = None;
 
         let listener: TcpListener = loop {
             match TcpListener::bind(current_addr).await {
@@ -124,7 +124,7 @@ impl AmiServer {
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::AddrInUse {
-                        last_error = Some(e);
+                        _last_error = Some(e);
                         current_addr.set_port(current_addr.port() + 1);
                         debug!(
                             "AMI: Port {} busy, trying port {}",

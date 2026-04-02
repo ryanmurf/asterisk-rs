@@ -1474,8 +1474,8 @@ fn load_pjsip_notify_config(
             if let Some(pos) = line.find('=') {
                 let key = line[..pos].trim();
                 let rest = &line[pos + 1..];
-                let value = if rest.starts_with('>') {
-                    rest[1..].trim()
+                let value = if let Some(stripped) = rest.strip_prefix('>') {
+                    stripped.trim()
                 } else {
                     rest.trim()
                 };

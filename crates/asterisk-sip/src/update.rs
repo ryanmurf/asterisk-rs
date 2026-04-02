@@ -38,25 +38,14 @@ pub fn build_update(
     let mut msg = SipMessage::new_request(SipMethod::Update, request_uri);
 
     // From/To with tags.
-    if dialog.is_uac {
-        msg.add_header(
-            "From",
-            &format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
-        );
-        msg.add_header(
-            "To",
-            &format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag),
-        );
-    } else {
-        msg.add_header(
-            "From",
-            &format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
-        );
-        msg.add_header(
-            "To",
-            &format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag),
-        );
-    }
+    msg.add_header(
+        "From",
+        &format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
+    );
+    msg.add_header(
+        "To",
+        &format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag),
+    );
 
     msg.add_header("Call-ID", &dialog.call_id);
     msg.add_header("CSeq", &format!("{} UPDATE", cseq));

@@ -121,6 +121,7 @@ impl SoftmixData {
         let mut total_mix = vec![0i32; num_samples];
         for chan_data in self.channel_buffers.values() {
             if chan_data.have_audio {
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..num_samples {
                     if i < chan_data.our_buf.len() {
                         total_mix[i] += chan_data.our_buf[i] as i32;

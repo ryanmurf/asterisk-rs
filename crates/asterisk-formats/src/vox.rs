@@ -17,6 +17,7 @@ use std::sync::Arc;
 /// Buffer size in bytes (80 bytes = 160 samples).
 const VOX_BUF_SIZE: usize = 80;
 /// Samples per buffer (2 samples per byte).
+#[allow(dead_code)]
 const VOX_SAMPLES: u32 = 160;
 
 /// VOX (Dialogic ADPCM) file format handler.

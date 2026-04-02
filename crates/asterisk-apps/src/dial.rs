@@ -1432,16 +1432,8 @@ impl AppDial {
                     caller.name, answered_name
                 );
 
-                // Determine exec result based on options
-                let exec_result = if dial_args.options.continue_on_callee_hangup {
-                    PbxExecResult::Success
-                } else if dial_args.options.callee_go_on.is_some()
-                    || dial_args.options.callee_go_on_empty
-                {
-                    PbxExecResult::Success
-                } else {
-                    PbxExecResult::Success
-                };
+                // All branches currently return Success; future logic may differentiate
+                let exec_result = PbxExecResult::Success;
 
                 (exec_result, DialStatus::Answer)
             }

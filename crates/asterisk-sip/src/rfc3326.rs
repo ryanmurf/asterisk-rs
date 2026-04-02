@@ -104,8 +104,8 @@ fn extract_param<'a>(header: &'a str, param_name: &str) -> Option<&'a str> {
         .unwrap_or(rest.len());
 
     // Handle quoted values
-    if rest.starts_with('"') {
-        let close = rest[1..].find('"').map(|p| p + 2).unwrap_or(end);
+    if let Some(inner) = rest.strip_prefix('"') {
+        let close = inner.find('"').map(|p| p + 2).unwrap_or(end);
         Some(&rest[..close])
     } else {
         Some(rest[..end].trim())

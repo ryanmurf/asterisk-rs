@@ -422,6 +422,7 @@ impl PubSub {
         response
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_notify_terminated(
         &self,
         _request: &SipMessage,

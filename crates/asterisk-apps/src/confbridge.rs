@@ -173,8 +173,10 @@ impl Default for UserProfile {
 impl UserProfile {
     /// Parse a user profile from key=value pairs.
     pub fn from_config(name: &str, config: &HashMap<String, String>) -> Self {
-        let mut profile = Self::default();
-        profile.name = name.to_string();
+        let mut profile = Self {
+            name: name.to_string(),
+            ..Self::default()
+        };
 
         for (key, value) in config {
             match key.as_str() {
@@ -312,8 +314,10 @@ impl Default for BridgeProfile {
 impl BridgeProfile {
     /// Parse a bridge profile from key=value pairs.
     pub fn from_config(name: &str, config: &HashMap<String, String>) -> Self {
-        let mut profile = Self::default();
-        profile.name = name.to_string();
+        let mut profile = Self {
+            name: name.to_string(),
+            ..Self::default()
+        };
 
         for (key, value) in config {
             match key.as_str() {
@@ -1514,7 +1518,7 @@ impl AppConfBridge {
         let mut should_destroy = false;
         let mut end_marked = false;
         let mut departed_video_streams = Vec::new();
-        let mut is_sfu = false;
+        let is_sfu;
 
         {
             let mut conf = conference.write();

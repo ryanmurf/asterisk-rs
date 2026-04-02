@@ -411,6 +411,7 @@ pub enum DahdiSignaling {
 // Per-channel private data
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct DahdiPrivate {
     /// DAHDI config for this channel.
     config: DahdiChannelConfig,
@@ -509,6 +510,7 @@ impl DahdiDriver {
     }
 
     /// Configure echo cancellation (stub).
+    #[allow(dead_code)]
     fn configure_echo_cancel(_channel_number: u32, _taps: u32) -> AsteriskResult<()> {
         debug!(
             _channel_number,

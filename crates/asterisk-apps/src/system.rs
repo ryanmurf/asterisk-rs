@@ -80,7 +80,7 @@ impl DialplanApp for AppTrySystem {
 /// * `channel` - The current channel
 /// * `command` - The command to execute
 /// * `fail_on_error` - If true (System), return Failed on error.
-///                     If false (TrySystem), always return Success.
+///   If false (TrySystem), always return Success.
 async fn system_exec_helper(
     channel: &mut Channel,
     command: &str,

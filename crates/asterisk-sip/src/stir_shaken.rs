@@ -54,6 +54,7 @@ pub enum AttestationLevel {
 
 impl AttestationLevel {
     /// Parse from a single-character string ("A", "B", or "C").
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, StirShakenError> {
         match s {
             "A" => Ok(Self::A),
@@ -788,6 +789,7 @@ pub fn sign_call(
 /// Create a STIR/SHAKEN Identity header with an explicit timestamp and origid.
 ///
 /// This is useful for testing where deterministic output is needed.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_call_with_params(
     calling_number: &str,
     called_number: &str,

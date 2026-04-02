@@ -468,6 +468,7 @@ fn aes_cm_encrypt_decrypt_with_cipher(
 }
 
 /// Legacy wrapper that creates a cipher on the fly (used by key derivation).
+#[allow(dead_code)]
 fn aes_cm_encrypt_decrypt(
     session_key: &[u8],
     session_salt: &[u8],

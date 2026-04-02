@@ -214,18 +214,18 @@ impl JsonParser {
     }
 
     fn parse_bool(input: &str) -> Result<(JsonValue, &str), String> {
-        if input.starts_with("true") {
-            Ok((JsonValue::Bool(true), &input[4..]))
-        } else if input.starts_with("false") {
-            Ok((JsonValue::Bool(false), &input[5..]))
+        if let Some(rest) = input.strip_prefix("true") {
+            Ok((JsonValue::Bool(true), rest))
+        } else if let Some(rest) = input.strip_prefix("false") {
+            Ok((JsonValue::Bool(false), rest))
         } else {
             Err("expected boolean".to_string())
         }
     }
 
     fn parse_null(input: &str) -> Result<(JsonValue, &str), String> {
-        if input.starts_with("null") {
-            Ok((JsonValue::Null, &input[4..]))
+        if let Some(rest) = input.strip_prefix("null") {
+            Ok((JsonValue::Null, rest))
         } else {
             Err("expected null".to_string())
         }
@@ -235,16 +235,16 @@ impl JsonParser {
         let mut rest = Self::skip_ws(&input[1..]);
         let mut items = Vec::new();
 
-        if rest.starts_with(']') {
-            return Ok((JsonValue::Array(items), &rest[1..]));
+        if let Some(after) = rest.strip_prefix(']') {
+            return Ok((JsonValue::Array(items), after));
         }
 
         loop {
             let (val, r) = Self::parse_value(rest)?;
             items.push(val);
             rest = Self::skip_ws(r);
-            if rest.starts_with(']') {
-                return Ok((JsonValue::Array(items), &rest[1..]));
+            if let Some(after) = rest.strip_prefix(']') {
+                return Ok((JsonValue::Array(items), after));
             }
             if !rest.starts_with(',') {
                 return Err("expected ',' or ']' in array".to_string());
@@ -257,8 +257,8 @@ impl JsonParser {
         let mut rest = Self::skip_ws(&input[1..]);
         let mut entries = Vec::new();
 
-        if rest.starts_with('}') {
-            return Ok((JsonValue::Object(entries), &rest[1..]));
+        if let Some(after) = rest.strip_prefix('}') {
+            return Ok((JsonValue::Object(entries), after));
         }
 
         loop {
@@ -279,8 +279,8 @@ impl JsonParser {
             entries.push((key, val));
             rest = Self::skip_ws(r);
 
-            if rest.starts_with('}') {
-                return Ok((JsonValue::Object(entries), &rest[1..]));
+            if let Some(after) = rest.strip_prefix('}') {
+                return Ok((JsonValue::Object(entries), after));
             }
             if !rest.starts_with(',') {
                 return Err("expected ',' or '}' in object".to_string());
