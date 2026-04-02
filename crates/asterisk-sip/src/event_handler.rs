@@ -795,6 +795,16 @@ impl SipEventHandler {
         cs.session.remote_sdp.clone()
     }
 
+    /// Get the remote SDP asynchronously (waits for the lock).
+    pub async fn get_remote_sdp_async(&self, call_id: &str) -> Option<SessionDescription> {
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(call_id)?.clone()
+        };
+        let cs = cs_arc.lock().await;
+        cs.session.remote_sdp.clone()
+    }
+
     /// Get the local SDP for an active call (the SDP answer we sent in 200 OK).
     pub fn get_local_sdp(&self, call_id: &str) -> Option<SessionDescription> {
         let states = self.call_states.read();
@@ -811,11 +821,31 @@ impl SipEventHandler {
         cs.session.initial_local_sdp.clone().or_else(|| cs.session.local_sdp.clone())
     }
 
+    /// Get the initial local SDP asynchronously (waits for the lock).
+    pub async fn get_initial_local_sdp_async(&self, call_id: &str) -> Option<SessionDescription> {
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(call_id)?.clone()
+        };
+        let cs = cs_arc.lock().await;
+        cs.session.initial_local_sdp.clone().or_else(|| cs.session.local_sdp.clone())
+    }
+
     /// Get the local address for generating SDP.
     pub fn local_addr_for_call(&self, call_id: &str) -> Option<String> {
         let states = self.call_states.read();
         let cs_arc = states.get(call_id)?;
         let cs = cs_arc.try_lock().ok()?;
+        Some(cs.session.local_addr.ip().to_string())
+    }
+
+    /// Get the local address asynchronously (waits for the lock).
+    pub async fn local_addr_for_call_async(&self, call_id: &str) -> Option<String> {
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(call_id)?.clone()
+        };
+        let cs = cs_arc.lock().await;
         Some(cs.session.local_addr.ip().to_string())
     }
 

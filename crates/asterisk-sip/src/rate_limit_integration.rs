@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::rate_limit::{SipRateLimiter, RateLimitConfig};
-use crate::event_handler::SipEventHandler;
 use crate::parser::SipMessage;
 
 /// Example of how to set up rate limiting in a SIP server

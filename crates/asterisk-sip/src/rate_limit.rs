@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -89,11 +89,16 @@ impl IpTrackingData {
         }
     }
 
-    /// Record an INVITE request and return current rate
+    /// Record an INVITE request and return current rate.
+    ///
+    /// Also resets scanner detection since an INVITE is a normal call
+    /// method that breaks any sequential REGISTER/OPTIONS flood pattern.
     fn record_invite(&mut self, now: Instant) -> u32 {
         self.clean_old_invites(now);
         self.invite_timestamps.push_back(now);
         self.last_activity = now;
+        self.last_method = Some(SipMethod::Invite);
+        self.sequential_scanner_requests = 0;
         self.invite_timestamps.len() as u32
     }
 
@@ -245,40 +250,50 @@ impl SipRateLimiter {
             }
         }
 
-        // Get or create tracking data for this IP
-        let mut tracking = self.ip_tracking.entry(ip).or_insert_with(IpTrackingData::new);
-
-        // Check the message based on method
+        // Get or create tracking data for this IP, perform rate checks,
+        // and determine if the IP should be blocked. We must drop the
+        // DashMap entry guard before calling block_ip() which also
+        // accesses ip_tracking, avoiding a same-shard deadlock.
         let method = message.method();
-        match method {
-            Some(SipMethod::Invite) => {
-                let current_rate = tracking.record_invite(now);
-                if current_rate > config.invite_rate_limit {
-                    self.rate_limited_requests.fetch_add(1, Ordering::Relaxed);
-                    let reason = format!("INVITE rate limit exceeded: {}/s", current_rate);
-                    self.block_ip(ip, reason.clone(), config.block_duration_secs);
-                    return Err(reason);
+        let block_reason: Option<String> = {
+            let mut tracking = self.ip_tracking.entry(ip).or_insert_with(IpTrackingData::new);
+
+            match method {
+                Some(SipMethod::Invite) => {
+                    let current_rate = tracking.record_invite(now);
+                    if current_rate > config.invite_rate_limit {
+                        self.rate_limited_requests.fetch_add(1, Ordering::Relaxed);
+                        Some(format!("INVITE rate limit exceeded: {}/s", current_rate))
+                    } else {
+                        None
+                    }
+                }
+                Some(SipMethod::Register) | Some(SipMethod::Options) => {
+                    let sequential_count = tracking.record_scanner_request(method.unwrap(), now);
+                    if sequential_count >= config.scanner_threshold {
+                        self.scanner_detections.fetch_add(1, Ordering::Relaxed);
+                        Some(format!(
+                            "Scanner detected: {} sequential {} requests",
+                            sequential_count,
+                            method.unwrap()
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    // Reset scanner detection for other methods
+                    if let Some(method) = method {
+                        tracking.reset_scanner_detection(method, now);
+                    }
+                    None
                 }
             }
-            Some(SipMethod::Register) | Some(SipMethod::Options) => {
-                let sequential_count = tracking.record_scanner_request(method.unwrap(), now);
-                if sequential_count >= config.scanner_threshold {
-                    self.scanner_detections.fetch_add(1, Ordering::Relaxed);
-                    let reason = format!(
-                        "Scanner detected: {} sequential {} requests",
-                        sequential_count,
-                        method.unwrap()
-                    );
-                    self.block_ip(ip, reason.clone(), config.block_duration_secs);
-                    return Err(reason);
-                }
-            }
-            _ => {
-                // Reset scanner detection for other methods
-                if let Some(method) = method {
-                    tracking.reset_scanner_detection(method, now);
-                }
-            }
+        }; // entry guard dropped here
+
+        if let Some(reason) = block_reason {
+            self.block_ip(ip, reason.clone(), config.block_duration_secs);
+            return Err(reason);
         }
 
         Ok(())

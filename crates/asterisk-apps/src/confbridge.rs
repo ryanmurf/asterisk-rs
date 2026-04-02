@@ -980,7 +980,7 @@ impl AppConfBridge {
 
         // Extract SIP Call-ID and video stream info for SFU
         let sip_call_id = channel.variables.get("__SIP_CALL_ID").cloned();
-        let video_streams = Self::extract_video_streams_for_channel(&sip_call_id);
+        let video_streams = Self::extract_video_streams_for_channel(&sip_call_id).await;
 
         // Create the conference user
         let conf_user = ConferenceUser {
@@ -1080,7 +1080,7 @@ impl AppConfBridge {
     }
 
     /// Extract video stream information from the SIP session's remote SDP.
-    fn extract_video_streams_for_channel(sip_call_id: &Option<String>) -> Vec<VideoStreamInfo> {
+    async fn extract_video_streams_for_channel(sip_call_id: &Option<String>) -> Vec<VideoStreamInfo> {
         let call_id = match sip_call_id {
             Some(id) => id,
             None => return Vec::new(),
@@ -1091,7 +1091,7 @@ impl AppConfBridge {
             None => return Vec::new(),
         };
 
-        let remote_sdp = match handler.get_remote_sdp(call_id) {
+        let remote_sdp = match handler.get_remote_sdp_async(call_id).await {
             Some(sdp) => sdp,
             None => return Vec::new(),
         };
@@ -1252,7 +1252,7 @@ impl AppConfBridge {
             };
 
             // Get the local SDP for this participant (the SDP answer we sent them).
-            let local_sdp = match handler.get_initial_local_sdp(call_id) {
+            let local_sdp = match handler.get_initial_local_sdp_async(call_id).await {
                 Some(sdp) => sdp,
                 None => {
                     warn!(call_id = %call_id, "ConfBridge SFU: no local SDP for participant");
@@ -1260,7 +1260,7 @@ impl AppConfBridge {
                 }
             };
 
-            let local_addr = handler.local_addr_for_call(call_id)
+            let local_addr = handler.local_addr_for_call_async(call_id).await
                 .unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Collect video streams from all OTHER participants (active and departed).
