@@ -5,7 +5,6 @@
 //! signalling. The actual geolocation data (PIDF-LO) is handled by
 //! the `geolocation_res` module in `asterisk-res`.
 
-use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Geolocation header

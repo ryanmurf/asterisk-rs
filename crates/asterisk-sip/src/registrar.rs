@@ -277,7 +277,7 @@ impl Registrar {
     /// Add or refresh a contact binding.
     pub fn register(&self, reg: Registration) {
         let mut map = self.contacts.write();
-        let list = map.entry(reg.aor.clone()).or_insert_with(Vec::new);
+        let list = map.entry(reg.aor.clone()).or_default();
 
         // If the contact already exists, update it.
         if let Some(existing) = list.iter_mut().find(|r| r.contact_uri == reg.contact_uri) {

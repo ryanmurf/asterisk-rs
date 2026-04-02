@@ -107,14 +107,13 @@ impl AppZapateller {
         // stop_stream(channel).await;
 
         // Answer the channel if requested and not already up
-        if channel.state != ChannelState::Up {
-            if options.answer {
+        if channel.state != ChannelState::Up
+            && options.answer {
                 channel.state = ChannelState::Up;
                 status = ZapatellerStatus::Answered;
             }
             // Brief pause after answer
             // safe_sleep(channel, 500).await;
-        }
 
         // If nocallerid option is set and we have caller ID, skip
         if options.no_caller_id {

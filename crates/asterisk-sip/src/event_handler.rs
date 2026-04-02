@@ -669,7 +669,7 @@ impl SipEventHandler {
         &self,
         request: &SipMessage,
         remote_addr: SocketAddr,
-        mut session: SipSession,
+        session: SipSession,
     ) -> Option<String> {
         let call_id = request.call_id()?.to_string();
 

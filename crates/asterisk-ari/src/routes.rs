@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 /// Build the complete ARI route tree rooted at "ari".
 pub fn build_route_tree() -> Arc<RestHandler> {
-    let root = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("ari")
             .child(build_channels_routes())
             .child(build_bridges_routes())
@@ -30,7 +32,5 @@ pub fn build_route_tree() -> Arc<RestHandler> {
             .child(build_asterisk_routes())
             .child(build_device_states_routes())
             .child(build_mailboxes_routes()),
-    );
-
-    root
+    )
 }

@@ -437,7 +437,7 @@ impl DialOptions {
                 chars.next(); // consume '('
                 let mut depth = 1;
                 let mut arg_str = String::new();
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '(' {
                         depth += 1;
                         arg_str.push(c);
@@ -1418,10 +1418,10 @@ impl AppDial {
 
                 // Set answered-specific channel variables
                 let answered_time = answer_time.elapsed();
-                caller.set_variable("ANSWEREDTIME", &answered_time.as_secs().to_string());
+                caller.set_variable("ANSWEREDTIME", answered_time.as_secs().to_string());
                 caller.set_variable(
                     "ANSWEREDTIME_MS",
-                    &answered_time.as_millis().to_string(),
+                    answered_time.as_millis().to_string(),
                 );
                 caller.set_variable("DIALEDPEERNAME", &answered_name);
                 caller.set_variable("DIALEDPEERNUMBER", &answered_number);
@@ -1498,8 +1498,8 @@ impl AppDial {
 
         // Set common channel variables
         caller.set_variable("DIALSTATUS", dial_status.as_str());
-        caller.set_variable("DIALEDTIME", &dial_elapsed.as_secs().to_string());
-        caller.set_variable("DIALEDTIME_MS", &dial_elapsed.as_millis().to_string());
+        caller.set_variable("DIALEDTIME", dial_elapsed.as_secs().to_string());
+        caller.set_variable("DIALEDTIME_MS", dial_elapsed.as_millis().to_string());
 
         info!(
             "Dial: complete for '{}': DIALSTATUS={} DIALEDTIME={}s",

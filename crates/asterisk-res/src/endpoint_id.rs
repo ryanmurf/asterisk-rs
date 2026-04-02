@@ -176,11 +176,10 @@ impl EndpointIdentifier for IpIdentifier {
         // Try most specific (longest prefix) first.
         let mut best: Option<&IpMatch> = None;
         for m in matches.iter() {
-            if Self::ip_in_subnet(ctx.source_ip, m.addr, m.prefix_len) {
-                if best.is_none() || m.prefix_len > best.unwrap().prefix_len {
+            if Self::ip_in_subnet(ctx.source_ip, m.addr, m.prefix_len)
+                && (best.is_none() || m.prefix_len > best.unwrap().prefix_len) {
                     best = Some(m);
                 }
-            }
         }
         best.map(|m| m.endpoint.clone())
     }

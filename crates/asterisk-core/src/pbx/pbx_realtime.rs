@@ -9,9 +9,9 @@
 //! When an extension is dialed, the realtime engine queries the database
 //! for matching rows and constructs temporary Extension/Priority objects.
 
-use super::{Context, Extension, Priority};
+use super::{Extension, Priority};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// A row returned from a realtime extension query.
 #[derive(Debug, Clone)]

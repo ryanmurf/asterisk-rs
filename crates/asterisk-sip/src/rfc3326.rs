@@ -38,7 +38,7 @@ impl ReasonHeader {
         if let Some(q850) = self.q850_cause {
             Some(q850 & 0x7f)
         } else {
-            self.sip_cause.map(|c| sip_to_hangup_cause(c))
+            self.sip_cause.map(sip_to_hangup_cause)
         }
     }
 }

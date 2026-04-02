@@ -7,7 +7,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Morse code type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +147,7 @@ impl Default for MorseConfig {
 /// Look up the Morse code representation for an ASCII character.
 pub fn char_to_morse(ch: char, morse_type: MorseType) -> &'static str {
     let idx = ch as usize;
-    if idx < 32 || idx > 127 {
+    if !(32..=127).contains(&idx) {
         return "";
     }
     match morse_type {

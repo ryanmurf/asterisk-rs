@@ -107,7 +107,7 @@ pub async fn create_rtp_from_sdp(
 ) -> Result<RtpSession, std::io::Error> {
     let mut session = RtpSession::bind(local_addr)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Set primary payload type.
     session.payload_type = params.primary_payload_type;

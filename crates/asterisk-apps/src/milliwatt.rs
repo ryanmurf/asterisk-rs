@@ -7,7 +7,7 @@
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
 use asterisk_types::ChannelState;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// The 8-byte digital milliwatt pattern (mu-law encoded 1004 Hz).
 ///

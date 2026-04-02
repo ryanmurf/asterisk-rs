@@ -41,8 +41,10 @@ pub type SrtpResult<T> = Result<T, SrtpError>;
 
 /// SRTP cipher suite (from RFC 4568 / SDES).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum SrtpSuite {
     /// AES_CM_128_HMAC_SHA1_80 (default).
+    #[default]
     AesCm128HmacSha1_80,
     /// AES_CM_128_HMAC_SHA1_32 (reduced auth tag).
     AesCm128HmacSha1_32,
@@ -108,11 +110,6 @@ impl SrtpSuite {
     }
 }
 
-impl Default for SrtpSuite {
-    fn default() -> Self {
-        Self::AesCm128HmacSha1_80
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SRTP policy trait

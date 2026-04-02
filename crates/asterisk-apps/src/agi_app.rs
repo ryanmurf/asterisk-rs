@@ -11,8 +11,7 @@
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
 use asterisk_res::agi::{
-    AgiCommandRegistry, AgiEnvironment, AgiMode,
-    AgiSession, FastAgiSession, handle_agi_command, parse_agi_command,
+    AgiCommandRegistry, AgiEnvironment, AgiMode, FastAgiSession, handle_agi_command, parse_agi_command,
 };
 use tracing::{debug, error, info, warn};
 
@@ -175,7 +174,7 @@ impl AppAgi {
             // Search in the channel's AGI directory (astagidir)
             // or the current working directory
             let agi_dir = channel.get_variable("ASTAGIDIR")
-                .map(|s| std::path::PathBuf::from(s))
+                .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             agi_dir.join(request)
         };

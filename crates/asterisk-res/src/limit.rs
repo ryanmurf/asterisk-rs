@@ -152,12 +152,12 @@ pub fn get_resource_limit(resource: ResourceType) -> LimitResult<ResourceLimit> 
     let soft = if rlim.rlim_cur == libc::RLIM_INFINITY {
         u64::MAX
     } else {
-        rlim.rlim_cur as u64
+        rlim.rlim_cur
     };
     let hard = if rlim.rlim_max == libc::RLIM_INFINITY {
         u64::MAX
     } else {
-        rlim.rlim_max as u64
+        rlim.rlim_max
     };
     Ok(ResourceLimit { soft, hard })
 }

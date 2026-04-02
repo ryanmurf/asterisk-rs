@@ -136,7 +136,7 @@ impl SubBandState {
     /// Update adaptive predictor state.
     fn block4_encode(&mut self, d: i32) {
         let mut reconstructed = self.signal_estimate + d;
-        reconstructed = reconstructed.max(-32768).min(32767);
+        reconstructed = reconstructed.clamp(-32768, 32767);
 
         // Update poles
         let p0 = self.poles[0];
@@ -158,7 +158,7 @@ impl SubBandState {
             };
 
         // Clamp poles
-        self.poles[0] = self.poles[0].max(-12288).min(12288);
+        self.poles[0] = self.poles[0].clamp(-12288, 12288);
         let limit = 12288i32.min(15360 - self.poles[0].abs());
         self.poles[1] = self.poles[1].max(-limit).min(limit);
 
@@ -186,7 +186,7 @@ impl SubBandState {
             + self.poles[1] as i64 * self.prev_reconstructed[1] as i64;
 
         self.signal_estimate = ((sp + sz) >> 14) as i32;
-        self.signal_estimate = self.signal_estimate.max(-32768).min(32767);
+        self.signal_estimate = self.signal_estimate.clamp(-32768, 32767);
 
         self.prev_reconstructed[1] = self.prev_reconstructed[0];
         self.prev_reconstructed[0] = reconstructed;
@@ -233,7 +233,7 @@ impl G722Encoder {
 
     /// Set the encoding mode (1=64kbps, 2=56kbps, 3=48kbps).
     pub fn set_mode(&mut self, mode: u8) {
-        self.mode = mode.max(1).min(3);
+        self.mode = mode.clamp(1, 3);
     }
 
     /// Encode 16kHz signed linear samples into G.722 data.
@@ -299,6 +299,7 @@ fn quantize_lower(el: i32, _state: &SubBandState) -> i32 {
 
     // Binary search in the decision table
     let mut code: i32 = 0;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..30 {
         if abs_el > QQ6[i] {
             code = i as i32 + 1;
@@ -354,7 +355,7 @@ impl G722Decoder {
 
     /// Set the decoding mode (1=64kbps, 2=56kbps, 3=48kbps).
     pub fn set_mode(&mut self, mode: u8) {
-        self.mode = mode.max(1).min(3);
+        self.mode = mode.clamp(1, 3);
     }
 
     /// Decode G.722 data into 16kHz signed linear samples.

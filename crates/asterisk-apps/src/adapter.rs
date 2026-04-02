@@ -168,7 +168,7 @@ pub fn register_all_apps() {
     APP_REGISTRY.register(Arc::new(AppAdapter::new(
         "Hangup",
         "Hangup the calling channel",
-        |channel, args| AppHangup::exec(channel, args),
+        AppHangup::exec,
     )));
 
     // Verbose - sync exec (takes &Channel, not &mut)
@@ -196,28 +196,28 @@ pub fn register_all_apps() {
     APP_REGISTRY.register(Arc::new(AppAdapter::new(
         "GoSub",
         "Execute a dialplan subroutine",
-        |channel, args| AppGoSub::exec(channel, args),
+        AppGoSub::exec,
     )));
 
     // GoSubIf - sync exec
     APP_REGISTRY.register(Arc::new(AppAdapter::new(
         "GoSubIf",
         "Conditionally execute a dialplan subroutine",
-        |channel, args| AppGoSubIf::exec(channel, args),
+        AppGoSubIf::exec,
     )));
 
     // Return - sync exec
     APP_REGISTRY.register(Arc::new(AppAdapter::new(
         "Return",
         "Return from a GoSub",
-        |channel, args| AppReturn::exec(channel, args),
+        AppReturn::exec,
     )));
 
     // StackPop - sync exec
     APP_REGISTRY.register(Arc::new(AppAdapter::new(
         "StackPop",
         "Pop the GoSub stack",
-        |channel, args| AppStackPop::exec(channel, args),
+        AppStackPop::exec,
     )));
 
     // -----------------------------------------------------------------------

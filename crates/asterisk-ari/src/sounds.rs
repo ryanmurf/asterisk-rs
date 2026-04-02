@@ -16,13 +16,13 @@ pub fn build_sounds_routes() -> Arc<RestHandler> {
     );
 
     // /sounds
-    let sounds = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("sounds")
             .on(HttpMethod::Get, handle_list)
             .child(sound_by_id),
-    );
-
-    sounds
+    )
 }
 
 // ---------------------------------------------------------------------------

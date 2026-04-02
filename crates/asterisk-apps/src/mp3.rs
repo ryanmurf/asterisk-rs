@@ -11,7 +11,6 @@ use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
 use asterisk_types::ChannelState;
 use std::path::PathBuf;
-use std::process::Stdio;
 use tracing::{debug, info, warn};
 
 /// Well-known paths for the mpg123 decoder.

@@ -127,7 +127,7 @@ impl AlarmEvent {
             };
             sum += val;
         }
-        sum % 15 == 0
+        sum.is_multiple_of(15)
     }
 
     /// Format event for logging.

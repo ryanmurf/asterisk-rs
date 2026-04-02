@@ -181,12 +181,12 @@ impl CallerId {
 
     /// Whether this caller ID has a valid number.
     pub fn has_number(&self) -> bool {
-        self.number.as_ref().map_or(false, |n| !n.is_empty())
+        self.number.as_ref().is_some_and(|n| !n.is_empty())
     }
 
     /// Whether this caller ID has a valid name.
     pub fn has_name(&self) -> bool {
-        self.name.as_ref().map_or(false, |n| !n.is_empty())
+        self.name.as_ref().is_some_and(|n| !n.is_empty())
     }
 }
 

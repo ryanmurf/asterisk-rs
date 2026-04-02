@@ -435,11 +435,8 @@ impl SessionDescription {
                         media.attributes.push((attr_name, attr_value));
                     } else {
                         // Session-level attributes: also check for fingerprint/setup.
-                        match attr_name.as_str() {
-                            "fingerprint" => {
-                                // Session-level fingerprint applies to all media.
-                            }
-                            _ => {}
+                        if attr_name.as_str() == "fingerprint" {
+                            // Session-level fingerprint applies to all media.
                         }
                         sdp.attributes.push((attr_name, attr_value));
                     }

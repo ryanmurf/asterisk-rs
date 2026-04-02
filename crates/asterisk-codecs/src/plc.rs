@@ -185,6 +185,7 @@ impl PlcEngine {
 
         // Apply crossfade at the beginning to smooth transition
         let overlap = self.overlap_length.min(output.len()).min(src.len());
+        #[allow(clippy::needless_range_loop)]
         for i in 0..overlap {
             let fade_in = i as f32 / overlap as f32;
             let fade_out = 1.0 - fade_in;

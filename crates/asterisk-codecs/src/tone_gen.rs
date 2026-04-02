@@ -204,10 +204,11 @@ impl ToneGenerator {
 
             if self.in_silence {
                 // Generate silence
-                let silence_samples = (segment.silence_ms * self.sample_rate / 1000) as u32;
+                let silence_samples = segment.silence_ms * self.sample_rate / 1000;
                 let remaining = silence_samples.saturating_sub(self.sample_position);
                 let to_generate = remaining.min((num_samples - output.len()) as u32);
 
+                #[allow(clippy::same_item_push)]
                 for _ in 0..to_generate {
                     output.push(0);
                 }
@@ -221,7 +222,7 @@ impl ToneGenerator {
                 }
             } else {
                 // Generate tone
-                let tone_samples = (segment.duration_ms * self.sample_rate / 1000) as u32;
+                let tone_samples = segment.duration_ms * self.sample_rate / 1000;
                 let remaining = tone_samples.saturating_sub(self.sample_position);
                 let to_generate = remaining.min((num_samples - output.len()) as u32);
 

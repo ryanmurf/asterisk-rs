@@ -576,7 +576,7 @@ mod pure_rust_backend {
             // Positive = seq is ahead, negative = seq is behind.
             let delta = seq.wrapping_sub(self.last_seq) as i16;
 
-            let v = if delta > 0 {
+            let _v = if delta > 0 {
                 // seq is ahead of last_seq (normal forward case).
                 // Check if we wrapped: if last_seq is high and seq is
                 // low, wrapping_sub gives a small positive number.
@@ -1167,7 +1167,7 @@ impl SrtpCrypto for AeadGcmSrtp {
     }
 
     fn protect_rtp(&mut self, packet: &mut Vec<u8>) -> Result<(), SrtpError> {
-        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit, Nonce};
+        use aes_gcm::{Aes128Gcm, Aes256Gcm, AeadInPlace, KeyInit};
 
         if packet.len() < RTP_HEADER_MIN {
             return Err(SrtpError::PacketTooShort {
@@ -1452,7 +1452,7 @@ pub fn create_srtp_crypto(
 
     #[cfg(feature = "pure-rust-crypto")]
     {
-        return Ok(Box::new(PureRustSrtp::new(key_material)?));
+        Ok(Box::new(PureRustSrtp::new(key_material)?))
     }
 
     #[cfg(feature = "openssl-crypto")]

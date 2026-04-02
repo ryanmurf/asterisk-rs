@@ -72,13 +72,13 @@ pub fn build_recordings_routes() -> Arc<RestHandler> {
     );
 
     // /recordings
-    let recordings = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("recordings")
             .child(stored)
             .child(live),
-    );
-
-    recordings
+    )
 }
 
 // ---------------------------------------------------------------------------

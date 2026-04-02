@@ -152,7 +152,7 @@ impl MediaCache {
     /// Check whether a URL is cached and still fresh.
     pub fn is_fresh(&self, url: &str) -> bool {
         let entries = self.entries.read();
-        entries.get(url).map_or(false, |e| !e.is_expired())
+        entries.get(url).is_some_and(|e| !e.is_expired())
     }
 
     /// Remove a cache entry by URL.

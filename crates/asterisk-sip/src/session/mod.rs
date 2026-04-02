@@ -48,6 +48,7 @@ impl Default for EarlyMediaConfig {
 
 /// State tracking for early media from forked INVITEs.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct EarlyMediaState {
     /// Whether the INVITE was forked (1xx from multiple UASs).
     pub forked: bool,
@@ -59,16 +60,6 @@ pub struct EarlyMediaState {
     pub fork_tags: Vec<String>,
 }
 
-impl Default for EarlyMediaState {
-    fn default() -> Self {
-        Self {
-            forked: false,
-            forked_from: Vec::new(),
-            selected_fork: None,
-            fork_tags: Vec::new(),
-        }
-    }
-}
 
 impl EarlyMediaState {
     /// Record a provisional response from a fork.
@@ -294,18 +285,15 @@ impl SipSession {
                         );
 
                         // Only process SDP from the selected fork
-                        if self.early_media_config.follow_early_media_fork
-                            || self.early_media.is_selected_fork(&to_tag)
-                        {
-                            if !response.body.is_empty() {
-                                if self.early_media_config.accept_multiple_sdp_answers
-                                    || self.remote_sdp.is_none()
+                        if (self.early_media_config.follow_early_media_fork
+                            || self.early_media.is_selected_fork(&to_tag))
+                            && !response.body.is_empty()
+                                && (self.early_media_config.accept_multiple_sdp_answers
+                                    || self.remote_sdp.is_none())
                                 {
                                     self.remote_sdp =
                                         SessionDescription::parse(&response.body).ok();
                                 }
-                            }
-                        }
                     }
                 }
 

@@ -183,7 +183,7 @@ impl ReadArgs {
                     trimmed.parse::<f64>().ok()
                 }
             })
-            .map(|secs| Duration::from_secs_f64(secs))
+            .map(Duration::from_secs_f64)
             .unwrap_or(Duration::ZERO);
 
         Some(Self {

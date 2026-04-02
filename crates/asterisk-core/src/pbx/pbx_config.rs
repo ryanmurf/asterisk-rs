@@ -14,7 +14,7 @@
 
 use super::{Context, Dialplan, Extension, Priority};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Result of loading extensions.conf.
 #[derive(Debug)]

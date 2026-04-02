@@ -6,12 +6,9 @@
 //! header extension.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 
 use super::RtpHeader;
-use asterisk_types::AsteriskError;
 
 // ---------------------------------------------------------------------------
 // Bundle group

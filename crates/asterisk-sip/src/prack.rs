@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use crate::parser::{SipMessage, SipMethod, StartLine, RequestLine, SipUri, SipHeader};
+use crate::parser::{SipMessage, SipMethod};
 use crate::transaction::timers;
 
 // ---------------------------------------------------------------------------

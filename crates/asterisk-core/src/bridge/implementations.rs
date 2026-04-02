@@ -93,7 +93,7 @@ impl SimpleBridgeRouting {
 /// Global routing state for simple bridges. Each bridge_id maps to its routing state.
 static SIMPLE_BRIDGE_ROUTING: std::sync::LazyLock<
     dashmap::DashMap<String, Arc<Mutex<SimpleBridgeRouting>>>,
-> = std::sync::LazyLock::new(|| dashmap::DashMap::new());
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Get or create routing state for a bridge.
 pub fn get_simple_routing(bridge_id: &str) -> Arc<Mutex<SimpleBridgeRouting>> {

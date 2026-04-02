@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Opus attributes (RFC 7587)
@@ -187,6 +186,7 @@ impl SilkAttr {
 
 /// VP8 video codec attributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Vp8Attr {
     /// Maximum frame rate.
     pub max_fr: Option<u32>,
@@ -194,14 +194,6 @@ pub struct Vp8Attr {
     pub max_fs: Option<u32>,
 }
 
-impl Default for Vp8Attr {
-    fn default() -> Self {
-        Self {
-            max_fr: None,
-            max_fs: None,
-        }
-    }
-}
 
 impl Vp8Attr {
     pub fn from_fmtp(fmtp: &str) -> Self {
@@ -226,6 +218,7 @@ impl Vp8Attr {
 
 /// H.264 video codec attributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct H264Attr {
     /// Profile-level-id (3 bytes hex-encoded).
     pub profile_level_id: Option<String>,
@@ -241,18 +234,6 @@ pub struct H264Attr {
     pub level_asymmetry_allowed: bool,
 }
 
-impl Default for H264Attr {
-    fn default() -> Self {
-        Self {
-            profile_level_id: None,
-            max_mbps: None,
-            max_fs: None,
-            max_br: None,
-            packetization_mode: 0,
-            level_asymmetry_allowed: false,
-        }
-    }
-}
 
 impl H264Attr {
     pub fn from_fmtp(fmtp: &str) -> Self {
@@ -310,6 +291,7 @@ impl H264Attr {
 
 /// H.263 video codec attributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct H263Attr {
     /// SQCIF MPI (Minimum Picture Interval).
     pub sqcif: Option<u32>,
@@ -323,17 +305,6 @@ pub struct H263Attr {
     pub max_br: Option<u32>,
 }
 
-impl Default for H263Attr {
-    fn default() -> Self {
-        Self {
-            sqcif: None,
-            qcif: None,
-            cif: None,
-            cif4: None,
-            max_br: None,
-        }
-    }
-}
 
 impl H263Attr {
     pub fn from_fmtp(fmtp: &str) -> Self {

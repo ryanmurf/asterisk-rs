@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Errors

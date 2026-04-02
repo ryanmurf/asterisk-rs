@@ -71,13 +71,13 @@ pub fn build_mailboxes_routes() -> Arc<RestHandler> {
     );
 
     // /mailboxes
-    let mailboxes = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("mailboxes")
             .on(HttpMethod::Get, handle_list)
             .child(mailbox_by_name),
-    );
-
-    mailboxes
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -69,13 +69,13 @@ pub fn build_device_states_routes() -> Arc<RestHandler> {
     );
 
     // /deviceStates
-    let device_states = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("deviceStates")
             .on(HttpMethod::Get, handle_list)
             .child(device_by_name),
-    );
-
-    device_states
+    )
 }
 
 // ---------------------------------------------------------------------------

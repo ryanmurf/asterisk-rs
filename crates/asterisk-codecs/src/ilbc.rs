@@ -21,10 +21,12 @@ use asterisk_types::Frame;
 
 /// iLBC frame mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum IlbcMode {
     /// 20ms mode: 38 bytes per frame, 15.20 kbps
     Mode20ms,
     /// 30ms mode: 50 bytes per frame, 13.33 kbps
+    #[default]
     Mode30ms,
 }
 
@@ -79,26 +81,15 @@ impl IlbcMode {
     }
 }
 
-impl Default for IlbcMode {
-    fn default() -> Self {
-        IlbcMode::Mode30ms // Asterisk default
-    }
-}
 
 /// iLBC encoder configuration.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct IlbcEncoderConfig {
     /// Frame mode (20ms or 30ms).
     pub mode: IlbcMode,
 }
 
-impl Default for IlbcEncoderConfig {
-    fn default() -> Self {
-        Self {
-            mode: IlbcMode::default(),
-        }
-    }
-}
 
 /// iLBC decoder configuration.
 #[derive(Debug, Clone)]

@@ -5,9 +5,7 @@
 //! Data Format - Location Object) XML documents containing civic addresses,
 //! GML shapes, and geolocation profiles per RFC 4119 / RFC 5491.
 
-use std::fmt;
 
-use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Civic address elements (RFC 4119 / RFC 5139)

@@ -28,8 +28,10 @@ use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, 
 
 /// Analog signaling type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AnalogSignaling {
     /// No signaling.
+    #[default]
     None,
     /// FXO, loop start.
     FxoLs,
@@ -75,24 +77,16 @@ pub enum AnalogSignaling {
     SfFeatB,
 }
 
-impl Default for AnalogSignaling {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Analog hook state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum HookState {
+    #[default]
     OnHook,
     OffHook,
 }
 
-impl Default for HookState {
-    fn default() -> Self {
-        Self::OnHook
-    }
-}
 
 /// Analog tone types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,18 +125,15 @@ pub enum AnalogEvent {
 
 /// Caller ID signaling method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CallerIdMethod {
     /// FSK (Bell 202 / V.23) modem tones.
+    #[default]
     Fsk,
     /// DTMF-based caller ID.
     Dtmf,
 }
 
-impl Default for CallerIdMethod {
-    fn default() -> Self {
-        Self::Fsk
-    }
-}
 
 /// Analog sub-channel type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,17 +263,14 @@ impl AnalogChannel {
 
 /// PRI signaling law.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum PriLaw {
+    #[default]
     Default,
     Ulaw,
     Alaw,
 }
 
-impl Default for PriLaw {
-    fn default() -> Self {
-        Self::Default
-    }
-}
 
 /// PRI span configuration (stub).
 ///
@@ -678,11 +666,8 @@ impl ChannelDriver for DahdiDriver {
             .get_private(channel.unique_id.as_str())
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
-        match frame {
-            Frame::Voice { data, .. } => {
-                Self::write_audio(priv_data.config.channel_number, data)?;
-            }
-            _ => {}
+        if let Frame::Voice { data, .. } = frame {
+            Self::write_audio(priv_data.config.channel_number, data)?;
         }
         Ok(())
     }

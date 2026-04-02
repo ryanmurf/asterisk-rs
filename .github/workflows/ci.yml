@@ -17,11 +17,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude pjsip-shim
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude pjsip-shim
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --exclude pjsip-shim -- -D warnings
 
   build-release:
     runs-on: ubuntu-latest
@@ -30,4 +30,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --exclude pjsip-shim

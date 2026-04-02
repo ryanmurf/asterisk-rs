@@ -184,7 +184,7 @@ impl Agent {
         let mut event = AmiEvent::new("AgentLogoff", EventCategory::AGENT.0);
         event.add_header("Agent", &self.config.agent_id);
         event.add_header("Channel", &channel_name);
-        event.add_header("Logintime", &login_duration.to_string());
+        event.add_header("Logintime", login_duration.to_string());
         asterisk_ami::publish_event(event);
     }
 
@@ -208,7 +208,7 @@ impl Agent {
         let hold_time = self.login_time
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
-        event.add_header("HoldTime", &hold_time.to_string());
+        event.add_header("HoldTime", hold_time.to_string());
         asterisk_ami::publish_event(event);
     }
 
@@ -231,8 +231,8 @@ impl Agent {
         // Emit AgentComplete AMI event
         let mut event = AmiEvent::new("AgentComplete", EventCategory::AGENT.0);
         event.add_header("Agent", &self.config.agent_id);
-        event.add_header("TalkTime", &talk_time.to_string());
-        event.add_header("CallsTaken", &self.calls_taken.to_string());
+        event.add_header("TalkTime", talk_time.to_string());
+        event.add_header("CallsTaken", self.calls_taken.to_string());
         if let Some(ref agent_chan) = self.logged_channel {
             event.add_header("MemberChannel", agent_chan);
         }

@@ -539,16 +539,16 @@ impl CliCommand for CmdCoreShowSettings {
     fn description(&self) -> &str { "Show PBX core settings" }
     fn execute(&self, _args: &[&str], state: &ServerState) -> Vec<String> {
         let mut lines = Vec::new();
-        lines.push(format!("PBX Core Settings"));
-        lines.push(format!("-----------------"));
+        lines.push("PBX Core Settings".to_string());
+        lines.push("-----------------".to_string());
         lines.push(format!("  Version:                {}", state.version));
         lines.push(format!("  Configuration directory: {}", state.config_dir));
         lines.push(format!("  Run directory:           {}", state.run_dir));
         lines.push(format!("  PID:                     {}", std::process::id()));
         lines.push(format!("  Verbose level:           {}", state.verbose_level.load(Ordering::Relaxed)));
         lines.push(format!("  Debug level:             {}", state.debug_level.load(Ordering::Relaxed)));
-        lines.push(format!("  Max calls:               0"));
-        lines.push(format!("  Max load:                0.00"));
+        lines.push("  Max calls:               0".to_string());
+        lines.push("  Max load:                0.00".to_string());
         lines
     }
 }
@@ -769,7 +769,7 @@ async fn handle_control_connection(
     let mut line = String::new();
 
     match buf_reader.read_line(&mut line).await {
-        Ok(0) => return,
+        Ok(0) => (),
         Ok(_) => {
             let cmd = line.trim();
             debug!("Control socket received command: {}", cmd);

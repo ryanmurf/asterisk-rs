@@ -270,7 +270,7 @@ pub async fn bridge_channel_run(
 
         let action = {
             let br = bridge.lock().await;
-            process_frame(&frame, &channel_id, &mut features, &*br, &bc_snapshot)
+            process_frame(&frame, &channel_id, &mut features, &br, &bc_snapshot)
         };
 
         match action {

@@ -675,7 +675,7 @@ pub fn is_rtcp_packet(data: &[u8]) -> bool {
     // RTCP PTs 200-204 fall in the range where RTP PTs would be
     // 200-204 with marker=0, or 72-76 with marker=1. Since PT 72-76
     // are unassigned, this demux is safe.
-    pt >= RTCP_PT_RANGE_START && pt <= RTCP_PT_RANGE_END
+    (RTCP_PT_RANGE_START..=RTCP_PT_RANGE_END).contains(&pt)
 }
 
 /// A muxed RTP/RTCP session (RFC 5761).

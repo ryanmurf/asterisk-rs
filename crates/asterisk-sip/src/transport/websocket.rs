@@ -105,7 +105,7 @@ fn compute_accept_key(client_key: &str) -> String {
     hasher.update(client_key.as_bytes());
     hasher.update(WEBSOCKET_GUID.as_bytes());
     let result = hasher.finalize();
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &result)
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, result)
 }
 
 /// Build a WebSocket upgrade response.

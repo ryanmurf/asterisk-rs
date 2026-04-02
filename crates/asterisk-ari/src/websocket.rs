@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// A handle to send JSON event strings to a connected WebSocket client.
 pub type EventSender = mpsc::UnboundedSender<String>;
@@ -110,7 +110,7 @@ impl WebSocketSessionManager {
         for app_name in &app_names {
             self.app_sessions
                 .entry(app_name.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(session_id.clone());
         }
 

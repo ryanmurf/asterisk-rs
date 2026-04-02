@@ -7,7 +7,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use tracing::{info, warn, debug};
+use tracing::{info, debug};
 
 /// Options for the ForkCDR application.
 #[derive(Debug, Clone, Default)]

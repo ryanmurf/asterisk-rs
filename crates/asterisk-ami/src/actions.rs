@@ -317,7 +317,7 @@ fn handle_ping(
 ) -> AmiResponse {
     AmiResponse::success("Pong")
         .with_header("Ping", "Pong")
-        .with_header("Timestamp", &format!("{}", chrono_timestamp()))
+        .with_header("Timestamp", format!("{}", chrono_timestamp()))
 }
 
 /// Handle CoreShowChannels action.
@@ -370,7 +370,7 @@ fn handle_core_show_channels(
         complete.add_header("ActionID", &action_id);
     }
     complete.add_header("EventList", "Complete");
-    complete.add_header("ListItems", &count.to_string());
+    complete.add_header("ListItems", count.to_string());
     resp.add_followup_event(complete);
 
     resp
@@ -970,7 +970,7 @@ pub fn execute_cli_command(command: &str) -> Vec<String> {
 
 /// Handle `pjsip send notify <template> endpoint <endpoint>` CLI command.
 fn handle_pjsip_send_notify_cli(command: &str) -> Vec<String> {
-    let parts: Vec<&str> = command.trim().split_whitespace().collect();
+    let parts: Vec<&str> = command.split_whitespace().collect();
     // Expected: "pjsip send notify <template> endpoint <endpoint>"
     if parts.len() < 6 {
         return vec!["Usage: pjsip send notify <template> endpoint <endpoint>".to_string()];
@@ -1123,7 +1123,7 @@ fn handle_status(
         event.add_header("Extension", &chan.exten);
         event.add_header("Priority", &priority_str);
         event.add_header("ChannelState", &state_num);
-        event.add_header("ChannelStateDesc", &chan.state.to_string());
+        event.add_header("ChannelStateDesc", chan.state.to_string());
         event.add_header("AccountCode", &chan.accountcode);
 
         resp.add_followup_event(event);
@@ -1134,7 +1134,7 @@ fn handle_status(
     if !action_id.is_empty() {
         complete.add_header("ActionID", &action_id);
     }
-    complete.add_header("Items", &count.to_string());
+    complete.add_header("Items", count.to_string());
     resp.add_followup_event(complete);
 
     resp
@@ -1372,12 +1372,11 @@ fn evaluate_dialplan_function(variable: &str) -> Option<String> {
         let mut state = "NOT_INUSE";
         for entry in asterisk_core::channel_store::all_channels() {
             let ch = entry.lock();
-            if ch.name.starts_with(&prefix) {
-                if ch.state == asterisk_types::ChannelState::Up {
+            if ch.name.starts_with(&prefix)
+                && ch.state == asterisk_types::ChannelState::Up {
                     state = "INUSE";
                     break;
                 }
-            }
         }
         return Some(state.to_string());
     }
@@ -1443,7 +1442,7 @@ fn handle_pjsip_show_endpoints(
             complete.add_header("ActionID", &action_id);
         }
         complete.add_header("EventList", "Complete");
-        complete.add_header("ListItems", &ep_count.to_string());
+        complete.add_header("ListItems", ep_count.to_string());
         resp.add_followup_event(complete);
     } else {
         let mut complete = AmiEvent::new("EndpointListComplete", 0x01);
@@ -1600,14 +1599,14 @@ fn handle_pjsip_show_endpoint(
             event.add_header("ObjectName", &aor.name);
             event.add_header("Mailboxes", "");
             event.add_header("RemoveExisting", if aor.remove_existing { "true" } else { "false" });
-            event.add_header("MaxContacts", &aor.max_contacts.to_string());
+            event.add_header("MaxContacts", aor.max_contacts.to_string());
             event.add_header("AuthenticateQualify", "false");
-            event.add_header("QualifyFrequency", &aor.qualify_frequency.to_string());
-            event.add_header("DefaultExpiration", &aor.default_expiration.to_string());
-            event.add_header("MaximumExpiration", &aor.maximum_expiration.to_string());
-            event.add_header("MinimumExpiration", &aor.minimum_expiration.to_string());
+            event.add_header("QualifyFrequency", aor.qualify_frequency.to_string());
+            event.add_header("DefaultExpiration", aor.default_expiration.to_string());
+            event.add_header("MaximumExpiration", aor.maximum_expiration.to_string());
+            event.add_header("MinimumExpiration", aor.minimum_expiration.to_string());
             event.add_header("Contacts", &contacts);
-            event.add_header("TotalContacts", &aor.contact.len().to_string());
+            event.add_header("TotalContacts", aor.contact.len().to_string());
             event.add_header("ContactsRegistered", "0");
             event.add_header("EndpointName", endpoint_name);
 
@@ -1650,7 +1649,7 @@ fn handle_pjsip_show_endpoint(
             event.add_header("ObjectType", "transport");
             event.add_header("ObjectName", &transport.name);
             event.add_header("Protocol", &transport.protocol);
-            event.add_header("Bind", &transport.bind.to_string());
+            event.add_header("Bind", transport.bind.to_string());
             event.add_header("AsyncOperations", "1");
             event.add_header("CaListFile", "");
             event.add_header("CertFile", transport.cert_file.as_deref().unwrap_or(""));
@@ -1665,7 +1664,7 @@ fn handle_pjsip_show_endpoint(
             event.add_header("RequireClientCert", "No");
             event.add_header("Method", "unspecified");
             event.add_header("Cipher", "");
-            event.add_header("LocalNet", &transport.local_net.join(","));
+            event.add_header("LocalNet", transport.local_net.join(","));
             event.add_header("Tos", "0");
             event.add_header("Cos", "0");
             event.add_header("EndpointName", endpoint_name);
@@ -1693,7 +1692,7 @@ fn handle_pjsip_show_endpoint(
                     format!("{}/255.255.255.255", m)
                 }
             }).collect();
-            event.add_header("Match", &formatted_matches.join(","));
+            event.add_header("Match", formatted_matches.join(","));
 
             resp.add_followup_event(event);
             list_items += 1;
@@ -1726,7 +1725,7 @@ fn handle_pjsip_show_endpoint(
         complete.add_header("ActionID", &action_id);
     }
     complete.add_header("EventList", "Complete");
-    complete.add_header("ListItems", &list_items.to_string());
+    complete.add_header("ListItems", list_items.to_string());
     resp.add_followup_event(complete);
 
     resp
@@ -1762,12 +1761,12 @@ fn handle_pjsip_show_registrations_inbound(
             event.add_header("ObjectName", &aor.name);
             event.add_header("Mailboxes", "");
             event.add_header("RemoveExisting", if aor.remove_existing { "true" } else { "false" });
-            event.add_header("MaxContacts", &aor.max_contacts.to_string());
+            event.add_header("MaxContacts", aor.max_contacts.to_string());
             event.add_header("AuthenticateQualify", "false");
-            event.add_header("QualifyFrequency", &aor.qualify_frequency.to_string());
-            event.add_header("DefaultExpiration", &aor.default_expiration.to_string());
-            event.add_header("MaximumExpiration", &aor.maximum_expiration.to_string());
-            event.add_header("MinimumExpiration", &aor.minimum_expiration.to_string());
+            event.add_header("QualifyFrequency", aor.qualify_frequency.to_string());
+            event.add_header("DefaultExpiration", aor.default_expiration.to_string());
+            event.add_header("MaximumExpiration", aor.maximum_expiration.to_string());
+            event.add_header("MinimumExpiration", aor.minimum_expiration.to_string());
             event.add_header("Contacts", &contacts);
 
             resp.add_followup_event(event);
@@ -1778,7 +1777,7 @@ fn handle_pjsip_show_registrations_inbound(
             complete.add_header("ActionID", &action_id);
         }
         complete.add_header("EventList", "Complete");
-        complete.add_header("ListItems", &aor_count.to_string());
+        complete.add_header("ListItems", aor_count.to_string());
         resp.add_followup_event(complete);
     } else {
         let mut complete = AmiEvent::new("InboundRegistrationDetailComplete", 0x01);
@@ -1803,11 +1802,11 @@ fn handle_pjsip_show_registrations_outbound(
     let pjsip_config = asterisk_sip::get_global_pjsip_config();
 
     let mut resp = AmiResponse::success("Following are Events for each Outbound registration");
-    let mut registered_count = 0u32;
+    let registered_count = 0u32;
     let mut not_registered_count = 0u32;
 
     if let Some(cfg) = pjsip_config {
-        let reg_count = cfg.registrations.len();
+        let _reg_count = cfg.registrations.len();
 
         for reg in &cfg.registrations {
             let mut event = AmiEvent::new("OutboundRegistrationDetail", 0x01);
@@ -1820,8 +1819,8 @@ fn handle_pjsip_show_registrations_outbound(
             event.add_header("AuthRejectionPermanent", "true");
             event.add_header("MaxRetries", "10");
             event.add_header("ForbiddenRetryInterval", "0");
-            event.add_header("RetryInterval", &reg.retry_interval.to_string());
-            event.add_header("Expiration", &reg.expiration.to_string());
+            event.add_header("RetryInterval", reg.retry_interval.to_string());
+            event.add_header("Expiration", reg.expiration.to_string());
             event.add_header("OutboundProxy", reg.outbound_proxy.as_deref().unwrap_or(""));
             event.add_header("Transport", reg.transport.as_deref().unwrap_or(""));
             event.add_header("ContactUser", reg.contact_user.as_deref().unwrap_or(""));
@@ -1861,8 +1860,8 @@ fn handle_pjsip_show_registrations_outbound(
             complete.add_header("ActionID", &action_id);
         }
         complete.add_header("EventList", "Complete");
-        complete.add_header("Registered", &registered_count.to_string());
-        complete.add_header("NotRegistered", &not_registered_count.to_string());
+        complete.add_header("Registered", registered_count.to_string());
+        complete.add_header("NotRegistered", not_registered_count.to_string());
         resp.add_followup_event(complete);
     } else {
         let mut complete = AmiEvent::new("OutboundRegistrationDetailComplete", 0x01);
@@ -1906,17 +1905,17 @@ fn handle_pjsip_notify(
 
     if let Some(chan_name) = channel {
         info!("AMI PJSIPNotify: channel={}", chan_name);
-        match asterisk_sip::global_notify_service().send_notify_for_channel(&chan_name, &variables) {
+        match asterisk_sip::global_notify_service().send_notify_for_channel(chan_name, &variables) {
             Ok(()) => AmiResponse::success("PJSIPNotify accepted"),
             Err(e) => {
                 warn!("PJSIPNotify failed for channel {}: {}", chan_name, e);
-                AmiResponse::error(&format!("PJSIPNotify failed: {}", e))
+                AmiResponse::error(format!("PJSIPNotify failed: {}", e))
             }
         }
     } else if let Some(ep) = endpoint {
         info!("AMI PJSIPNotify: endpoint={}", ep);
         // For endpoint mode, send ad-hoc NOTIFY with variables
-        match asterisk_sip::global_notify_service().send_notify_to_endpoint("adhoc-ami", &ep) {
+        match asterisk_sip::global_notify_service().send_notify_to_endpoint("adhoc-ami", ep) {
             Ok(()) => AmiResponse::success("PJSIPNotify accepted"),
             Err(_) => {
                 // Fallback: just accept it (endpoint notify without template)
@@ -1987,7 +1986,7 @@ fn handle_confbridge_list(
                 .with_header("Event", "ConfbridgeListRooms");
             
             resp = resp.with_header("Conference", conf_name)
-                .with_header("Parties", &participant_count.to_string())
+                .with_header("Parties", participant_count.to_string())
                 .with_header("Marked", "0") // We don't have marked user info without app access
                 .with_header("Locked", "No")
                 .with_header("Muted", "No");
@@ -2011,7 +2010,7 @@ fn handle_confbridge_list(
         let participant_count = bridge.channel_ids.len();
         
         resp = resp.with_header("Conference", conference_name)
-            .with_header("Parties", &participant_count.to_string())
+            .with_header("Parties", participant_count.to_string())
             .with_header("Marked", "0")
             .with_header("Locked", "No")
             .with_header("Muted", "No");
@@ -2076,7 +2075,7 @@ fn handle_confbridge_kick(
             
             AmiResponse::success("All participants kicked")
                 .with_header("Conference", conference)
-                .with_header("KickedCount", &kicked_count.to_string())
+                .with_header("KickedCount", kicked_count.to_string())
         }
     } else {
         AmiResponse::error(format!("Conference '{}' not found", conference))
@@ -2183,7 +2182,7 @@ fn format_epoch_time(epoch: u64) -> String {
 }
 
 fn is_leap_year_ami(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Get a simple timestamp string (seconds since epoch).

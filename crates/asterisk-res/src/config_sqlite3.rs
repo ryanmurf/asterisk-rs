@@ -5,12 +5,11 @@
 //! batch mode for WAL, and column requirement enforcement.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config_curl::ConfigRealtimeDriver;
 

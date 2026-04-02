@@ -11,7 +11,6 @@ use crate::websocket::WebSocketSessionManager;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Authentication credentials for ARI access.
@@ -277,15 +276,15 @@ impl AriServer {
         let ws_manager = Arc::new(WebSocketSessionManager::new());
         let app_registry = Arc::new(StasisAppRegistry::new(ws_manager.clone()));
 
-        let server = Self {
+        
+
+        Self {
             config,
             root_handler: root,
             websocket_sessions: ws_manager,
             app_registry,
             global_variables: DashMap::new(),
-        };
-
-        server
+        }
     }
 
     /// Install all built-in ARI resource routes.

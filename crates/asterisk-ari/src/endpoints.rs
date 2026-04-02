@@ -40,15 +40,15 @@ pub fn build_endpoints_routes() -> Arc<RestHandler> {
     );
 
     // /endpoints
-    let endpoints = Arc::new(
+    
+
+    Arc::new(
         RestHandler::new("endpoints")
             .on(HttpMethod::Get, handle_list)
             .child(send_message)
             .child(refer)
             .child(tech),
-    );
-
-    endpoints
+    )
 }
 
 // ---------------------------------------------------------------------------

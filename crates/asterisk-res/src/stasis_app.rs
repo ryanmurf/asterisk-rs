@@ -13,7 +13,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------

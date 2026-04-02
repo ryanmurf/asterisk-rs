@@ -25,7 +25,7 @@ pub const LPC10_BITS_IN_COMPRESSED_FRAME: usize = 54;
 
 /// Bytes in a compressed LPC-10 frame (54 bits padded to byte boundary).
 pub const LPC10_BYTES_IN_COMPRESSED_FRAME: usize =
-    (LPC10_BITS_IN_COMPRESSED_FRAME + 7) / 8; // == 7
+    LPC10_BITS_IN_COMPRESSED_FRAME.div_ceil(8); // == 7
 
 /// LPC-10 encoder (stub).
 ///

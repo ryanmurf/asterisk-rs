@@ -20,8 +20,8 @@
 //!   Data: hello-world
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use std::path::PathBuf;
+use tracing::debug;
 
 /// Default spool directory.
 pub const DEFAULT_SPOOL_DIR: &str = "/var/spool/asterisk/outgoing";

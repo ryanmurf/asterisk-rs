@@ -7,7 +7,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// A single tone segment in a tone cadence.
 #[derive(Debug, Clone, PartialEq)]

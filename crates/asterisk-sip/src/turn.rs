@@ -84,11 +84,7 @@ impl TurnAllocation {
     /// Seconds remaining before expiry.
     pub fn remaining_secs(&self) -> u64 {
         let elapsed = self.created_at.elapsed().as_secs();
-        if elapsed >= self.lifetime as u64 {
-            0
-        } else {
-            self.lifetime as u64 - elapsed
-        }
+        (self.lifetime as u64).saturating_sub(elapsed)
     }
 
     /// Check if it is time to refresh (refresh at 80% of lifetime).
@@ -576,7 +572,7 @@ impl TurnClient {
         // Check if it's ChannelData (first two bytes are channel number >= 0x4000)
         if len >= CHANNEL_DATA_HEADER_SIZE {
             let maybe_channel = u16::from_be_bytes([buf[0], buf[1]]);
-            if maybe_channel >= CHANNEL_MIN && maybe_channel <= CHANNEL_MAX {
+            if (CHANNEL_MIN..=CHANNEL_MAX).contains(&maybe_channel) {
                 let data_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
                 if len >= CHANNEL_DATA_HEADER_SIZE + data_len {
                     if let Some(binding) = self.channels.get(&maybe_channel) {
@@ -668,7 +664,7 @@ pub fn decode_channel_data(buf: &[u8]) -> Option<(u16, &[u8])> {
         return None;
     }
     let channel = u16::from_be_bytes([buf[0], buf[1]]);
-    if channel < CHANNEL_MIN || channel > CHANNEL_MAX {
+    if !(CHANNEL_MIN..=CHANNEL_MAX).contains(&channel) {
         return None;
     }
     let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
@@ -684,7 +680,7 @@ pub fn is_channel_data(buf: &[u8]) -> bool {
         return false;
     }
     let channel = u16::from_be_bytes([buf[0], buf[1]]);
-    channel >= CHANNEL_MIN && channel <= CHANNEL_MAX
+    (CHANNEL_MIN..=CHANNEL_MAX).contains(&channel)
 }
 
 // ---------------------------------------------------------------------------

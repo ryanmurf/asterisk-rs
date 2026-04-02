@@ -5,14 +5,11 @@
 //! serving the Prometheus text exposition format.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
 // Errors

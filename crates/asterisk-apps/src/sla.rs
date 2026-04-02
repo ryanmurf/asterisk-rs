@@ -11,7 +11,7 @@ use asterisk_types::ChannelState;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// State of an SLA trunk line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

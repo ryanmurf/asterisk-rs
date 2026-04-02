@@ -315,7 +315,7 @@ impl JitterBuffer for AdaptiveJitterBuffer {
         self.last_arrival_ts = Some(arrival_ts);
 
         // Periodically adapt the delay
-        if self.frames_received % 10 == 0 {
+        if self.frames_received.is_multiple_of(10) {
             self.adapt_delay();
         }
 

@@ -111,7 +111,7 @@ async fn system_exec_helper(
 
     let output = tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(&command)
+        .arg(command)
         .output()
         .await;
 

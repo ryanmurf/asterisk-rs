@@ -215,7 +215,7 @@ impl WebSocketFrame {
             if code < 1000
                 || code == close_code::NO_STATUS
                 || code == close_code::ABNORMAL
-                || (code >= 1016 && code < 3000)
+                || (1016..3000).contains(&code)
             {
                 return Err(AsteriskError::Parse(format!(
                     "WebSocket close frame has invalid status code: {}",
@@ -345,7 +345,7 @@ pub fn compute_accept_key(client_key: &str) -> String {
     hasher.update(client_key.as_bytes());
     hasher.update(WEBSOCKET_GUID.as_bytes());
     let result = hasher.finalize();
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &result)
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, result)
 }
 
 /// Build a WebSocket upgrade response for a server handshake.

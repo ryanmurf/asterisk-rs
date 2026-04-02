@@ -40,8 +40,10 @@ pub type SpeechResult<T> = Result<T, SpeechError>;
 ///
 /// Mirrors `enum ast_speech_states` from the C header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum SpeechState {
     /// Not ready to accept audio.
+    #[default]
     NotReady,
     /// Ready and accepting audio.
     Ready,
@@ -51,11 +53,6 @@ pub enum SpeechState {
     Done,
 }
 
-impl Default for SpeechState {
-    fn default() -> Self {
-        Self::NotReady
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Speech flags (from ast_speech_flags)
@@ -80,8 +77,10 @@ bitflags::bitflags! {
 
 /// Type of results requested from the speech engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SpeechResultsType {
     /// Normal (single best result).
+    #[default]
     Normal,
     /// N-Best (multiple alternative results).
     NBest,
@@ -96,11 +95,6 @@ impl SpeechResultsType {
     }
 }
 
-impl Default for SpeechResultsType {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Speech result

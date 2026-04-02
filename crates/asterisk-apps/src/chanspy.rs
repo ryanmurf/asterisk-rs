@@ -25,8 +25,10 @@ use tracing::{debug, info, warn};
 
 /// The spy mode determines how audio flows between the spy and the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SpyMode {
     /// Listen only -- hear both sides of the call but cannot speak.
+    #[default]
     Listen,
     /// Whisper -- hear both sides and speak to the spied-on channel only.
     Whisper,
@@ -45,11 +47,6 @@ impl SpyMode {
     }
 }
 
-impl Default for SpyMode {
-    fn default() -> Self {
-        Self::Listen
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ChanSpyResult
@@ -417,7 +414,7 @@ impl AppChanSpy {
             spy_name, spied_count
         );
 
-        channel.set_variable("CHANSPY_CHANNELS", &spied_count.to_string());
+        channel.set_variable("CHANSPY_CHANNELS", spied_count.to_string());
 
         // Emit ChanSpyStop when done
         publish_chanspy_event("ChanSpyStop", &spy_name, &spy_unique_id, None);
@@ -460,11 +457,10 @@ impl AppChanSpy {
             }
 
             // Check enforced extensions filter
-            if !options.enforced_extensions.is_empty() {
-                if !options.enforced_extensions.contains(&chan.exten) {
+            if !options.enforced_extensions.is_empty()
+                && !options.enforced_extensions.contains(&chan.exten) {
                     continue;
                 }
-            }
 
             drop(chan);
             targets.push(chan_arc);
@@ -595,7 +591,7 @@ impl AppExtenSpy {
             );
         }
 
-        channel.set_variable("CHANSPY_CHANNELS", &spied_count.to_string());
+        channel.set_variable("CHANSPY_CHANNELS", spied_count.to_string());
 
         info!(
             "ExtenSpy: channel '{}' spied on {} channels at {}@{}",
