@@ -5103,12 +5103,21 @@ second part\r\n\
     async fn test_sip_event_handler_incoming_invite() {
         use asterisk_sip::event_handler::SipEventHandler;
         use asterisk_sip::parser::{SipMessage, SipHeader, SipUri, RequestLine, StartLine, SipMethod, header_names};
-        use asterisk_core::pbx::{Dialplan, Context};
+        use asterisk_core::pbx::{Dialplan, Context, Extension, Priority};
 
-        // Create a simple dialplan with a "from-external" context
+        // Create a dialplan with a "default" context containing extension 100.
+        // The handler uses "default" when no auth/endpoint config is present.
         let mut dp = Dialplan::new();
-        let ctx = Context::new("from-external");
-        dp.add_context(ctx);
+        let mut default_ctx = Context::new("default");
+        let mut ext_100 = Extension::new("100");
+        ext_100.add_priority(Priority {
+            priority: 1,
+            app: "Answer".to_string(),
+            app_data: String::new(),
+            label: None,
+        });
+        default_ctx.add_extension(ext_100);
+        dp.add_context(default_ctx);
 
         let mock_transport: Arc<dyn asterisk_sip::transport::SipTransport> = Arc::new(
             asterisk_sip::transport::UdpTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap()
