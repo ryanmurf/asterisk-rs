@@ -8,6 +8,14 @@ edition = "2021"
 name = "pjsip_rs"
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Off by default: the crate builds as a pure-Rust cdylib/staticlib with no
+# external dependency. Enable `pjproject-cffi` to compile pjproject 2.16's
+# real ioqueue/threading/locking C sources into the shim (needs the
+# pjproject source tree; see scripts/fetch-pjproject.sh or set PJPROJECT_DIR).
+default = []
+pjproject-cffi = []
+
 [dependencies]
 asterisk-sip = { path = "../asterisk-sip" }
 asterisk-types = { path = "../asterisk-types" }

@@ -104,6 +104,26 @@ Rustisk is a Rust-native PBX and telephony toolkit that tracks the architecture,
 cargo build --release
 ```
 
+This builds the entire workspace in pure Rust with no external dependencies.
+
+#### Optional: pjproject C compatibility layer
+
+The `pjsip-shim` crate can also compile pjproject 2.16's real ioqueue,
+threading, and locking C sources into the shim, so it can be validated against
+pjproject's own `pjlib-test` suite. This is **off by default** and gated behind
+the `pjproject-cffi` feature because it requires the pjproject 2.16 source tree.
+
+```bash
+# Download pjproject 2.16 into crates/pjsip-shim/vendor/ (git-ignored)
+scripts/fetch-pjproject.sh
+
+# Build the shim with the C layer enabled
+cargo build -p pjsip-shim --features pjproject-cffi --release
+```
+
+Alternatively, point the build at an existing checkout with
+`PJPROJECT_DIR=/path/to/pjproject-2.16 cargo build -p pjsip-shim --features pjproject-cffi`.
+
 ### Run
 
 ```bash
@@ -130,9 +150,9 @@ cargo test --workspace
 # Run tests for a specific crate
 cargo test -p asterisk-sip
 
-# Run pjlib compatibility tests
-cargo build -p pjsip-shim --release
-# Link the resulting libpjsip_shim against pjlib-test and run
+# Run pjlib compatibility tests (needs the pjproject C layer -- see Build)
+scripts/fetch-pjproject.sh
+cargo test -p pjsip-shim --features pjproject-cffi
 ```
 
 The workspace includes **4,200+ tests** covering SIP parsing, dialplan execution, AMI/ARI protocols, codec negotiation, bridging, and the pjlib compatibility layer.
