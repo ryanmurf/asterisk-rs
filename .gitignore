@@ -1,1 +1,5 @@
 /target
+
+# Third-party pjproject source fetched by scripts/fetch-pjproject.sh for the
+# optional `pjproject-cffi` feature of the pjsip-shim crate. Not committed.
+/crates/pjsip-shim/vendor/

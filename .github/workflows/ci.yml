@@ -16,8 +16,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The whole workspace (including pjsip-shim) must build with default
+      # features and no external pjproject checkout. This guards against a
+      # regression like the hardcoded /tmp/pjproject path (issue #5).
       - name: Build
-        run: cargo build --workspace --exclude pjsip-shim
+        run: cargo build --workspace
+      # pjsip-shim's unit tests and lints exercise the optional pjproject C
+      # layer, which needs the pjproject-cffi feature + source tree (covered
+      # by the pjsip-shim-cffi job). Exclude it from the pure-Rust gates.
       - name: Test
         run: cargo test --workspace --exclude pjsip-shim
       - name: Clippy
@@ -30,4 +36,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release --workspace --exclude pjsip-shim
+        run: cargo build --release --workspace
+
+  pjsip-shim-cffi:
+    # Builds the optional pjproject C compatibility layer so a future
+    # missing-source / hardcoded-path / duplicate-symbol regression in the
+    # shim's build.rs is caught rather than masked (issue #5).
+    #
+    # This is build-only: the shim's own unit tests were written against the
+    # pure-Rust stubs and pass null pools/atomics that the real pjproject C
+    # asserts on (SIGABRT). Running them against the C layer needs the tests
+    # adapted first; that is tracked separately.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch pjproject 2.16
+        run: scripts/fetch-pjproject.sh
+      - name: Build shim with pjproject-cffi
+        run: cargo build -p pjsip-shim --features pjproject-cffi

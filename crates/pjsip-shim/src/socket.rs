@@ -4,6 +4,23 @@
 
 use crate::types::*;
 
+/// Pointer to the thread-local C `errno`.
+///
+/// macOS/BSD expose it through `__error()`; Linux/glibc through
+/// `__errno_location()`. Returning the raw pointer lets callers both read
+/// and clear `errno` across platforms.
+#[inline]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        errno_ptr()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        libc::__errno_location()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants (exported as C symbols)
 // ---------------------------------------------------------------------------
@@ -57,7 +74,7 @@ pub unsafe extern "C" fn pj_sock_socket(
     let fd = libc::socket(family, sock_type, protocol);
     if fd < 0 {
         *sock = -1;
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *sock = fd as i64;
@@ -72,7 +89,7 @@ pub unsafe extern "C" fn pj_sock_close(sock: pj_sock_t) -> pj_status_t {
     if libc::close(sock as i32) == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -94,7 +111,7 @@ pub unsafe extern "C" fn pj_sock_bind(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err // PJ_STATUS_FROM_OS(errno)
     }
 }
@@ -107,7 +124,7 @@ pub unsafe extern "C" fn pj_sock_listen(sock: pj_sock_t, backlog: i32) -> pj_sta
     if libc::listen(sock as i32, backlog) == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err // PJ_STATUS_FROM_OS(errno)
     }
 }
@@ -138,7 +155,7 @@ pub unsafe extern "C" fn pj_sock_accept(
     );
     if fd < 0 {
         *new_sock = -1;
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *new_sock = fd as i64;
@@ -165,7 +182,7 @@ pub unsafe extern "C" fn pj_sock_connect(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err // PJ_STATUS_FROM_OS(errno)
     }
 }
@@ -182,7 +199,7 @@ pub unsafe extern "C" fn pj_sock_send(
     }
     let sent = libc::send(sock as i32, buf, *len as usize, flags);
     if sent < 0 {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = sent as isize;
@@ -201,7 +218,7 @@ pub unsafe extern "C" fn pj_sock_recv(
     }
     let recvd = libc::recv(sock as i32, buf, *len as usize, flags);
     if recvd < 0 {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = recvd as isize;
@@ -229,7 +246,7 @@ pub unsafe extern "C" fn pj_sock_sendto(
         tolen as libc::socklen_t,
     );
     if sent < 0 {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = sent as isize;
@@ -266,7 +283,7 @@ pub unsafe extern "C" fn pj_sock_recvfrom(
         &mut slen,
     );
     if recvd < 0 {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         return 120000 + err; // PJ_STATUS_FROM_OS(errno)
     }
     *len = recvd as isize;
@@ -284,7 +301,7 @@ pub unsafe extern "C" fn pj_sock_shutdown(sock: pj_sock_t, how: i32) -> pj_statu
     if libc::shutdown(sock as i32, how) == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -310,7 +327,7 @@ pub unsafe extern "C" fn pj_sock_setsockopt(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -332,7 +349,7 @@ pub unsafe extern "C" fn pj_sock_getsockopt(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -352,7 +369,7 @@ pub unsafe extern "C" fn pj_sock_getsockname(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -372,7 +389,7 @@ pub unsafe extern "C" fn pj_sock_getpeername(
     if rc == 0 {
         PJ_SUCCESS
     } else {
-        let err = *libc::__error();
+        let err = *errno_ptr();
         120000 + err
     }
 }
@@ -934,8 +951,13 @@ pub unsafe extern "C" fn pj_sock_bind_in(
         return PJ_EINVAL;
     }
     let mut sa: libc::sockaddr_in = std::mem::zeroed();
-    sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-    sa.sin_family = libc::AF_INET as u8;
+    // `sin_len` only exists in the BSD/macOS sockaddr layout.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
+    // `sin_family` is `sa_family_t`, which is u8 on macOS/BSD and u16 on Linux.
+    sa.sin_family = libc::AF_INET as libc::sa_family_t;
     sa.sin_port = port.to_be();
     sa.sin_addr.s_addr = addr;
     let rc = libc::bind(
@@ -1141,7 +1163,7 @@ pub unsafe extern "C" fn pj_inet_addr2(cp: *const libc::c_char) -> pj_in_addr {
 
 #[no_mangle]
 pub unsafe extern "C" fn pj_get_os_error() -> pj_status_t {
-    let e = *libc::__error(); // macOS errno
+    let e = *errno_ptr(); // errno
     if e == 0 { PJ_SUCCESS } else { 120000 + e }
 }
 
@@ -1153,9 +1175,9 @@ pub unsafe extern "C" fn pj_get_netos_error() -> pj_status_t {
 #[no_mangle]
 pub unsafe extern "C" fn pj_set_os_error(code: pj_status_t) {
     if code == PJ_SUCCESS {
-        *libc::__error() = 0;
+        *errno_ptr() = 0;
     } else if code >= 120000 {
-        *libc::__error() = code - 120000;
+        *errno_ptr() = code - 120000;
     }
 }
 
