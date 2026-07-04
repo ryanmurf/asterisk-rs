@@ -132,15 +132,22 @@ fn build_pjproject_cffi() {
     let src = pj_dir.join("pjlib/src/pj");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    cc::Build::new()
-        .file("src/log_wrapper.c")
-        .file("src/pjlib_stubs.c")
-        .file(src.join("ioqueue_select.c"))
+    let c_files = [
+        "src/log_wrapper.c".to_string(),
+        "src/pjlib_stubs.c".to_string(),
+        src.join("ioqueue_select.c").to_string_lossy().into_owned(),
         // NOTE: ioqueue_common_abs.c is NOT listed here because
         // ioqueue_select.c does #include "ioqueue_common_abs.c" directly.
-        .file(src.join("os_core_unix.c"))
-        .file(src.join("lock.c"))
-        .file(src.join("os_timestamp_posix.c"))
+        src.join("os_core_unix.c").to_string_lossy().into_owned(),
+        src.join("lock.c").to_string_lossy().into_owned(),
+        src.join("os_timestamp_posix.c").to_string_lossy().into_owned(),
+    ];
+
+    let mut build = cc::Build::new();
+    for f in &c_files {
+        build.file(f);
+    }
+    build
         .include(&include)
         .define("PJ_AUTOCONF", "1")
         // The test binary was compiled without PJ_AUTOCONF, using os_darwinos.h
@@ -152,33 +159,32 @@ fn build_pjproject_cffi() {
         // Must be set *before* system headers define fd_set.
         .define("FD_SETSIZE", "2048")
         .warnings(false)
+        // Suppress cc's automatic `cargo:rustc-link-lib` directive. We
+        // re-link the archive below with the +whole-archive modifier; if cc
+        // also emitted its default `-l`, the archive would be linked twice
+        // and GNU ld would report duplicate symbols.
+        .cargo_metadata(false)
         .compile("pjsip_c_parts");
 
-    // Force-load the archive so the linker includes all symbols,
-    // even those not referenced by Rust code.
-    #[cfg(target_os = "macos")]
-    {
-        println!(
-            "cargo:rustc-link-arg=-Wl,-force_load,{}/libpjsip_c_parts.a",
-            out_dir.display()
-        );
-
-        // The cdylib export list from rustc only includes #[no_mangle]
-        // Rust symbols.  Force-export the C variadic functions so they
-        // are visible to external code that links against our dylib.
-        for sym in EXPORTED_SYMBOLS {
-            println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_{}", sym);
-        }
+    // cargo_metadata(false) silenced cc's search-path and rerun hints too;
+    // re-emit the ones we still need.
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    for f in &c_files {
+        println!("cargo:rerun-if-changed={}", f);
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--whole-archive");
-        println!(
-            "cargo:rustc-cdylib-link-arg={}/libpjsip_c_parts.a",
-            out_dir.display()
-        );
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--no-whole-archive");
+    // Link the whole C archive so *all* pj* symbols land in the shim, not
+    // just the ones Rust references (external C consumers need them too).
+    // cargo's +whole-archive modifier maps to `--whole-archive` on GNU ld
+    // and `-force_load` on macOS ld, so one directive covers both platforms.
+    println!("cargo:rustc-link-lib=static:+whole-archive=pjsip_c_parts");
+
+    // The cdylib export list from rustc only includes #[no_mangle] Rust
+    // symbols. On macOS, force-export the C functions so they are visible to
+    // external code linking against our dylib.
+    #[cfg(target_os = "macos")]
+    for sym in EXPORTED_SYMBOLS {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_{}", sym);
     }
 }
 

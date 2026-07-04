@@ -1227,11 +1227,18 @@ pub unsafe extern "C" fn pj_register_strerror(
 // Miscellaneous system functions
 // ============================================================================
 
+// pj_getpid and the pj_thread_local_* family are provided by pjproject's
+// os_core_unix.c when the `pjproject-cffi` feature is enabled. Define the
+// pure-Rust fallbacks only when that C layer is absent, otherwise both
+// implementations would collide as duplicate symbols at link time.
+
+#[cfg(not(feature = "pjproject-cffi"))]
 #[no_mangle]
 pub unsafe extern "C" fn pj_getpid() -> u32 {
     libc::getpid() as u32
 }
 
+#[cfg(not(feature = "pjproject-cffi"))]
 #[no_mangle]
 pub unsafe extern "C" fn pj_thread_local_alloc(index: *mut i32) -> pj_status_t {
     if index.is_null() {
@@ -1243,13 +1250,16 @@ pub unsafe extern "C" fn pj_thread_local_alloc(index: *mut i32) -> pj_status_t {
     PJ_SUCCESS
 }
 
+#[cfg(not(feature = "pjproject-cffi"))]
 #[no_mangle]
 pub unsafe extern "C" fn pj_thread_local_free(index: i32) {
     let _ = index;
 }
 
+#[cfg(not(feature = "pjproject-cffi"))]
 static mut TLS_VALUES: [*mut libc::c_void; 64] = [std::ptr::null_mut(); 64];
 
+#[cfg(not(feature = "pjproject-cffi"))]
 #[no_mangle]
 pub unsafe extern "C" fn pj_thread_local_set(
     index: i32,
@@ -1262,6 +1272,7 @@ pub unsafe extern "C" fn pj_thread_local_set(
     PJ_SUCCESS
 }
 
+#[cfg(not(feature = "pjproject-cffi"))]
 #[no_mangle]
 pub unsafe extern "C" fn pj_thread_local_get(index: i32) -> *mut libc::c_void {
     if index < 0 || index >= 64 {
