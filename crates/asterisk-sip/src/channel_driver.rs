@@ -28,7 +28,15 @@ struct SipChannelPrivate {
     /// The SIP session.
     session: Mutex<SipSession>,
     /// The RTP session for media.
-    rtp: Mutex<Option<RtpSession>>,
+    ///
+    /// Held as an `Arc` so frame I/O clones the session handle out and
+    /// releases the mutex BEFORE awaiting the socket. Holding the guard
+    /// across `recv_frame().await` (as a naive implementation would) makes
+    /// a blocked reader starve concurrent writers on the same leg: a
+    /// mixing bridge (ConfBridge softmix) writes from its own task, and a
+    /// listen-only participant would otherwise only receive audio when
+    /// their own inbound packets released the lock.
+    rtp: Mutex<Option<Arc<RtpSession>>>,
     /// SIP transport to use.
     transport: Arc<dyn SipTransport>,
 }
@@ -136,7 +144,7 @@ impl SipChannelDriver {
     ) {
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(SipSession::new_outbound(local_addr, remote_addr)),
-            rtp: Mutex::new(Some(rtp)),
+            rtp: Mutex::new(Some(Arc::new(rtp))),
             transport,
         });
         self.channels.write().insert(channel_name.to_string(), priv_data);
@@ -245,7 +253,7 @@ impl ChannelDriver for SipChannelDriver {
 
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(sip_session),
-            rtp: Mutex::new(Some(rtp_session)),
+            rtp: Mutex::new(Some(Arc::new(rtp_session))),
             transport,
         });
 
@@ -391,9 +399,14 @@ impl ChannelDriver for SipChannelDriver {
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
-        let rtp_guard = priv_data.rtp.lock().await;
-        let rtp = rtp_guard
-            .as_ref()
+        // Clone the session handle and release the lock before blocking on
+        // the socket, so concurrent write_frame calls are never starved by
+        // a reader waiting for inbound media.
+        let rtp = priv_data
+            .rtp
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
 
         rtp.recv_frame().await
@@ -405,12 +418,22 @@ impl ChannelDriver for SipChannelDriver {
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
-        let rtp_guard = priv_data.rtp.lock().await;
-        let rtp = rtp_guard
-            .as_ref()
+        let rtp = priv_data
+            .rtp
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
 
         rtp.send_frame(frame).await
+    }
+
+    /// The negotiated audio format: the RTP session's payload type (the same
+    /// codec id `read_frame` stamps on inbound voice frames).
+    async fn audio_format(&self, channel: &Channel) -> Option<u32> {
+        let priv_data = self.get_private(&channel.name)?;
+        let rtp_guard = priv_data.rtp.lock().await;
+        rtp_guard.as_ref().map(|rtp| rtp.payload_type as u32)
     }
 
     /// Send DTMF via RFC 2833.
@@ -419,9 +442,11 @@ impl ChannelDriver for SipChannelDriver {
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
-        let rtp_guard = priv_data.rtp.lock().await;
-        let rtp = rtp_guard
-            .as_ref()
+        let rtp = priv_data
+            .rtp
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
 
         // Convert ms to samples (8kHz)

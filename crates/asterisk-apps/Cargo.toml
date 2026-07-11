@@ -7,9 +7,11 @@ edition.workspace = true
 [dependencies]
 asterisk-types = { workspace = true }
 asterisk-core = { workspace = true }
+asterisk-codecs = { workspace = true }
 asterisk-ami = { workspace = true }
 asterisk-res = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
