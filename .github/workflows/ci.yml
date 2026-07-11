@@ -28,6 +28,12 @@ jobs:
         run: cargo test --workspace --exclude pjsip-shim
       - name: Clippy
         run: cargo clippy --workspace --exclude pjsip-shim -- -D warnings
+      # The native codec system libraries are not installed on the runner;
+      # `cargo check` still runs build.rs (link-directive emission) and
+      # compiles the feature-gated FFI code without the final link step, so
+      # a compile regression behind these features is caught (issue #15).
+      - name: Check native codec features
+        run: cargo check -p asterisk-codecs --features native-opus,native-gsm,native-speex
 
   build-release:
     runs-on: ubuntu-latest
