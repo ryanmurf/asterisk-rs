@@ -348,21 +348,29 @@ pub mod header_names {
 }
 
 /// Compact header name mapping (RFC 3261 Section 7.3.3).
+///
+/// Compact forms are single characters and, like all SIP header names, are
+/// case-insensitive (RFC 3261 §7.3.1) — so `V:` must expand exactly as `v:`.
+/// Only single-character names are compact forms; any longer name is returned
+/// verbatim (header lookups compare case-insensitively elsewhere).
 #[inline]
 fn expand_compact_header(name: &str) -> &str {
-    match name {
-        "i" => header_names::CALL_ID,
-        "m" => header_names::CONTACT,
-        "e" => "Content-Encoding",
-        "l" => header_names::CONTENT_LENGTH,
-        "c" => header_names::CONTENT_TYPE,
-        "f" => header_names::FROM,
-        "s" => "Subject",
-        "k" => header_names::SUPPORTED,
-        "t" => header_names::TO,
-        "v" => header_names::VIA,
-        other => other,
+    if name.len() == 1 {
+        match name.as_bytes()[0].to_ascii_lowercase() {
+            b'i' => return header_names::CALL_ID,
+            b'm' => return header_names::CONTACT,
+            b'e' => return "Content-Encoding",
+            b'l' => return header_names::CONTENT_LENGTH,
+            b'c' => return header_names::CONTENT_TYPE,
+            b'f' => return header_names::FROM,
+            b's' => return "Subject",
+            b'k' => return header_names::SUPPORTED,
+            b't' => return header_names::TO,
+            b'v' => return header_names::VIA,
+            _ => {}
+        }
     }
+    name
 }
 
 /// A parsed SIP message.
@@ -924,6 +932,30 @@ CSeq: 1 INVITE\r\n\
         let parsed = SipMessage::parse(msg).unwrap();
         assert_eq!(parsed.call_id(), Some("call123"));
         assert!(parsed.from_header().unwrap().contains("Alice"));
+    }
+
+    #[test]
+    fn test_compact_headers_uppercase() {
+        // RFC 3261 §7.3.1: header names are case-insensitive, so uppercase
+        // compact forms (`V:`, `F:`, `T:`, `I:`, `L:`) must expand exactly like
+        // their lowercase equivalents. Regression for compact forms being
+        // matched case-sensitively (a `V:`-sending UA would otherwise have its
+        // Via/branch silently lost, breaking transaction/response matching).
+        let msg = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+V: SIP/2.0/UDP 10.0.0.1;branch=z9hG4bKxyz\r\n\
+F: Alice <sip:alice@example.com>;tag=abc\r\n\
+T: Bob <sip:bob@example.com>\r\n\
+I: call123\r\n\
+L: 0\r\n\
+CSeq: 1 INVITE\r\n\
+\r\n";
+        let parsed = SipMessage::parse(msg).unwrap();
+        assert_eq!(parsed.call_id(), Some("call123"));
+        assert!(parsed.from_header().unwrap().contains("Alice"));
+        assert!(
+            parsed.get_header("Via").unwrap().contains("z9hG4bKxyz"),
+            "uppercase compact `V:` must expand to Via"
+        );
     }
 
     #[test]
