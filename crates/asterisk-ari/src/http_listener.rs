@@ -43,7 +43,14 @@ impl AriHttpListener {
     /// Start listening for HTTP connections. Runs indefinitely.
     pub async fn run(&self) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!(addr = %self.listen_addr, "ARI HTTP listener started");
+        self.serve(listener).await
+    }
+
+    /// Serve HTTP connections on an already-bound listener. Runs
+    /// indefinitely. Useful when the caller binds port 0 and needs the
+    /// actual local address (e.g. integration tests).
+    pub async fn serve(&self, listener: TcpListener) -> Result<(), std::io::Error> {
+        info!(addr = ?listener.local_addr(), "ARI HTTP listener started");
 
         loop {
             match listener.accept().await {

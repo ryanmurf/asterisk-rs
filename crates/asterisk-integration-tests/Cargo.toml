@@ -20,6 +20,7 @@ asterisk-ami = { workspace = true }
 asterisk-config = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+serde_json = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }

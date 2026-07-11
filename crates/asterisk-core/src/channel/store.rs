@@ -157,6 +157,47 @@ pub fn register_existing_channel(mut channel: Channel) -> Arc<Mutex<Channel>> {
     arc
 }
 
+/// Register an existing `Channel` in the global store, PRESERVING the
+/// channel's current `unique_id`.
+///
+/// Unlike [`register_existing_channel`], which always assigns a fresh
+/// `epoch.counter` ID, this is for callers whose API contract lets the
+/// client supply the channel ID (e.g. ARI's `channelId` parameter).
+/// If a channel with that unique_id already exists, nothing is registered
+/// and the channel is handed back (boxed) via `Err` so the caller can
+/// surface a conflict and tear down any driver-side state.
+pub fn try_register_channel(channel: Channel) -> Result<Arc<Mutex<Channel>>, Box<Channel>> {
+    let uid = channel.unique_id.0.clone();
+    let name = channel.name.clone();
+
+    if CHANNEL_STORE.by_uniqueid.contains_key(&uid) {
+        return Err(Box::new(channel));
+    }
+
+    let state_num = (channel.state as u8).to_string();
+    let state_desc = channel.state.to_string();
+    let caller_num = channel.caller.id.number.number.clone();
+    let accountcode = channel.accountcode.clone();
+    let linkedid = channel.linkedid.clone();
+
+    let arc = Arc::new(Mutex::new(channel));
+    CHANNEL_STORE.register(Arc::clone(&arc));
+    tracing::debug!(channel = %name, unique_id = %uid, "existing channel registered (id preserved)");
+
+    // Emit Newchannel AMI event
+    super::publish_channel_event("Newchannel", &[
+        ("Channel", &name),
+        ("ChannelState", &state_num),
+        ("ChannelStateDesc", &state_desc),
+        ("CallerIDNum", &caller_num),
+        ("AccountCode", &accountcode),
+        ("Uniqueid", &uid),
+        ("Linkedid", &linkedid),
+    ]);
+
+    Ok(arc)
+}
+
 /// Look up a channel by its channel name (e.g. `SIP/alice-00000001`).
 pub fn find_by_name(name: &str) -> Option<Arc<Mutex<Channel>>> {
     CHANNEL_STORE.find_by_name(name)
@@ -324,5 +365,24 @@ mod tests {
         assert_eq!(parts.len(), 2, "unique_id should be epoch.counter");
         assert!(parts[0].parse::<u64>().is_ok());
         assert!(parts[1].parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn try_register_preserves_id_and_detects_duplicates() {
+        let mut chan = Channel::new("Test/keep-id-1");
+        chan.unique_id = crate::channel::ChannelId::from_name("client-supplied-id-1");
+        let arc = try_register_channel(chan).expect("first registration must succeed");
+        assert_eq!(arc.lock().unique_id.0, "client-supplied-id-1");
+        assert!(find_by_uniqueid("client-supplied-id-1").is_some());
+
+        // Same unique_id again -> conflict, channel handed back unregistered.
+        let mut dup = Channel::new("Test/keep-id-2");
+        dup.unique_id = crate::channel::ChannelId::from_name("client-supplied-id-1");
+        let returned = try_register_channel(dup).expect_err("duplicate id must conflict");
+        assert_eq!(returned.name, "Test/keep-id-2");
+        assert!(find_by_name("Test/keep-id-2").is_none());
+
+        deregister("client-supplied-id-1");
+        assert!(find_by_uniqueid("client-supplied-id-1").is_none());
     }
 }

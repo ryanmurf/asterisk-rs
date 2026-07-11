@@ -285,6 +285,7 @@ dependencies = [
  "md-5",
  "parking_lot",
  "rand",
+ "serde_json",
  "sha1",
  "tokio",
  "tracing",
