@@ -156,7 +156,7 @@ impl SoftmixData {
         }
 
         // Step 3: Clear channel buffers for next interval.
-        for (_, chan_data) in self.channel_buffers.iter_mut() {
+        for chan_data in self.channel_buffers.values_mut() {
             chan_data.clear();
         }
     }
@@ -322,7 +322,7 @@ impl BridgeTechnology for SoftmixBridgeTech {
         frame: &Frame,
     ) -> AsteriskResult<()> {
         // Only process voice frames for mixing.
-        if let Frame::Voice { data, samples: _, .. } = frame {
+        if let Frame::Voice { data, .. } = frame {
             let mut mix_data = self.data.lock().await;
             let chan_id = from_channel.channel_id.as_str();
 

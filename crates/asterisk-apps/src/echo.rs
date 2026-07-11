@@ -5,9 +5,11 @@
 //! creating an echo effect. Useful for testing audio quality and latency.
 //! The application exits when '#' is pressed.
 
+use std::time::Duration;
+
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::channel::Channel;
-use asterisk_types::ChannelState;
+use asterisk_types::{ChannelState, Frame};
 use tracing::{debug, info};
 
 /// The Echo() dialplan application.
@@ -35,72 +37,94 @@ impl DialplanApp for AppEcho {
 impl AppEcho {
     /// Execute the Echo application.
     ///
-    /// Reads frames from the channel and writes them back. Continues until
-    /// the channel hangs up or '#' DTMF is received.
+    /// Reads frames from the channel's technology driver and writes them back,
+    /// continuing until the channel hangs up or '#' DTMF is received. This is
+    /// the real media pump: for a live inbound call it drives
+    /// `read_frame`/`write_frame` on the channel driver, which move RTP frames
+    /// to and from the bound socket (issue with no media pump). When the
+    /// channel has no media plane (no driver / no RTP session), it degrades to
+    /// polling channel state so the dialplan (and thus the SIP dialog) stays
+    /// alive until the remote hangs up.
     ///
     /// # Arguments
     /// * `channel` - The channel to echo frames on
     pub async fn exec(channel: &mut Channel) -> PbxExecResult {
         info!("Echo: starting echo on channel '{}'", channel.name);
 
-        // Track whether we've sent a FIR (Full Intra Request) for video
-        let _fir_sent = false;
+        // The technology driver is looked up by the channel-name prefix, e.g.
+        // "PJSIP/alice-00000001" -> "PJSIP" (Asterisk names channels
+        // <tech>/<resource>-<id>). Its read_frame/write_frame proxy to the RTP
+        // session bound for this call.
+        let tech = channel
+            .name
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let driver = asterisk_core::channel::tech_registry::TECH_REGISTRY.find(&tech);
 
-        // Main echo loop: read frames and write them back
-        // In a real implementation, this uses channel.read() and channel.write()
-        // which are async operations that wait for the next frame.
-        //
-        // The loop runs until:
-        // 1. The channel hangs up (read returns None/error)
-        // 2. The '#' DTMF digit is received
-        //
-        // Frame handling rules (matching Asterisk C behavior):
-        // - Voice frames: echo back
-        // - Video frames: echo back (and send FIR on first video frame)
-        // - DTMF frames: echo back (unless '#' which terminates)
-        // - Text frames: echo back
-        // - Control frames: only echo VidUpdate, and only once
-        // - Modem frames: do NOT echo
-        // - Null frames: do NOT echo
-
-        // Check if channel is still alive
-        if channel.state == ChannelState::Down {
-            debug!("Echo: channel '{}' hung up", channel.name);
-            return PbxExecResult::Hangup;
-        }
-
-        // In a real implementation, this would be a loop that:
-        //   1. Reads frames from the channel
-        //   2. Echoes them back (voice, video, DTMF, text)
-        //   3. Terminates on '#' DTMF or channel hangup
-        //
-        // The actual frame loop would call:
-        //   let frame = channel_driver.read(channel).await?;
-        //
-        // Then process each frame type:
-        //   - Voice/Video/Text/DTMF: echo back
-        //   - Control (VidUpdate): echo once
-        //   - Modem/Null: skip
-        //   - DTMF '#': exit
-        //
-        // Without real frame I/O, we block by polling the channel state.
-        // This keeps the dialplan alive so the SIP dialog stays open until
-        // the remote side hangs up (softhangup sets state to Down).
         let chan_name = channel.name.clone();
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if channel.state == ChannelState::Down
-                || channel.check_hangup()
-            {
+            // Terminate on hangup (local flag, or a hangup set on the shared
+            // store copy by AMI / a remote BYE).
+            if channel.state == ChannelState::Down || channel.check_hangup() {
                 break;
             }
-            // Also check the global channel store for hangup (AMI may set flags there)
             if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&chan_name) {
-                let guard = store_chan.lock();
-                if guard.check_hangup() {
-                    channel.softhangup(guard.softhangup_flags);
+                let flags = {
+                    let guard = store_chan.lock();
+                    if guard.check_hangup() {
+                        Some(guard.softhangup_flags)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(flags) = flags {
+                    channel.softhangup(flags);
                     break;
                 }
+            }
+
+            let Some(driver) = driver.as_ref() else {
+                // No technology driver at all: nothing to pump. Poll for hangup.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+
+            // Read one frame, bounded so we periodically re-check for hangup
+            // even when the media is silent (recv_frame blocks on the socket).
+            match tokio::time::timeout(Duration::from_millis(500), driver.read_frame(channel)).await
+            {
+                Ok(Ok(frame)) => {
+                    match &frame {
+                        // '#' terminates Echo, matching app_echo.c.
+                        Frame::DtmfEnd { digit, .. } | Frame::DtmfBegin { digit } if *digit == '#' => {
+                            debug!("Echo: '#' received, exiting on '{}'", chan_name);
+                            break;
+                        }
+                        // Echo media / DTMF / text back to the caller. (Only
+                        // voice actually goes on the wire via RTP; other kinds
+                        // are accepted and ignored by the driver.)
+                        Frame::Voice { .. }
+                        | Frame::Video { .. }
+                        | Frame::Text { .. }
+                        | Frame::DtmfBegin { .. }
+                        | Frame::DtmfEnd { .. } => {
+                            if let Err(e) = driver.write_frame(channel, &frame).await {
+                                debug!("Echo: write_frame error on '{}': {}", chan_name, e);
+                            }
+                        }
+                        // Do not echo Control / Modem / Null frames.
+                        _ => {}
+                    }
+                }
+                // Read error (e.g. no RTP session attached for this channel):
+                // back off briefly and keep the dialplan alive.
+                Ok(Err(_)) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                // Timed out waiting for a frame: loop to re-check hangup.
+                Err(_) => {}
             }
         }
 

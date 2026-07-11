@@ -141,7 +141,7 @@ impl TestRegistry {
     pub fn execute_all(&self) -> Vec<TestCase> {
         let tests = self.tests.lock();
         let mut results = Vec::new();
-        for (_, (info, f)) in tests.iter() {
+        for (info, f) in tests.values() {
             let tc = Self::run_one(info, f);
             results.push(tc);
         }
@@ -152,7 +152,7 @@ impl TestRegistry {
     pub fn execute_category(&self, category_prefix: &str) -> Vec<TestCase> {
         let tests = self.tests.lock();
         let mut results = Vec::new();
-        for (_, (info, f)) in tests.iter() {
+        for (info, f) in tests.values() {
             if info.category.starts_with(category_prefix) {
                 results.push(Self::run_one(info, f));
             }

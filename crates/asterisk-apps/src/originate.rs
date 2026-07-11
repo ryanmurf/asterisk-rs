@@ -114,14 +114,11 @@ impl OriginateArgs {
 
         // Parse tech/data
         let tech_data_str = parts[0].trim();
-        let (tech, tech_data) = if let Some(slash_pos) = tech_data_str.find('/') {
-            (
-                tech_data_str[..slash_pos].to_string(),
-                tech_data_str[slash_pos + 1..].to_string(),
-            )
-        } else {
-            return None;
-        };
+        let slash_pos = tech_data_str.find('/')?;
+        let (tech, tech_data) = (
+            tech_data_str[..slash_pos].to_string(),
+            tech_data_str[slash_pos + 1..].to_string(),
+        );
 
         if tech.is_empty() {
             return None;

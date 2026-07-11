@@ -6,13 +6,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use tracing::{info, warn, debug};
 
+use crate::channel_driver::SipChannelDriver;
 use crate::parser::SipMessage;
 use crate::authenticator::AuthCredentials;
+use crate::registrar::Registrar;
+use crate::rtp::RtpSession;
 use crate::sdp::SessionDescription;
 use crate::session::SipSession;
 use crate::transport::SipTransport;
@@ -43,6 +46,13 @@ pub struct SipEventHandler {
     call_states: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<CallState>>>>>,
     /// Supported codecs (audio + video) for SDP answer generation.
     supported_codecs: Vec<Codec>,
+    /// SIP channel driver used to attach the inbound media plane (RTP) to
+    /// answered channels, mirroring the outbound `request()` wiring. Set once
+    /// at startup via [`Self::set_channel_driver`]; when absent, inbound calls
+    /// still signal but carry no media.
+    channel_driver: OnceLock<Arc<SipChannelDriver>>,
+    /// Inbound REGISTER handler (contact bindings per AoR).
+    registrar: Arc<Registrar>,
 }
 
 impl SipEventHandler {
@@ -59,7 +69,24 @@ impl SipEventHandler {
                 codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
             ],
+            channel_driver: OnceLock::new(),
+            registrar: Arc::new(Registrar::new()),
         }
+    }
+
+    /// Attach the SIP channel driver used to wire the inbound media plane.
+    ///
+    /// Called once at startup with the same `SipChannelDriver` that is
+    /// registered in the tech registry, so inbound RTP sessions land in the
+    /// driver's channel map (keyed by channel name) and are reachable by
+    /// `Echo()` and other apps via `read_frame`/`write_frame`.
+    pub fn set_channel_driver(&self, driver: Arc<SipChannelDriver>) {
+        let _ = self.channel_driver.set(driver);
+    }
+
+    /// The inbound registrar, exposed for status/introspection and tests.
+    pub fn registrar(&self) -> Arc<Registrar> {
+        self.registrar.clone()
     }
 
     /// Handle an incoming SIP INVITE -- creates a channel and starts PBX execution.
@@ -243,13 +270,62 @@ impl SipEventHandler {
             map.insert(call_id.clone(), channel_name.clone());
         }
 
-        // 7. Generate SDP answer from the remote offer so 200 OK includes media.
+        // 7. Bind the inbound media plane (RTP) and generate the SDP answer.
+        //
+        //    Mirrors the outbound `SipChannelDriver::request()` wiring: bind a
+        //    local RTP socket, point it at the caller's advertised RTP endpoint,
+        //    select the negotiated payload type, then attach it to the channel
+        //    via the driver so `read_frame`/`write_frame` (and thus `Echo`) can
+        //    move media. The SDP answer advertises the socket's REAL port —
+        //    never the old hardcoded 10000 (issues #7, #8, #9).
         let local_ip = session.local_addr.ip().to_string();
-        if let Some(ref remote_sdp) = session.remote_sdp {
+        if let Some(remote_sdp) = session.remote_sdp.clone() {
+            let mut answer_port: u16 = 0;
+
+            let rtp_bind = SocketAddr::new(session.local_addr.ip(), 0);
+            match RtpSession::bind(rtp_bind).await {
+                Ok(mut rtp) => {
+                    if let Some(remote_rtp) = remote_rtp_endpoint(&remote_sdp) {
+                        rtp.set_remote_addr(remote_rtp);
+                    }
+                    if let Some(pt) = negotiated_payload_type(&remote_sdp, &self.supported_codecs) {
+                        rtp.payload_type = pt;
+                    }
+                    answer_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
+
+                    if let Some(driver) = self.channel_driver.get() {
+                        driver.attach_inbound_media(
+                            &channel_name,
+                            session.local_addr,
+                            remote_addr,
+                            self.transport.clone(),
+                            rtp,
+                        );
+                        debug!(
+                            call_id = %call_id,
+                            channel = %channel_name,
+                            port = answer_port,
+                            "Bound inbound RTP and attached media plane"
+                        );
+                    } else {
+                        warn!(
+                            call_id = %call_id,
+                            "No channel driver set -- inbound call will carry no media"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(call_id = %call_id, "Failed to bind inbound RTP socket: {}", e);
+                }
+            }
+
+            // Advertise the socket's real port. Only if the bind failed do we
+            // fall back to a placeholder so the SDP still parses.
+            let sdp_port = if answer_port != 0 { answer_port } else { 10000 };
             let answer_sdp = SessionDescription::create_answer(
-                remote_sdp,
+                &remote_sdp,
                 &local_ip,
-                10000, // RTP port (will be overridden if RTP session is created)
+                sdp_port,
                 &self.supported_codecs,
             );
             session.local_sdp = Some(answer_sdp.clone());
@@ -310,6 +386,10 @@ impl SipEventHandler {
         let call_id_for_task = call_id.clone();
         let call_states_ref = self.call_states.clone();
         let callid_map_ref = self.callid_map.clone();
+        // Tear down the inbound media plane (drop the RTP socket) when the call
+        // ends, so bound sockets are not leaked in the driver's channel map.
+        let driver_for_cleanup = self.channel_driver.get().cloned();
+        let channel_name_for_media = channel_name.clone();
 
         // Notify that fires when Answer() is called on the channel.
         let answer_notify = Arc::new(tokio::sync::Notify::new());
@@ -452,6 +532,11 @@ impl SipEventHandler {
                 // Clean up from global store
                 let uid = ch_for_cleanup.lock().unique_id.0.clone();
                 store::deregister(&uid);
+
+                // Tear down the inbound media plane (drop the RTP socket).
+                if let Some(driver) = &driver_for_cleanup {
+                    driver.remove_channel(&channel_name_for_media);
+                }
             });
         });
 
@@ -590,6 +675,50 @@ impl SipEventHandler {
 
             // Notify any SFU conferences that this SIP call was hung up.
             crate::notify_sip_hangup(&call_id);
+        }
+    }
+
+    /// Handle an incoming SIP REGISTER request.
+    ///
+    /// Routes the request to the registrar (contact binding + expiry) and sends
+    /// the resulting response. When endpoints have auth configured, the client
+    /// must present a valid digest first — otherwise we return a 401 challenge,
+    /// consistent with the INVITE auth flow (issue #11). Without this routing,
+    /// inbound REGISTER received no response at all.
+    pub async fn handle_register(&self, request: &SipMessage, remote_addr: SocketAddr) {
+        let call_id = request.call_id().unwrap_or("").to_string();
+
+        // Enforce digest auth if any endpoint has credentials configured.
+        if let Some(cfg) = crate::pjsip_config::get_global_pjsip_config() {
+            let mut creds: Vec<AuthCredentials> = Vec::new();
+            for ep in &cfg.endpoints {
+                if let Some(ref auth_name) = ep.auth {
+                    if let Some(auth) = cfg.find_auth(auth_name) {
+                        creds.push(AuthCredentials::new(&auth.username, &auth.password, ""));
+                    }
+                }
+            }
+
+            if !creds.is_empty() {
+                let authenticator = crate::authenticator::InboundAuthenticator::new();
+                if let Err(challenge) = authenticator.verify(request, &creds, false) {
+                    if let Err(e) = self.transport.send(&challenge, remote_addr).await {
+                        warn!(call_id = %call_id, "Failed to send REGISTER 401 challenge: {}", e);
+                    } else {
+                        debug!(call_id = %call_id, "Sent 401 challenge for REGISTER");
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Authenticated (or no auth required): perform the registration.
+        let response = self.registrar.handle_register(request);
+        let status = response.status_code().unwrap_or(0);
+        if let Err(e) = self.transport.send(&response, remote_addr).await {
+            warn!(call_id = %call_id, "Failed to send REGISTER response: {}", e);
+        } else {
+            info!(call_id = %call_id, status, "Handled REGISTER");
         }
     }
 
@@ -855,6 +984,47 @@ impl SipEventHandler {
     }
 }
 
+/// Extract the caller's advertised RTP endpoint (IP + port) from an offer SDP.
+///
+/// Prefers a media-level `c=` line, falling back to the session-level `c=`.
+/// Returns `None` when there is no active audio stream (port 0) or the address
+/// cannot be parsed — in which case we still bind a socket but leave the remote
+/// unset until the first packet teaches us the source.
+fn remote_rtp_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
+    let media = sdp
+        .media_descriptions
+        .iter()
+        .find(|m| m.media_type == "audio")?;
+    if media.port == 0 {
+        return None;
+    }
+    let addr_str = media
+        .connection
+        .as_ref()
+        .map(|c| c.addr.as_str())
+        .or_else(|| sdp.connection.as_ref().map(|c| c.addr.as_str()))?;
+    let ip: std::net::IpAddr = addr_str.parse().ok()?;
+    Some(SocketAddr::new(ip, media.port))
+}
+
+/// Determine the outbound RTP payload type for the answer: the first codec the
+/// offer and our supported list share (so we echo/transmit with a PT the caller
+/// understands). Falls back to the offer's first advertised format.
+fn negotiated_payload_type(sdp: &SessionDescription, supported: &[Codec]) -> Option<u8> {
+    let media = sdp
+        .media_descriptions
+        .iter()
+        .find(|m| m.media_type == "audio")?;
+    for oc in media.codecs() {
+        for sc in supported {
+            if oc.name.eq_ignore_ascii_case(&sc.name) && oc.sample_rate == sc.sample_rate {
+                return Some(oc.payload_type);
+            }
+        }
+    }
+    media.formats.first().copied()
+}
+
 /// Extract the user part from a SIP header value like `"Name" <sip:user@host>` or `sip:user@host`.
 fn extract_user_from_header(header: &str) -> Option<String> {
     // Try to find a SIP URI in angle brackets first
@@ -979,5 +1149,33 @@ mod tests {
         let _b = rand_id();
         // They are close in time but not necessarily different
         assert!(a > 0 || true); // just ensure it doesn't panic
+    }
+
+    #[test]
+    fn test_remote_rtp_endpoint_from_offer() {
+        let offer = SessionDescription::create_offer(
+            "203.0.113.7",
+            40000,
+            &[codecs::pcmu()],
+        );
+        let ep = remote_rtp_endpoint(&offer).expect("offer has an audio endpoint");
+        assert_eq!(ep.ip().to_string(), "203.0.113.7");
+        assert_eq!(ep.port(), 40000);
+    }
+
+    #[test]
+    fn test_remote_rtp_endpoint_rejected_stream_is_none() {
+        // A media stream with port 0 (rejected/held) has no live endpoint.
+        let mut offer = SessionDescription::create_offer("203.0.113.7", 0, &[codecs::pcmu()]);
+        offer.media_descriptions[0].port = 0;
+        assert!(remote_rtp_endpoint(&offer).is_none());
+    }
+
+    #[test]
+    fn test_negotiated_payload_type_prefers_common_codec() {
+        // Offer PCMA (8); our supported list includes it -> PT 8.
+        let offer = SessionDescription::create_offer("203.0.113.7", 40000, &[codecs::pcma()]);
+        let supported = vec![codecs::pcmu(), codecs::pcma()];
+        assert_eq!(negotiated_payload_type(&offer, &supported), Some(8));
     }
 }

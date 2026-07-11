@@ -130,10 +130,7 @@ impl FramehookList {
     fn process_event(&self, frame: &Frame, event: FramehookEvent) -> Option<Frame> {
         let mut current = frame.clone();
         for hook in &self.hooks {
-            match hook.process(&current, event) {
-                Some(f) => current = f,
-                None => return None,
-            }
+            current = hook.process(&current, event)?;
         }
         Some(current)
     }
