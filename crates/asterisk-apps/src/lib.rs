@@ -72,6 +72,7 @@ pub mod playback;
 pub mod echo;
 pub mod record;
 pub mod confbridge;
+pub mod confbridge_mix;
 pub mod queue;
 pub mod voicemail;
 pub mod registry;

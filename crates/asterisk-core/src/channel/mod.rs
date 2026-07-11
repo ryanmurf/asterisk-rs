@@ -617,6 +617,18 @@ pub trait ChannelDriver: Send + Sync + fmt::Debug {
     /// Write a frame to the channel.
     async fn write_frame(&self, channel: &mut Channel, frame: &Frame) -> AsteriskResult<()>;
 
+    /// The negotiated audio format for this channel, expressed as the same
+    /// codec id carried in [`Frame::Voice`] (for RTP-based drivers this is
+    /// the negotiated payload type, e.g. 0 = PCMU, 8 = PCMA). Returns `None`
+    /// when the driver has no negotiated audio format for the channel.
+    ///
+    /// Mixing bridges (ConfBridge softmix) use this to pick the encoder for
+    /// audio written back to a leg, so a participant that never sends media
+    /// still receives the mix in its own negotiated codec.
+    async fn audio_format(&self, _channel: &Channel) -> Option<u32> {
+        None
+    }
+
     /// Indicate a condition.
     async fn indicate(
         &self,

@@ -668,6 +668,22 @@ pub fn get_events() -> Vec<ConfBridgeEvent> {
     EVENT_LOG.read().clone()
 }
 
+/// Snapshot of a conference's participants for the audio mixer: channel
+/// name -> (muted, deaf). "Muted" includes waiting-for-marked users, whose
+/// audio must not enter the mix. Returns `None` when no conference by this
+/// name is registered (the mixer then keeps its current participant set).
+pub(crate) fn conference_participant_flags(
+    conf_name: &str,
+) -> Option<HashMap<String, (bool, bool)>> {
+    CONFERENCES.get(conf_name).map(|conf| {
+        let conf = conf.read();
+        conf.participants
+            .values()
+            .map(|u| (u.channel_name.clone(), (u.muted || u.waiting, u.deaf)))
+            .collect()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Video Stream Info (for SFU)
 // ---------------------------------------------------------------------------
@@ -1411,6 +1427,14 @@ impl AppConfBridge {
             marked: is_marked,
         });
 
+        // Attach this leg to the conference's audio mixer (issue #12): a
+        // reader task pumps the leg's RTP into the softmix core, and the
+        // mixer's 20 ms tick writes the mix-minus back to every leg. The
+        // mixer refreshes mute/deaf (and drops kicked legs) each tick from
+        // this conference's participant list.
+        let mixer = crate::confbridge_mix::get_or_create_mixer(&conf_name);
+        mixer.add_participant(&channel.name).await;
+
         if wait_for_marked {
             debug!(
                 "ConfBridge: '{}' is waiting for marked user in '{}'",
@@ -1518,6 +1542,7 @@ impl AppConfBridge {
         let mut should_destroy = false;
         let mut end_marked = false;
         let mut departed_video_streams = Vec::new();
+        let mut departed_channel_name = None;
         let is_sfu;
 
         {
@@ -1535,6 +1560,9 @@ impl AppConfBridge {
             }
 
             if let Some(ref user) = user {
+                // Capture the channel name so the leg can be detached from
+                // the audio mixer outside the conference lock.
+                departed_channel_name = Some(user.channel_name.clone());
                 // Capture video streams for SFU departure notification.
                 departed_video_streams = user.video_streams.clone();
 
@@ -1606,6 +1634,15 @@ impl AppConfBridge {
             }
         }
 
+        // Detach the departed leg from the audio mixer right away; the
+        // remaining legs keep mixing without interruption. (The mixer's
+        // per-tick sync would also catch this, plus any kick path.)
+        if let Some(ref name) = departed_channel_name {
+            if let Some(mixer) = crate::confbridge_mix::get_mixer(conf_name) {
+                mixer.remove_participant(name);
+            }
+        }
+
         // Broadcast SFU participant left event so remaining participants get re-INVITEd.
         if is_sfu && !departed_video_streams.is_empty() {
             let _ = SFU_EVENT_TX.send(SfuEvent::ParticipantLeft {
@@ -1616,6 +1653,9 @@ impl AppConfBridge {
         }
 
         if should_destroy {
+            // Last leg out: stop the mixing task and abort all readers so
+            // no task or socket reference outlives the conference.
+            crate::confbridge_mix::shutdown_mixer(conf_name);
             CONFERENCES.remove(conf_name);
             emit_event(ConfBridgeEvent::ConfbridgeEnd {
                 conference: conf_name.to_string(),
