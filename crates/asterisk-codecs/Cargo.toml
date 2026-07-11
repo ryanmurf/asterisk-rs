@@ -8,10 +8,13 @@ edition.workspace = true
 default = []
 # Enable native Opus codec via FFI to libopus.
 # When disabled, Opus encode/decode returns a stub error.
+# Links the system libopus (build.rs: OPUS_LIB_DIR > pkg-config > -lopus).
 native-opus = []
 # Enable native GSM codec via FFI to libgsm.
+# Links the system libgsm (build.rs: GSM_LIB_DIR > pkg-config > -lgsm).
 native-gsm = []
 # Enable native Speex codec via FFI to libspeex.
+# Links the system libspeex (build.rs: SPEEX_LIB_DIR > pkg-config > -lspeex).
 native-speex = []
 
 [dependencies]
