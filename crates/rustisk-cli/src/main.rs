@@ -733,9 +733,41 @@ impl Default for AsteriskDirs {
             config_dir: "/etc/asterisk".to_string(),
             run_dir: "/var/run/asterisk".to_string(),
             mod_dir: "/usr/lib/asterisk/modules".to_string(),
-            include_dir: "/usr/include".to_string(),
+            // Derived from run_dir by default (see resolve_include_dir); the
+            // old hardcoded /usr/include default required root to write the
+            // header shims (issue #14).
+            include_dir: "/var/run/asterisk/include".to_string(),
         }
     }
+}
+
+/// Environment variable that overrides the header-shim include directory
+/// when `astincludedir` is not set in `asterisk.conf`.
+const INCLUDE_DIR_ENV: &str = "RUSTISK_INCLUDE_DIR";
+
+/// Resolve the directory the header shims (e.g. `asterisk/buildopts.h`)
+/// are written under.
+///
+/// Precedence:
+/// 1. `astincludedir` from `[directories]` in `asterisk.conf`
+/// 2. the `RUSTISK_INCLUDE_DIR` environment variable
+/// 3. `<run_dir>/include` -- writable in a normal non-root install, unlike
+///    the old hardcoded `/usr/include` default (issue #14)
+///
+/// Empty or whitespace-only values are treated as unset.
+fn resolve_include_dir(
+    config_value: Option<&str>,
+    env_value: Option<&str>,
+    run_dir: &str,
+) -> String {
+    let non_empty = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    non_empty(config_value)
+        .or_else(|| non_empty(env_value))
+        .unwrap_or_else(|| format!("{}/include", run_dir.trim_end_matches('/')))
 }
 
 /// Resolve all directories from the asterisk.conf file.
@@ -748,6 +780,7 @@ fn resolve_dirs(config_file: Option<&str>) -> AsteriskDirs {
         .unwrap_or_else(|| std::path::PathBuf::from("/etc/asterisk/asterisk.conf"));
 
     let mut dirs = AsteriskDirs::default();
+    let mut include_dir_override: Option<String> = None;
 
     // Default config_dir to parent of the config file
     if let Some(parent) = conf_path.parent() {
@@ -782,12 +815,23 @@ fn resolve_dirs(config_file: Option<&str>) -> AsteriskDirs {
                             dirs.run_dir = value.to_string();
                         } else if key.eq_ignore_ascii_case("astmoddir") {
                             dirs.mod_dir = value.to_string();
+                        } else if key.eq_ignore_ascii_case("astincludedir") {
+                            include_dir_override = Some(value.to_string());
                         }
                     }
                 }
             }
         }
     }
+
+    // Resolve the include dir last so the derived default follows any
+    // astrundir override parsed above.
+    let env_value = std::env::var(INCLUDE_DIR_ENV).ok();
+    dirs.include_dir = resolve_include_dir(
+        include_dir_override.as_deref(),
+        env_value.as_deref(),
+        &dirs.run_dir,
+    );
 
     dirs
 }
@@ -1382,11 +1426,16 @@ fn create_module_stubs(mod_dir: &str) {
 // ============================================================================
 
 /// Create the buildopts.h shim at `<include_dir>/asterisk/buildopts.h`.
+///
+/// The shim is a nice-to-have for external modules compiled against the
+/// Asterisk headers, so failure to write it (e.g. the directory is not
+/// writable by the current user) is logged at debug level and startup
+/// continues (issue #14).
 fn create_buildopts_h(include_dir: &str) {
     let dir = std::path::Path::new(include_dir).join("asterisk");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(
-            "Could not create include directory {}: {}",
+        debug!(
+            "Skipping buildopts.h shim; could not create include directory {}: {}",
             dir.display(),
             e
         );
@@ -1405,7 +1454,11 @@ fn create_buildopts_h(include_dir: &str) {
 
     match std::fs::write(&path, content) {
         Ok(()) => info!("Created buildopts.h at {}", path.display()),
-        Err(e) => warn!("Could not create buildopts.h: {}", e),
+        Err(e) => debug!(
+            "Skipping buildopts.h shim; could not write {}: {}",
+            path.display(),
+            e
+        ),
     }
 }
 
@@ -2293,4 +2346,98 @@ async fn main() {
     // Graceful shutdown
     shutdown_sequence(&run_dir);
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a unique empty temp directory for a test.
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustisk-dirs-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn include_dir_precedence_is_config_then_env_then_derived() {
+        assert_eq!(
+            resolve_include_dir(Some("/cfg/include"), Some("/env/include"), "/run"),
+            "/cfg/include"
+        );
+        assert_eq!(
+            resolve_include_dir(None, Some("/env/include"), "/run"),
+            "/env/include"
+        );
+        assert_eq!(resolve_include_dir(None, None, "/run"), "/run/include");
+    }
+
+    #[test]
+    fn include_dir_treats_empty_values_as_unset() {
+        assert_eq!(
+            resolve_include_dir(Some("  "), Some(""), "/run"),
+            "/run/include"
+        );
+        assert_eq!(
+            resolve_include_dir(Some(""), Some("/env/include"), "/run"),
+            "/env/include"
+        );
+    }
+
+    #[test]
+    fn include_dir_derived_default_handles_trailing_slash() {
+        assert_eq!(resolve_include_dir(None, None, "/run/"), "/run/include");
+    }
+
+    #[test]
+    fn resolve_dirs_honors_astincludedir() {
+        let dir = test_dir("incdir");
+        let conf = dir.join("asterisk.conf");
+        std::fs::write(
+            &conf,
+            "[directories]\nastincludedir => /opt/rustisk/include\n",
+        )
+        .unwrap();
+
+        let dirs = resolve_dirs(Some(conf.to_str().unwrap()));
+        assert_eq!(dirs.include_dir, "/opt/rustisk/include");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // NOTE: the tests below assume RUSTISK_INCLUDE_DIR is not set in the
+    // test environment (it never is in CI); env-override precedence itself
+    // is covered by the pure resolve_include_dir tests above.
+
+    #[test]
+    fn resolve_dirs_derives_include_dir_from_astrundir() {
+        let dir = test_dir("rundir");
+        let conf = dir.join("asterisk.conf");
+        std::fs::write(&conf, "[directories]\nastrundir = /home/user/rustisk/run\n").unwrap();
+
+        let dirs = resolve_dirs(Some(conf.to_str().unwrap()));
+        assert_eq!(dirs.run_dir, "/home/user/rustisk/run");
+        assert_eq!(dirs.include_dir, "/home/user/rustisk/run/include");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_dirs_default_include_dir_is_under_run_dir_not_usr_include() {
+        let dir = test_dir("noconf");
+        let conf = dir.join("does-not-exist.conf");
+
+        let dirs = resolve_dirs(Some(conf.to_str().unwrap()));
+        assert_eq!(dirs.include_dir, "/var/run/asterisk/include");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
