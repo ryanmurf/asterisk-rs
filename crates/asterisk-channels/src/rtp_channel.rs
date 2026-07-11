@@ -1,6 +1,12 @@
 //! RTP (bare) channel driver.
 //!
 //! Port of `channels/chan_rtp.c`. Channel backed by raw UDP RTP socket.
+//!
+//! The `UnicastRTP` technology is the media leg behind ARI's
+//! `POST /channels/externalMedia`: the channel's `write_frame` forks audio as
+//! RTP to a fixed external `host:port`, and `read_frame` injects RTP received
+//! back from that endpoint into the channel. Destination syntax for
+//! `request()` is `<host:port>[/<format>]`, e.g. `192.0.2.1:12345/ulaw`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -90,6 +96,33 @@ pub fn parse_rtp_packet(data: &[u8]) -> Result<(RtpHeader, &[u8]), AsteriskError
     Ok((header, &data[offset..]))
 }
 
+/// Channel variable exposing the local RTP bind address (like chan_rtp.c).
+pub const UNICASTRTP_LOCAL_ADDRESS: &str = "UNICASTRTP_LOCAL_ADDRESS";
+/// Channel variable exposing the local RTP bind port (like chan_rtp.c).
+pub const UNICASTRTP_LOCAL_PORT: &str = "UNICASTRTP_LOCAL_PORT";
+
+/// Map an Asterisk format name to its static RTP payload type and the number
+/// of samples carried per 20ms packet. Only the narrowband G.711 variants are
+/// supported until the codec layer grows transcoding.
+fn format_to_payload(format: &str) -> Option<(u8, u32)> {
+    match format {
+        "ulaw" | "mulaw" | "pcmu" => Some((0, 160)),
+        "alaw" | "pcma" => Some((8, 160)),
+        _ => None,
+    }
+}
+
+/// Formats accepted by [`format_to_payload`], for error messages and
+/// ARI-side validation.
+pub fn supported_formats() -> &'static [&'static str] {
+    &["ulaw", "mulaw", "pcmu", "alaw", "pcma"]
+}
+
+/// Global counter for unique channel-name suffixes (like chan_pjsip's
+/// counter); two concurrent channels to the same destination must not
+/// collide on a name because driver private data is keyed by name.
+static CHANNEL_COUNTER: AtomicU32 = AtomicU32::new(1);
+
 struct RtpPrivate {
     socket: Arc<UdpSocket>,
     remote_addr: Option<SocketAddr>,
@@ -127,12 +160,16 @@ impl RtpChannelDriver {
         Self { channels: RwLock::new(HashMap::new()) }
     }
 
-    fn get_private(&self, id: &str) -> Option<Arc<Mutex<RtpPrivate>>> {
-        self.channels.read().get(id).cloned()
+    /// Private data is keyed by channel NAME (not unique_id): the global
+    /// channel store may re-assign a channel's unique_id when registering it
+    /// (`register_existing_channel`), which would orphan an id-keyed entry
+    /// and leak its RTP socket -- the exact failure shape of finding F23.
+    fn get_private(&self, name: &str) -> Option<Arc<Mutex<RtpPrivate>>> {
+        self.channels.read().get(name).cloned()
     }
 
-    fn remove_private(&self, id: &str) -> Option<Arc<Mutex<RtpPrivate>>> {
-        self.channels.write().remove(id)
+    fn remove_private(&self, name: &str) -> Option<Arc<Mutex<RtpPrivate>>> {
+        self.channels.write().remove(name)
     }
 
     fn generate_ssrc() -> u32 {
@@ -161,8 +198,15 @@ impl ChannelDriver for RtpChannelDriver {
         "Unicast RTP Media Channel Driver"
     }
 
+    /// Request a UnicastRTP channel.
+    ///
+    /// `dest` format: `<host:port>[/<format>]` where `<format>` is an
+    /// Asterisk format name (default `ulaw`). Binds a fresh UDP socket (and
+    /// thus a fresh SSRC), points it at the external address, and exposes
+    /// the local bind address via the `UNICASTRTP_LOCAL_ADDRESS` /
+    /// `UNICASTRTP_LOCAL_PORT` channel variables like chan_rtp.c.
     async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
-        let (addr_str, _options) = match dest.split_once('/') {
+        let (addr_str, options) = match dest.split_once('/') {
             Some((a, o)) => (a, Some(o)),
             None => (dest, None),
         };
@@ -171,14 +215,37 @@ impl ChannelDriver for RtpChannelDriver {
             AsteriskError::InvalidArgument(format!("Invalid address '{}': {}", addr_str, e))
         })?;
 
+        let format = match options {
+            Some(f) if !f.is_empty() => f,
+            _ => "ulaw",
+        };
+        let (payload_type, samples_per_packet) =
+            format_to_payload(format).ok_or_else(|| {
+                AsteriskError::InvalidArgument(format!(
+                    "Unsupported format '{}' for UnicastRTP (supported: {})",
+                    format,
+                    supported_formats().join(", ")
+                ))
+            })?;
+
         let bind_addr = if remote_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
         let ssrc = Self::generate_ssrc();
 
-        let chan_name = format!("UnicastRTP/{}", addr_str);
-        let channel = Channel::new(chan_name);
-        let channel_id = channel.unique_id.as_str().to_string();
+        let counter = CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let chan_name = format!("UnicastRTP/{}-{:08x}", addr_str, counter);
+        let mut channel = Channel::new(chan_name);
+        channel.read_format = format.to_string();
+        channel.write_format = format.to_string();
+        channel.variables.insert(
+            UNICASTRTP_LOCAL_ADDRESS.to_string(),
+            local_addr.ip().to_string(),
+        );
+        channel.variables.insert(
+            UNICASTRTP_LOCAL_PORT.to_string(),
+            local_addr.port().to_string(),
+        );
 
         let priv_data = Arc::new(Mutex::new(RtpPrivate {
             socket: Arc::new(socket),
@@ -186,11 +253,18 @@ impl ChannelDriver for RtpChannelDriver {
             sequence: AtomicU16::new(0),
             timestamp: AtomicU32::new(0),
             ssrc,
-            payload_type: 0,
-            samples_per_packet: 160,
+            payload_type,
+            samples_per_packet,
         }));
-        self.channels.write().insert(channel_id, priv_data);
-        info!(remote = %remote_addr, local = %local_addr, ssrc, "RTP channel created");
+        self.channels.write().insert(channel.name.clone(), priv_data);
+        info!(
+            channel = %channel.name,
+            remote = %remote_addr,
+            local = %local_addr,
+            ssrc,
+            format,
+            "RTP channel created"
+        );
         Ok(channel)
     }
 
@@ -204,8 +278,11 @@ impl ChannelDriver for RtpChannelDriver {
         Ok(())
     }
 
+    /// Hang up: drops the private entry, which releases the bound RTP socket
+    /// (no orphaned driver entries -- see finding F23 for the leak shape this
+    /// must avoid).
     async fn hangup(&self, channel: &mut Channel) -> AsteriskResult<()> {
-        self.remove_private(channel.unique_id.as_str());
+        self.remove_private(&channel.name);
         channel.set_state(ChannelState::Down);
         info!(channel = %channel.name, "RTP channel hungup");
         Ok(())
@@ -213,7 +290,7 @@ impl ChannelDriver for RtpChannelDriver {
 
     async fn read_frame(&self, channel: &mut Channel) -> AsteriskResult<Frame> {
         let priv_arc = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
         let priv_data = priv_arc.lock().await;
         let mut buf = vec![0u8; RTP_HEADER_SIZE + RTP_MAX_PAYLOAD];
@@ -234,7 +311,7 @@ impl ChannelDriver for RtpChannelDriver {
         };
 
         let priv_arc = self
-            .get_private(channel.unique_id.as_str())
+            .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
         let priv_data = priv_arc.lock().await;
         let remote_addr = priv_data.remote_addr
@@ -295,5 +372,68 @@ mod tests {
         assert_eq!(h.payload_type, 8);
         assert_eq!(h.sequence, 42);
         assert_eq!(p.len(), 160);
+    }
+
+    #[test]
+    fn test_format_to_payload_mapping() {
+        assert_eq!(format_to_payload("ulaw"), Some((0, 160)));
+        assert_eq!(format_to_payload("alaw"), Some((8, 160)));
+        assert_eq!(format_to_payload("pcmu"), Some((0, 160)));
+        assert_eq!(format_to_payload("g729"), None);
+        assert_eq!(format_to_payload(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_bad_dest_and_format() {
+        let driver = RtpChannelDriver::new();
+        assert!(driver.request("not-an-address", None).await.is_err());
+        assert!(driver.request("127.0.0.1", None).await.is_err()); // no port
+        assert!(driver.request("127.0.0.1:4000/g729", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_request_unique_names_and_local_addr_vars() {
+        let driver = RtpChannelDriver::new();
+        let a = driver.request("127.0.0.1:4000/ulaw", None).await.unwrap();
+        let b = driver.request("127.0.0.1:4000/ulaw", None).await.unwrap();
+        assert_ne!(a.name, b.name, "concurrent channels to the same dest must not collide");
+        assert!(a.name.starts_with("UnicastRTP/127.0.0.1:4000-"));
+        assert!(a.variables.contains_key(UNICASTRTP_LOCAL_ADDRESS));
+        let port: u16 = a
+            .variables
+            .get(UNICASTRTP_LOCAL_PORT)
+            .expect("local port var")
+            .parse()
+            .expect("port must be numeric");
+        assert_ne!(port, 0);
+    }
+
+    /// Regression guard against the F23 leak shape: after `hangup()`, the
+    /// driver entry (and its socket) must be gone, so further media ops fail
+    /// rather than silently using a leaked socket.
+    #[tokio::test]
+    async fn test_hangup_releases_driver_entry() {
+        let driver = RtpChannelDriver::new();
+        let mut chan = driver.request("127.0.0.1:4000/ulaw", None).await.unwrap();
+        assert!(driver.get_private(&chan.name).is_some());
+
+        driver.hangup(&mut chan).await.unwrap();
+        assert!(driver.get_private(&chan.name).is_none());
+        let frame = Frame::voice(0, 160, Bytes::from_static(&[0x7F; 160]));
+        assert!(driver.write_frame(&mut chan, &frame).await.is_err());
+    }
+
+    /// The media plane must survive the global store re-assigning unique_id
+    /// (as `register_existing_channel` does): privates are keyed by name.
+    #[tokio::test]
+    async fn test_media_survives_uniqueid_reassignment() {
+        let driver = RtpChannelDriver::new();
+        let mut chan = driver.request("127.0.0.1:4001/alaw", None).await.unwrap();
+        chan.unique_id = asterisk_core::channel::ChannelId::from_name("rewritten-id");
+
+        // UDP send_to needs no listener; this only exercises the by-name lookup.
+        let frame = Frame::voice(8, 160, Bytes::from_static(&[0x55; 160]));
+        let res = driver.write_frame(&mut chan, &frame).await;
+        assert!(res.is_ok(), "write_frame must find the private by name: {:?}", res);
     }
 }

@@ -1862,6 +1862,9 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     use asterisk_core::channel::tech_registry::TECH_REGISTRY;
     TECH_REGISTRY.register(Arc::new(asterisk_channels::local::LocalChannelDriver::new()));
 
+    // Bare-RTP media channels (ARI externalMedia's UnicastRTP technology)
+    TECH_REGISTRY.register(Arc::new(asterisk_channels::rtp_channel::RtpChannelDriver::new()));
+
     // Register SIP/PJSIP channel driver
     let sip_driver = Arc::new(asterisk_sip::channel_driver::SipChannelDriver::new(
         sip_bind,
