@@ -39,8 +39,17 @@ impl fmt::Debug for SipChannelPrivate {
     }
 }
 
-/// Global counter for outbound channel naming (like Asterisk's chan_pjsip counter).
+/// Global counter for channel naming (like Asterisk's chan_pjsip counter).
+/// Shared by both the outbound `request()` path and the inbound INVITE path so
+/// that channel-name suffixes are process-globally unique and monotonic.
 static CHANNEL_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate the next process-global, monotonically increasing channel-name
+/// suffix. Used to build `PJSIP/<label>-<suffix>` names for both inbound and
+/// outbound calls; guarantees no two concurrent calls collide on a name.
+pub fn next_channel_suffix() -> u32 {
+    CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The SIP channel driver.
 ///
@@ -221,7 +230,7 @@ impl ChannelDriver for SipChannelDriver {
         );
         sip_session.local_sdp = Some(sdp);
 
-        let counter = CHANNEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let counter = next_channel_suffix();
         let chan_name = format!("PJSIP/{}-{:08}", dest, counter);
         let mut channel = Channel::new(chan_name);
 
@@ -470,5 +479,47 @@ impl ChannelDriver for SipChannelDriver {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::thread;
+
+    /// Regression for the channel-name collision bug: the inbound INVITE path
+    /// previously derived its channel-name suffix from a truncated
+    /// `SystemTime::now()` nanosecond value ("rand_id"), which is not random and
+    /// collides when two calls land in the same nanosecond window. The shared
+    /// monotonic counter must hand out strictly-unique suffixes even under
+    /// concurrent allocation from many threads.
+    #[test]
+    fn next_channel_suffix_is_unique_across_threads() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 1000;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                thread::spawn(|| {
+                    (0..PER_THREAD)
+                        .map(|_| next_channel_suffix())
+                        .collect::<Vec<u32>>()
+                })
+            })
+            .collect();
+
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("thread panicked"));
+        }
+
+        let unique: HashSet<u32> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "channel-name suffixes must be unique; got {} duplicates",
+            all.len() - unique.len()
+        );
     }
 }

@@ -239,7 +239,11 @@ impl SipEventHandler {
             .and_then(|cfg| cfg.identify_endpoint_by_ip(&remote_addr.ip().to_string()))
             .map(|s| s.to_string());
         let chan_label = matched_endpoint_name.as_deref().unwrap_or(&caller_num);
-        let channel_name = format!("PJSIP/{}-{:08x}", chan_label, rand_id());
+        let channel_name = format!(
+            "PJSIP/{}-{:08}",
+            chan_label,
+            crate::channel_driver::next_channel_suffix()
+        );
         let mut new_ch = asterisk_core::channel::Channel::new(&channel_name);
         new_ch.caller.id.number.number = caller_num.clone();
         new_ch.caller.id.name.name = caller_name;
@@ -1091,16 +1095,6 @@ fn extract_display_name(header: &str) -> Option<String> {
     None
 }
 
-/// Generate a random u32 for channel name suffix.
-fn rand_id() -> u32 {
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    (now & 0xFFFF_FFFF) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,16 +1133,6 @@ mod tests {
     fn test_extract_display_name_none() {
         let from = "<sip:bob@example.com>";
         assert_eq!(extract_display_name(from), None);
-    }
-
-    #[test]
-    fn test_rand_id() {
-        let a = rand_id();
-        // Just verify it returns something non-zero
-        // (technically could be 0 but extremely unlikely)
-        let _b = rand_id();
-        // They are close in time but not necessarily different
-        assert!(a > 0 || true); // just ensure it doesn't panic
     }
 
     #[test]
