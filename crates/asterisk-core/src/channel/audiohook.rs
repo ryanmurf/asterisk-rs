@@ -114,13 +114,11 @@ impl AudiohookList {
             let _ = spy.read(frame);
         }
 
-        // Run through manipulators
+        // Run through manipulators (`?` returns None when a manipulator
+        // drops the frame)
         let mut current = frame.clone();
         for manip in &mut self.manipulators {
-            match manip.read(&current) {
-                Some(f) => current = f,
-                None => return None, // manipulator dropped the frame
-            }
+            current = manip.read(&current)?;
         }
 
         Some(current)
@@ -136,10 +134,7 @@ impl AudiohookList {
 
         let mut current = frame.clone();
         for manip in &mut self.manipulators {
-            match manip.write(&current) {
-                Some(f) => current = f,
-                None => return None,
-            }
+            current = manip.write(&current)?;
         }
 
         Some(current)

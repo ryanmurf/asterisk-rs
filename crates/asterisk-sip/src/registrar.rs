@@ -305,7 +305,7 @@ impl Registrar {
     pub fn purge_expired(&self) -> usize {
         let mut map = self.contacts.write();
         let mut removed = 0usize;
-        for (_aor, list) in map.iter_mut() {
+        for list in map.values_mut() {
             let before = list.len();
             list.retain(|r| !r.is_expired());
             removed += before - list.len();
