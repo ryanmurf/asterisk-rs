@@ -1894,6 +1894,9 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                             dialplan.clone(),
                             transport_for_handler,
                         ));
+                    // Give the handler the SIP channel driver so inbound calls
+                    // bind an RTP session and carry media (mirrors outbound).
+                    event_handler.set_channel_driver(sip_driver_ref.clone());
                     asterisk_sip::set_global_event_handler(event_handler.clone());
                     tokio::spawn(async move {
                         while let Some(event) = rx.recv().await {
@@ -1927,8 +1930,16 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                                     request,
                                     remote_addr,
                                 } => {
-                                    // Handle OPTIONS with 200 OK
-                                    if request.method() == Some(asterisk_sip::SipMethod::Options) {
+                                    // Route inbound REGISTER to the registrar
+                                    // (contact binding + 200/401), so endpoints
+                                    // can register instead of getting no reply.
+                                    if request.method() == Some(asterisk_sip::SipMethod::Register) {
+                                        event_handler
+                                            .handle_register(&request, remote_addr)
+                                            .await;
+                                    } else if request.method()
+                                        == Some(asterisk_sip::SipMethod::Options)
+                                    {
                                         if let Ok(mut ok_resp) = request.create_response(200, "OK")
                                         {
                                             ok_resp.add_header(

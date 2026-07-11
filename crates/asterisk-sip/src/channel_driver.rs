@@ -105,6 +105,42 @@ impl SipChannelDriver {
         self.channels.write().remove(name)
     }
 
+    /// Attach a pre-bound [`RtpSession`] to an **inbound** channel so the media
+    /// plane (`read_frame`/`write_frame` → RTP) is reachable by channel name,
+    /// exactly like an outbound channel created via [`Self::request`].
+    ///
+    /// Inbound INVITEs are handled by [`crate::event_handler::SipEventHandler`],
+    /// which builds the channel directly in the global store rather than through
+    /// this driver — so without this call an inbound channel has no RTP session
+    /// and carries no media (issue #7). The `session`/`transport` stored here are
+    /// only used by the outbound-oriented `answer`/`call`/`hangup`/`indicate`
+    /// paths; the inbound signaling is driven by the event handler, so a
+    /// lightweight placeholder session is sufficient — only `rtp` is load-bearing
+    /// for the media pump.
+    pub fn attach_inbound_media(
+        &self,
+        channel_name: &str,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        transport: Arc<dyn SipTransport>,
+        rtp: RtpSession,
+    ) {
+        let priv_data = Arc::new(SipChannelPrivate {
+            session: Mutex::new(SipSession::new_outbound(local_addr, remote_addr)),
+            rtp: Mutex::new(Some(rtp)),
+            transport,
+        });
+        self.channels.write().insert(channel_name.to_string(), priv_data);
+    }
+
+    /// Remove a channel's private data (and its RTP socket) from the driver.
+    ///
+    /// Used to tear down the inbound media plane when a call ends, so bound
+    /// RTP sockets are not leaked in the driver's channel map.
+    pub fn remove_channel(&self, name: &str) {
+        self.remove_private(name);
+    }
+
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
         self.transport.read().clone().ok_or_else(|| {
             AsteriskError::Internal("SIP transport not initialized".into())

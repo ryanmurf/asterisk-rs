@@ -169,12 +169,41 @@ impl InboundAuthenticator {
             realm: realm.to_string(),
         };
 
-        let expected = create_digest_response(&challenge, &digest_creds, method, &parsed.uri);
+        // Recompute the expected response using the CLIENT's cnonce and nc so a
+        // qop=auth response can actually match (see issue #10). For a qop=auth
+        // request that omits cnonce/nc the response is malformed; reject it
+        // rather than silently falling back to values that could never match.
+        let expected_response = if parsed.qop.as_deref().is_some_and(|q| q.contains("auth")) {
+            let (cnonce, nc) = match (parsed.cnonce.as_deref(), parsed.nc.as_deref()) {
+                (Some(c), Some(n)) => (c, n),
+                _ => {
+                    warn!(
+                        username = %parsed.username,
+                        "qop=auth response missing cnonce/nc -- rejecting"
+                    );
+                    return Err(self.build_challenge(request, credentials, use_proxy_auth));
+                }
+            };
+            crate::auth::compute_digest_response_hash(
+                &challenge,
+                &digest_creds,
+                method,
+                &parsed.uri,
+                cnonce,
+                nc,
+            )
+        } else {
+            // RFC 2069 (no qop): cnonce/nc are not part of the hash.
+            crate::auth::compute_digest_response_hash(
+                &challenge,
+                &digest_creds,
+                method,
+                &parsed.uri,
+                "",
+                "",
+            )
+        };
 
-        // Extract the response= value from the expected header.
-        let expected_response = extract_response_value(&expected);
-        eprintln!("[DEBUG] Auth verify: username={}, method={}, uri={}, realm={}, nonce={}, expected_response={}, parsed_response={}", 
-                  cred.username, method, parsed.uri, realm, parsed.nonce, expected_response, parsed.response);
         if expected_response == parsed.response {
             debug!(username = %cred.username, "Authentication successful");
             Ok(())
@@ -346,6 +375,11 @@ pub struct ParsedAuth {
     pub algorithm: DigestAlgorithm,
     pub qop: Option<String>,
     pub opaque: Option<String>,
+    /// Client-supplied cnonce (present with qop). Required to verify a
+    /// qop=auth response.
+    pub cnonce: Option<String>,
+    /// Client-supplied nonce-count (present with qop), e.g. "00000001".
+    pub nc: Option<String>,
 }
 
 /// Parse an Authorization or Proxy-Authorization header value.
@@ -361,6 +395,8 @@ pub fn parse_authorization(value: &str) -> Option<ParsedAuth> {
     let mut algorithm = DigestAlgorithm::Md5;
     let mut qop = None;
     let mut opaque = None;
+    let mut cnonce = None;
+    let mut nc = None;
 
     for param in split_params(rest) {
         let (key, val) = match param.split_once('=') {
@@ -377,6 +413,8 @@ pub fn parse_authorization(value: &str) -> Option<ParsedAuth> {
             "algorithm" => algorithm = DigestAlgorithm::from_name(&val),
             "qop" => qop = Some(val),
             "opaque" => opaque = Some(val),
+            "cnonce" => cnonce = Some(val),
+            "nc" => nc = Some(val),
             _ => {}
         }
     }
@@ -394,6 +432,8 @@ pub fn parse_authorization(value: &str) -> Option<ParsedAuth> {
         algorithm,
         qop,
         opaque,
+        cnonce,
+        nc,
     })
 }
 
@@ -434,18 +474,6 @@ fn unquote(s: &str) -> String {
     } else {
         s.to_string()
     }
-}
-
-/// Extract the `response="..."` value from a complete Digest auth header value.
-fn extract_response_value(header_value: &str) -> String {
-    for param in split_params(header_value.strip_prefix("Digest").unwrap_or(header_value)) {
-        if let Some((key, val)) = param.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("response") {
-                return unquote(val.trim());
-            }
-        }
-    }
-    String::new()
 }
 
 /// Generate a random nonce for authentication challenges.
@@ -505,6 +533,175 @@ mod tests {
         assert_eq!(parsed.nonce, "abc123");
         assert_eq!(parsed.response, "deadbeef");
         assert_eq!(parsed.algorithm, DigestAlgorithm::Md5);
+    }
+
+    /// Build a request bearing a Digest Authorization header, as a real client
+    /// would, given a challenge. Uses the shared `create_digest_response`, which
+    /// generates its own cnonce/nc (exactly like a UAC) — so a passing
+    /// `verify()` proves the server folds the *client's* cnonce/nc into its
+    /// recomputation (issue #10).
+    fn client_authed_request(
+        method: &str,
+        req_uri: &str,
+        challenge: &DigestChallenge,
+        username: &str,
+        password: &str,
+    ) -> SipMessage {
+        let creds = crate::auth::DigestCredentials {
+            username: username.to_string(),
+            password: password.to_string(),
+            realm: challenge.realm.clone(),
+        };
+        let auth_value = create_digest_response(challenge, &creds, method, req_uri);
+        let raw = format!(
+            "{method} {req_uri} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK{branch}\r\n\
+             From: <sip:{username}@example.com>;tag=abc\r\n\
+             To: <sip:{username}@example.com>\r\n\
+             Call-ID: authed-{branch}\r\n\
+             CSeq: 2 {method}\r\n\
+             Authorization: {auth_value}\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            branch = "verify1"
+        );
+        SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    /// A qop=auth Authorization built by a client MUST verify successfully.
+    /// Before the fix this failed (infinite 401 loop) because the verifier
+    /// recomputed the response with its own random cnonce.
+    #[test]
+    fn test_verify_qop_auth_succeeds() {
+        let auth = InboundAuthenticator::new();
+        let creds = vec![AuthCredentials::new("alice", "secret", "asterisk")];
+
+        let challenge = DigestChallenge {
+            realm: "asterisk".to_string(),
+            nonce: "1a2b3c4d5e6f".to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+
+        let request = client_authed_request(
+            "REGISTER",
+            "sip:asterisk",
+            &challenge,
+            "alice",
+            "secret",
+        );
+
+        assert!(
+            auth.verify(&request, &creds, false).is_ok(),
+            "qop=auth response from a well-behaved client must authenticate"
+        );
+    }
+
+    /// A concrete Linphone-style Authorization header (fixed cnonce/nc/qop),
+    /// with the response precomputed from those exact values, must verify.
+    #[test]
+    fn test_verify_linphone_style_qop_auth() {
+        let auth = InboundAuthenticator::new();
+        let creds = vec![AuthCredentials::new("100", "1234", "asterisk")];
+
+        let realm = "asterisk";
+        let nonce = "3ba9f7d8c0e14a2b";
+        let cnonce = "557b3a1e"; // client-chosen
+        let nc = "00000001";
+        let uri = "sip:asterisk";
+
+        let challenge = DigestChallenge {
+            realm: realm.to_string(),
+            nonce: nonce.to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+        let digest_creds = crate::auth::DigestCredentials {
+            username: "100".to_string(),
+            password: "1234".to_string(),
+            realm: realm.to_string(),
+        };
+        let response = crate::auth::compute_digest_response_hash(
+            &challenge, &digest_creds, "REGISTER", uri, cnonce, nc,
+        );
+
+        // A header exactly as Linphone emits it (qop=auth, algorithm=MD5,
+        // explicit cnonce + nc), which the old verifier could never match.
+        let auth_header = format!(
+            "Digest username=\"100\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", \
+             response=\"{response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc={nc}"
+        );
+        let raw = format!(
+            "REGISTER sip:asterisk SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.2;branch=z9hG4bKlin1\r\n\
+             From: <sip:100@asterisk>;tag=lin\r\n\
+             To: <sip:100@asterisk>\r\n\
+             Call-ID: linphone-call-1\r\n\
+             CSeq: 2 REGISTER\r\n\
+             Authorization: {auth_header}\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        );
+        let request = SipMessage::parse(raw.as_bytes()).unwrap();
+
+        assert!(
+            auth.verify(&request, &creds, false).is_ok(),
+            "Linphone-style qop=auth header must authenticate"
+        );
+    }
+
+    /// A qop=auth response computed with the WRONG password must be rejected
+    /// with a fresh challenge.
+    #[test]
+    fn test_verify_qop_auth_wrong_password_rejected() {
+        let auth = InboundAuthenticator::new();
+        let creds = vec![AuthCredentials::new("alice", "secret", "asterisk")];
+
+        let challenge = DigestChallenge {
+            realm: "asterisk".to_string(),
+            nonce: "abc123".to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+        let request =
+            client_authed_request("REGISTER", "sip:asterisk", &challenge, "alice", "wrongpass");
+
+        let result = auth.verify(&request, &creds, false);
+        assert!(result.is_err(), "wrong password must not authenticate");
+        assert_eq!(result.unwrap_err().status_code(), Some(401));
+    }
+
+    /// The legacy RFC 2069 (no qop) path must still authenticate.
+    #[test]
+    fn test_verify_rfc2069_no_qop_still_works() {
+        let auth = InboundAuthenticator::new();
+        let creds = vec![AuthCredentials::new("alice", "secret", "asterisk")];
+
+        let challenge = DigestChallenge {
+            realm: "asterisk".to_string(),
+            nonce: "noqopnonce".to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: None, // RFC 2069
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+        let request =
+            client_authed_request("REGISTER", "sip:asterisk", &challenge, "alice", "secret");
+
+        assert!(
+            auth.verify(&request, &creds, false).is_ok(),
+            "RFC 2069 (no qop) digest must still authenticate"
+        );
     }
 
     #[test]

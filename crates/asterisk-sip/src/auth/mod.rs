@@ -105,16 +105,29 @@ impl DigestChallenge {
     }
 }
 
-/// Create a digest response string for an Authorization or Proxy-Authorization header.
-pub fn create_digest_response(
+/// Compute only the `response=` digest hash for the given inputs.
+///
+/// This is the shared core used by both sides of the exchange:
+///
+/// * The UAC (outbound) side calls it via [`create_digest_response`] with a
+///   freshly generated `cnonce` and `nc`.
+/// * The UAS (inbound) side, when *verifying* a client's response, MUST call
+///   it with the **client-supplied** `cnonce` and `nc` (echoed from the
+///   received Authorization header) — otherwise, for `qop=auth`, the recomputed
+///   hash can never match the client's (which is exactly the bug in #10).
+///
+/// When `challenge.qop` selects an `auth` quality-of-protection, the
+/// `cnonce`/`nc` are folded into the hash per RFC 2617 §3.2.2.1. When there is
+/// no qop (RFC 2069), they are ignored and the legacy `H(HA1:nonce:HA2)` form
+/// is used.
+pub fn compute_digest_response_hash(
     challenge: &DigestChallenge,
     credentials: &DigestCredentials,
     method: &str,
     uri: &str,
+    cnonce: &str,
+    nc: &str,
 ) -> String {
-    let cnonce = generate_cnonce();
-    let nc = "00000001";
-
     // HA1 = H(username:realm:password)
     let ha1 = compute_hash(
         &format!("{}:{}:{}", credentials.username, challenge.realm, credentials.password),
@@ -141,9 +154,11 @@ pub fn create_digest_response(
     );
 
     // Response
-    let response = if let Some(ref qop) = challenge.qop {
+    if let Some(ref qop) = challenge.qop {
         if qop.contains("auth") {
-            // response = H(HA1:nonce:nc:cnonce:qop:HA2)
+            // response = H(HA1:nonce:nc:cnonce:qop:HA2).
+            // Only qop=auth is supported (auth-int needs an entity-body hash in
+            // HA2, which we do not compute), so the qop token is always "auth".
             compute_hash(
                 &format!("{}:{}:{}:{}:auth:{}", ha1, challenge.nonce, nc, cnonce, ha2),
                 challenge.algorithm,
@@ -161,7 +176,21 @@ pub fn create_digest_response(
             &format!("{}:{}:{}", ha1, challenge.nonce, ha2),
             challenge.algorithm,
         )
-    };
+    }
+}
+
+/// Create a digest response string for an Authorization or Proxy-Authorization header.
+pub fn create_digest_response(
+    challenge: &DigestChallenge,
+    credentials: &DigestCredentials,
+    method: &str,
+    uri: &str,
+) -> String {
+    let cnonce = generate_cnonce();
+    let nc = "00000001";
+
+    let response =
+        compute_digest_response_hash(challenge, credentials, method, uri, &cnonce, nc);
 
     // Build the Authorization header value
     let mut auth = format!(
@@ -334,5 +363,65 @@ mod tests {
         assert_eq!(unquote("\"hello\""), "hello");
         assert_eq!(unquote("hello"), "hello");
         assert_eq!(unquote("\"\""), "");
+    }
+
+    /// Known-good RFC 2617 §3.5 qop=auth vector. With the canonical inputs
+    /// (including the client's cnonce and nc), the response MUST equal the
+    /// value published in the RFC. This is the exact computation the inbound
+    /// verifier now performs with the client-supplied cnonce/nc (issue #10).
+    #[test]
+    fn test_compute_digest_response_hash_rfc2617_qop_auth() {
+        let challenge = DigestChallenge {
+            realm: "testrealm@host.com".to_string(),
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: Some("5ccc069c403ebaf9f0171e9517f40e41".to_string()),
+            stale: false,
+            domain: None,
+        };
+        let credentials = DigestCredentials {
+            username: "Mufasa".to_string(),
+            password: "Circle Of Life".to_string(),
+            realm: "testrealm@host.com".to_string(),
+        };
+
+        let response = compute_digest_response_hash(
+            &challenge,
+            &credentials,
+            "GET",
+            "/dir/index.html",
+            "0a4f113b", // client cnonce from the RFC example
+            "00000001", // client nc
+        );
+
+        assert_eq!(response, "6629fae49393a05397450978507c4ef1");
+    }
+
+    /// The response hash is sensitive to the client cnonce/nc: using a
+    /// different cnonce than the client's must NOT reproduce the RFC value.
+    /// This is precisely why the old verifier (which generated its own random
+    /// cnonce) could never match a real client's qop=auth response.
+    #[test]
+    fn test_compute_digest_response_hash_wrong_cnonce_differs() {
+        let challenge = DigestChallenge {
+            realm: "testrealm@host.com".to_string(),
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+        let credentials = DigestCredentials {
+            username: "Mufasa".to_string(),
+            password: "Circle Of Life".to_string(),
+            realm: "testrealm@host.com".to_string(),
+        };
+
+        let with_server_cnonce = compute_digest_response_hash(
+            &challenge, &credentials, "GET", "/dir/index.html", "deadbeef", "00000001",
+        );
+        assert_ne!(with_server_cnonce, "6629fae49393a05397450978507c4ef1");
     }
 }
