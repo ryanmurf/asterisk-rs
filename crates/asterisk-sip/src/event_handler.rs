@@ -216,6 +216,29 @@ impl SipEventHandler {
             }
         }
 
+        // 5a. Delayed-offer INVITE (no SDP body). RFC 3261 §13.2.1 requires
+        //     the UAS to place its OWN offer in the 2xx and take the peer's
+        //     answer from the ACK. We do not yet implement offer-in-2xx /
+        //     answer-in-ACK (it needs the ACK body plumbed from the stack to
+        //     this handler), and the previous behaviour was worse than a
+        //     rejection: build_200_ok emitted a 200 OK with no SDP and the
+        //     ACK's SDP was silently discarded, so the gateway either dropped
+        //     the call or brought it up with no media. Until the negotiated
+        //     path exists, reject cleanly with 488 Not Acceptable Here so the
+        //     peer gets an unambiguous, spec-legal final response instead of a
+        //     broken session (RFC 3261 §21.4.26). Re-INVITEs are handled
+        //     earlier (step 3b), so this only affects initial INVITEs.
+        if session.remote_sdp.is_none() {
+            if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                let _ = self.transport.send(&resp, remote_addr).await;
+                info!(
+                    call_id = %call_id,
+                    "Sent 488 Not Acceptable Here (delayed-offer INVITE with no SDP not supported)"
+                );
+            }
+            return None;
+        }
+
         // 5b. If the INVITE carries an SDP offer we cannot answer (no codec in
         //     common on any stream), reject with 488 Not Acceptable Here rather
         //     than sending a 200 OK whose media is entirely rejected — the
