@@ -120,6 +120,20 @@ impl RtcpFeedback {
         let ssrc_sender = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let ssrc_media = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
+        // The RTCP common-header length field counts 32-bit words minus one
+        // (RFC 3550 §6.4.1). A feedback packet always carries the 8-byte SSRC
+        // pair after the 4-byte header (3 words total), so `length` is at least
+        // 2. A wire value below 2 is malformed and would otherwise underflow
+        // the `(length_words + 1) * 4 - 12` FCI-length computation below,
+        // panicking (subtract-with-overflow in debug, a bogus reverse slice
+        // range in release) — a remotely triggerable crash. Reject it instead.
+        if length_words < 2 {
+            return Err(AsteriskError::Parse(format!(
+                "RTCP feedback length field too small: {}",
+                length_words
+            )));
+        }
+
         let fci_len = (length_words + 1) * 4 - 12;
         let fci = if data.len() > 12 && fci_len > 0 {
             data[12..std::cmp::min(data.len(), 12 + fci_len)].to_vec()
@@ -506,6 +520,29 @@ mod tests {
         assert_eq!(fb.pt, RTCP_PT_PSFB);
         assert_eq!(fb.ssrc_sender, 0xAAAAAAAA);
         assert_eq!(fb.ssrc_media, 0xBBBBBBBB);
+    }
+
+    #[test]
+    fn test_rtcp_feedback_parse_rejects_underflow_length() {
+        // Regression for the FCI-length underflow: a feedback packet whose
+        // RTCP length field is < 2 must be rejected, not panic. Previously
+        // `(length_words + 1) * 4 - 12` underflowed (subtract-with-overflow in
+        // debug builds; a reverse slice range `data[12..4]` in release) — a
+        // remotely triggerable crash from a >=12-byte packet.
+        let mut data = build_pli(0xAAAAAAAA, 0xBBBBBBBB).to_vec();
+        // Append bytes so `data.len() > 12`, exercising the release-mode
+        // reverse-slice path in addition to the debug-mode subtraction panic.
+        data.extend_from_slice(&[0u8; 4]);
+        assert!(data.len() > 12);
+        for bad_len in [0u16, 1u16] {
+            data[2] = (bad_len >> 8) as u8;
+            data[3] = (bad_len & 0xFF) as u8;
+            let parsed = RtcpFeedback::parse(&data);
+            assert!(
+                parsed.is_err(),
+                "length_words={bad_len} must be rejected, got {parsed:?}"
+            );
+        }
     }
 
     #[test]
