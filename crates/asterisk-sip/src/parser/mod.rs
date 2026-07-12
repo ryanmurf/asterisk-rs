@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 
 /// SIP methods as defined in RFC 3261 and extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -553,6 +554,112 @@ impl SipMessage {
             body: String::new(),
         })
     }
+
+    /// Stamp the top `Via` header with `received`/`rport` parameters for the
+    /// packet source address, per RFC 3261 §18.2.1 and RFC 3581 §4.
+    ///
+    /// Applied by the server transport when a request is received, so the
+    /// responses we generate (which echo the request's `Via`) carry the
+    /// parameters a NAT'd client or a downstream proxy relies on for
+    /// symmetric return routing. Only the top (first) via-entry is touched;
+    /// existing `received`/valued-`rport` parameters are preserved, so the
+    /// call is idempotent and safe to apply once per received request.
+    pub fn stamp_via_received_rport(&mut self, src: SocketAddr) {
+        if let Some(h) = self
+            .headers
+            .iter_mut()
+            .find(|h| h.name.eq_ignore_ascii_case(header_names::VIA))
+        {
+            // A folded Via header may hold several comma-separated entries;
+            // only the first (top) one describes the immediate upstream hop.
+            match h.value.split_once(',') {
+                Some((top, rest)) => {
+                    h.value = format!("{},{}", rewrite_top_via_entry(top, src), rest);
+                }
+                None => {
+                    h.value = rewrite_top_via_entry(&h.value, src);
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite a single top `Via` via-entry to add `received`/`rport` for the
+/// packet source, per RFC 3261 §18.2.1 and RFC 3581.
+///
+/// - Adds `received=<src-ip>` when the sent-by host is a domain name or an IP
+///   literal that differs from the source IP.
+/// - When the entry carries a bare `rport` parameter (the client's RFC 3581
+///   request), sets its value to the source port and also ensures `received`
+///   is present (RFC 3581 pairs the two).
+///
+/// Existing `received` and valued `rport` parameters are left untouched, and
+/// all other parameters (notably `branch`) are preserved in order.
+fn rewrite_top_via_entry(entry: &str, src: SocketAddr) -> String {
+    let entry = entry.trim();
+
+    // Split "SIP/2.0/PROTO sent-by" from the ";param;param…" tail.
+    let (head, params_str) = match entry.find(';') {
+        Some(i) => (entry[..i].trim_end(), &entry[i + 1..]),
+        None => (entry, ""),
+    };
+
+    // sent-by is the last whitespace-separated token of the head; strip an
+    // optional :port to get the host. (IPv4/hostname; rustisk binds v4.)
+    let sent_by = head.rsplit(' ').next().unwrap_or("").trim();
+    let sent_by_host = match sent_by.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => sent_by,
+    };
+
+    let src_ip = src.ip().to_string();
+    let src_port = src.port();
+
+    // Parse existing parameters, preserving order.
+    let mut params: Vec<(String, Option<String>)> = Vec::new();
+    for p in params_str.split(';') {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.split_once('=') {
+            Some((k, v)) => params.push((k.trim().to_string(), Some(v.trim().to_string()))),
+            None => params.push((p.to_string(), None)),
+        }
+    }
+
+    let has_received = params
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("received"));
+    let rport_idx = params
+        .iter()
+        .position(|(k, _)| k.eq_ignore_ascii_case("rport"));
+    let client_wants_rport = rport_idx.is_some();
+
+    // Fill in a bare rport with the source port (RFC 3581).
+    if let Some(i) = rport_idx {
+        if params[i].1.is_none() {
+            params[i].1 = Some(src_port.to_string());
+        }
+    }
+
+    // received is required when the sent-by host is not the source IP (covers
+    // FQDN sent-by), and whenever rport is in play (RFC 3581 §4).
+    let need_received = client_wants_rport || sent_by_host != src_ip;
+    if need_received && !has_received {
+        params.push(("received".to_string(), Some(src_ip)));
+    }
+
+    let mut out = String::from(head);
+    for (k, v) in &params {
+        out.push(';');
+        out.push_str(k);
+        if let Some(v) = v {
+            out.push('=');
+            out.push_str(v);
+        }
+    }
+    out
 }
 
 impl fmt::Display for SipMessage {
@@ -1083,5 +1190,105 @@ Content-Length: 0\r\n\
     fn test_retry_after_empty() {
         assert!(RetryAfter::parse("").is_none());
         assert!(RetryAfter::parse("   ").is_none());
+    }
+
+    // --- issue #27: received/rport on the top Via (RFC 3261 §18.2.1 / 3581) ---
+
+    fn via_param<'a>(via: &'a str, key: &str) -> Option<Option<&'a str>> {
+        via.split(';').skip(1).find_map(|p| {
+            let p = p.trim();
+            match p.split_once('=') {
+                Some((k, v)) if k.eq_ignore_ascii_case(key) => Some(Some(v)),
+                None if p.eq_ignore_ascii_case(key) => Some(None),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn rewrite_via_adds_received_when_source_ip_differs() {
+        let src = "203.0.113.9:1234".parse().unwrap();
+        let out = rewrite_top_via_entry(
+            "SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKabc",
+            src,
+        );
+        assert_eq!(via_param(&out, "received"), Some(Some("203.0.113.9")));
+        // No rport was requested, so none is added.
+        assert!(via_param(&out, "rport").is_none());
+        // The branch (and thus transaction matching) is preserved.
+        assert_eq!(via_param(&out, "branch"), Some(Some("z9hG4bKabc")));
+    }
+
+    #[test]
+    fn rewrite_via_fills_bare_rport_and_pairs_received() {
+        let src = "203.0.113.9:41000".parse().unwrap();
+        let out = rewrite_top_via_entry(
+            "SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKabc;rport",
+            src,
+        );
+        // RFC 3581: bare rport gets the source port, and received is added.
+        assert_eq!(via_param(&out, "rport"), Some(Some("41000")));
+        assert_eq!(via_param(&out, "received"), Some(Some("203.0.113.9")));
+        assert_eq!(via_param(&out, "branch"), Some(Some("z9hG4bKabc")));
+    }
+
+    #[test]
+    fn rewrite_via_adds_received_for_fqdn_sent_by() {
+        // A domain-name sent-by always gets received, per RFC 3261 §18.2.1.
+        let src = "203.0.113.9:5060".parse().unwrap();
+        let out = rewrite_top_via_entry(
+            "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bKq",
+            src,
+        );
+        assert_eq!(via_param(&out, "received"), Some(Some("203.0.113.9")));
+    }
+
+    #[test]
+    fn rewrite_via_no_op_when_ip_matches_and_no_rport() {
+        // Single-hop UAS, sent-by IP == source IP, no rport requested: the
+        // Via is returned unchanged (no spurious received).
+        let src = "203.0.113.9:5060".parse().unwrap();
+        let out = rewrite_top_via_entry(
+            "SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKx",
+            src,
+        );
+        assert!(via_param(&out, "received").is_none());
+        assert!(via_param(&out, "rport").is_none());
+        assert_eq!(via_param(&out, "branch"), Some(Some("z9hG4bKx")));
+    }
+
+    #[test]
+    fn rewrite_via_is_idempotent_for_existing_received() {
+        let src = "203.0.113.9:1234".parse().unwrap();
+        let once = rewrite_top_via_entry(
+            "SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKabc;rport",
+            src,
+        );
+        let twice = rewrite_top_via_entry(&once, src);
+        assert_eq!(once, twice, "stamping an already-stamped Via must be a no-op");
+        // received appears exactly once.
+        assert_eq!(twice.matches("received=").count(), 1);
+    }
+
+    #[test]
+    fn stamped_request_via_is_echoed_into_the_response() {
+        // End-to-end: a request stamped on receipt yields a response whose
+        // top Via carries received/rport (create_response copies Via).
+        let raw = b"OPTIONS sip:asterisk@203.0.113.9 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 192.168.1.5:5060;branch=z9hG4bKopt;rport\r\n\
+From: <sip:caller@192.168.1.5>;tag=f1\r\n\
+To: <sip:asterisk@203.0.113.9>\r\n\
+Call-ID: opt-1\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut req = SipMessage::parse(raw).unwrap();
+        let src = "198.51.100.7:5062".parse().unwrap();
+        req.stamp_via_received_rport(src);
+
+        let resp = req.create_response(200, "OK").unwrap();
+        let via = resp.get_header(header_names::VIA).expect("response has Via");
+        assert_eq!(via_param(via, "received"), Some(Some("198.51.100.7")));
+        assert_eq!(via_param(via, "rport"), Some(Some("5062")));
+        assert_eq!(via_param(via, "branch"), Some(Some("z9hG4bKopt")));
     }
 }
