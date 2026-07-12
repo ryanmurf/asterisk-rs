@@ -52,7 +52,10 @@ async fn playback_streams_file_audio_to_the_media_plane() {
     let driver = Arc::new(SipChannelDriver::new(local));
     driver.set_transport(transport.clone());
     let chan_name = "PJSIP/play-1";
-    driver.attach_inbound_media(chan_name, local, peer_addr, transport, rtp);
+    // Media-only test: the session is not exercised by the pump, so a plain
+    // session is sufficient here.
+    let session = asterisk_sip::session::SipSession::new_outbound(local, peer_addr);
+    driver.attach_inbound_media(chan_name, session, transport, rtp);
     TECH_REGISTRY.register(driver.clone());
 
     // Drain the peer socket in the background, counting non-empty RTP payloads.

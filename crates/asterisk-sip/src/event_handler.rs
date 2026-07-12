@@ -348,10 +348,26 @@ impl SipEventHandler {
                     answer_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
 
                     if let Some(driver) = self.channel_driver.get() {
+                        // Store the REAL inbound session (carries the INVITE,
+                        // is_outbound = false) so driver.indicate()/hangup()
+                        // work on this channel instead of silently no-opping on
+                        // a fabricated outbound placeholder (issue #36). Built
+                        // fresh from the same INVITE; the event handler keeps
+                        // its own `session` for the 200 OK / BYE path.
+                        let driver_session =
+                            SipSession::new_inbound(request, session.local_addr, remote_addr)
+                                .unwrap_or_else(|| {
+                                    let mut s = SipSession::new_outbound(
+                                        session.local_addr,
+                                        remote_addr,
+                                    );
+                                    s.is_outbound = false;
+                                    s.invite = Some(request.clone());
+                                    s
+                                });
                         driver.attach_inbound_media(
                             &channel_name,
-                            session.local_addr,
-                            remote_addr,
+                            driver_session,
                             self.transport.clone(),
                             rtp,
                         );
