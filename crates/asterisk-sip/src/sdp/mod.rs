@@ -523,6 +523,17 @@ impl SessionDescription {
     }
 
     /// Create an SDP answer from an offer.
+    ///
+    /// rustisk binds a single RTP transport per call and does not negotiate
+    /// BUNDLE, so it can carry exactly one media stream. Per RFC 3264 §6 the
+    /// answer keeps every offered m-line, in order, but only the **first
+    /// audio** m-line that shares a codec is accepted and given `port`; every
+    /// other m-line (a second audio stream, any video/application stream, or
+    /// one with no common codec) is rejected with port 0. This prevents the
+    /// caller from sending, e.g., video RTP into the audio socket — which the
+    /// receiver would mislabel as voice and echo back with the audio payload
+    /// type, corrupting both streams (issue #31). Per-stream transports/ports
+    /// are future work.
     pub fn create_answer(
         offer: &SessionDescription,
         addr: &str,
@@ -556,7 +567,10 @@ impl SessionDescription {
             attributes: Vec::new(),
         };
 
-        // For each media in the offer, find common codecs
+        // For each media in the offer, find common codecs. Only the first
+        // audio stream with a common codec is accepted; a single transport is
+        // bound per call, so every other stream must be rejected (port 0).
+        let mut audio_accepted = false;
         for offer_media in &offer.media_descriptions {
             let offer_codecs = offer_media.codecs();
             let mut common: Vec<Codec> = Vec::new();
@@ -574,8 +588,14 @@ impl SessionDescription {
                 }
             }
 
-            if common.is_empty() {
-                // No common codecs; set port to 0 (reject)
+            let is_audio = offer_media.media_type.eq_ignore_ascii_case("audio");
+            let accept = is_audio && !audio_accepted && !common.is_empty();
+
+            if !accept {
+                // Reject: no common codec, a non-audio stream, or an
+                // additional audio stream we have no transport for. Echo the
+                // media line with port 0 (RFC 3264 §6) so the m-line count and
+                // order still match the offer.
                 answer.media_descriptions.push(MediaDescription {
                     media_type: offer_media.media_type.clone(),
                     port: 0,
@@ -591,6 +611,7 @@ impl SessionDescription {
                     bandwidth: Vec::new(),
                 });
             } else {
+                audio_accepted = true;
                 let formats: Vec<u8> = common.iter().map(|c| c.payload_type).collect();
                 let mut attributes = Vec::new();
                 for codec in &common {
@@ -1164,5 +1185,114 @@ a=ice-ufrag:media_ufrag\r\n";
         assert_eq!(sdp.media_ice_ufrag(0), Some("media_ufrag"));
         // But no media-level pwd, so falls back to session
         assert_eq!(sdp.media_ice_pwd(0), Some("session_password_long_enough"));
+    }
+
+    // --- issue #31: multi-m-line answers must not share the audio port -----
+
+    fn supported_audio_and_video() -> Vec<Codec> {
+        vec![Codec::new("PCMU", 0, 8000), Codec::new("VP8", 96, 90000)]
+    }
+
+    #[test]
+    fn answer_gives_only_first_audio_the_port_and_rejects_video() {
+        // A video-capable phone offers audio + video; both share a codec with
+        // us, but we bind one transport. The answer must put the real port on
+        // audio and reject video with port 0, so the caller never sends video
+        // RTP into the audio socket (issue #31).
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             m=video 40002 RTP/AVP 96\r\n\
+             a=rtpmap:96 VP8/90000\r\n",
+        )
+        .unwrap();
+
+        let answer =
+            SessionDescription::create_answer(&offer, "127.0.0.1", 55555, &supported_audio_and_video());
+
+        // Same number of m-lines, same order (RFC 3264 §6).
+        assert_eq!(answer.media_descriptions.len(), 2);
+        assert_eq!(answer.media_descriptions[0].media_type, "audio");
+        assert_eq!(answer.media_descriptions[1].media_type, "video");
+        // Audio accepted on the real port; video rejected with port 0.
+        assert_eq!(answer.media_descriptions[0].port, 55555);
+        assert_eq!(answer.media_descriptions[1].port, 0);
+    }
+
+    #[test]
+    fn answer_rejects_a_second_audio_stream() {
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             m=audio 40002 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        )
+        .unwrap();
+
+        let answer =
+            SessionDescription::create_answer(&offer, "127.0.0.1", 55555, &supported_audio_and_video());
+
+        assert_eq!(answer.media_descriptions.len(), 2);
+        assert_eq!(answer.media_descriptions[0].port, 55555, "first audio accepted");
+        assert_eq!(answer.media_descriptions[1].port, 0, "second audio rejected");
+    }
+
+    #[test]
+    fn answer_puts_port_on_audio_even_when_video_is_first() {
+        // The bound transport is for audio, so the real port must land on the
+        // audio m-line regardless of offer order; the leading video is
+        // rejected.
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=video 40002 RTP/AVP 96\r\n\
+             a=rtpmap:96 VP8/90000\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        )
+        .unwrap();
+
+        let answer =
+            SessionDescription::create_answer(&offer, "127.0.0.1", 55555, &supported_audio_and_video());
+
+        assert_eq!(answer.media_descriptions[0].media_type, "video");
+        assert_eq!(answer.media_descriptions[0].port, 0, "leading video rejected");
+        assert_eq!(answer.media_descriptions[1].media_type, "audio");
+        assert_eq!(answer.media_descriptions[1].port, 55555, "audio gets the port");
+    }
+
+    #[test]
+    fn answer_still_accepts_a_single_audio_stream() {
+        // Regression guard: the common single-audio case is unchanged.
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0 8\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n",
+        )
+        .unwrap();
+
+        let answer =
+            SessionDescription::create_answer(&offer, "127.0.0.1", 55555, &supported_audio_and_video());
+
+        assert_eq!(answer.media_descriptions.len(), 1);
+        assert_eq!(answer.media_descriptions[0].port, 55555);
     }
 }
