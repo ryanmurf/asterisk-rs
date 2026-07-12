@@ -413,11 +413,19 @@ impl SipStack {
     }
 
     /// Handle an incoming request.
-    async fn handle_request(&self, request: SipMessage, src: SocketAddr) {
+    async fn handle_request(&self, mut request: SipMessage, src: SocketAddr) {
         let method = match request.method() {
             Some(m) => m,
             None => return,
         };
+
+        // Stamp the top Via with received/rport for the packet source before
+        // the request is cloned into transactions, sessions, and events. The
+        // responses we build echo this Via verbatim, so a NAT'd client or a
+        // downstream proxy gets the return-routing parameters RFC 3261
+        // §18.2.1 / RFC 3581 require. Branch and other params are preserved,
+        // so transaction matching is unaffected (issue #27).
+        request.stamp_via_received_rport(src);
 
         // Check for retransmission (existing server transaction)
         // Extract the response to retransmit (if any) without holding the lock across await.
