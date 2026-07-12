@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -205,6 +206,10 @@ impl DialogManager {
     }
 }
 
+/// Capacity of the stack → application event queue. Sized to absorb bursts;
+/// when it fills, `emit_event` applies backpressure instead of dropping.
+const EVENT_QUEUE_CAPACITY: usize = 256;
+
 /// The SIP stack coordinator: wires transport, transactions, and dialogs.
 pub struct SipStack {
     transport: Arc<UdpTransport>,
@@ -214,6 +219,9 @@ pub struct SipStack {
     local_addr: SocketAddr,
     event_tx: mpsc::Sender<SipEvent>,
     event_rx: Option<mpsc::Receiver<SipEvent>>,
+    /// Edge-trigger for the queue-full warning so a sustained burst logs
+    /// once per episode instead of once per event.
+    event_queue_full_logged: AtomicBool,
 }
 
 impl SipStack {
@@ -221,7 +229,7 @@ impl SipStack {
     pub async fn new(bind_addr: SocketAddr) -> Result<Self, TransportError> {
         let transport = UdpTransport::bind(bind_addr).await?;
         let local_addr = transport.local_addr()?;
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
         info!(addr = %local_addr, "SIP stack created");
 
@@ -232,6 +240,7 @@ impl SipStack {
             local_addr,
             event_tx,
             event_rx: Some(event_rx),
+            event_queue_full_logged: AtomicBool::new(false),
         })
     }
 
@@ -313,6 +322,38 @@ impl SipStack {
         self.transport.clone()
     }
 
+    /// Deliver a stack event to the application layer, never dropping it.
+    ///
+    /// `try_send` covers the common (non-full) case without a context
+    /// switch. When the queue is full we log once per episode and fall back
+    /// to an awaited `send`, which blocks the stack's event loop: incoming
+    /// datagrams then queue in the kernel UDP buffer, where loss is
+    /// recovered by SIP retransmission (RFC 3261 §17.1). Dropping here
+    /// instead would lose signaling permanently — the request is already
+    /// absorbed into a server transaction, so peer retransmissions are
+    /// matched as duplicates and never re-emitted (issue #26).
+    async fn emit_event(&self, event: SipEvent) {
+        match self.event_tx.try_send(event) {
+            Ok(()) => {
+                self.event_queue_full_logged.store(false, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                if !self.event_queue_full_logged.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        capacity = EVENT_QUEUE_CAPACITY,
+                        "SIP event queue full; applying backpressure to the receive loop"
+                    );
+                }
+                if self.event_tx.send(event).await.is_err() {
+                    error!("SIP event receiver dropped; event discarded");
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("SIP event receiver dropped; event discarded");
+            }
+        }
+    }
+
     /// Main event loop: recv from transport, route through transaction and
     /// dialog layers, emit events for the application.
     pub async fn run(&self) {
@@ -364,10 +405,11 @@ impl SipStack {
         }
 
         // Emit event for application layer
-        let _ = self.event_tx.try_send(SipEvent::Response {
+        self.emit_event(SipEvent::Response {
             response,
             remote_addr: src,
-        });
+        })
+        .await;
     }
 
     /// Handle an incoming request.
@@ -415,11 +457,12 @@ impl SipStack {
 
                 // Create inbound session
                 if let Some(session) = SipSession::new_inbound(&request, self.local_addr, src) {
-                    let _ = self.event_tx.try_send(SipEvent::IncomingInvite {
+                    self.emit_event(SipEvent::IncomingInvite {
                         session,
                         request,
                         remote_addr: src,
-                    });
+                    })
+                    .await;
                 }
             }
             SipMethod::Ack => {
@@ -443,11 +486,12 @@ impl SipStack {
                     .insert(branch, txn);
 
                 let call_id = request.call_id().unwrap_or("").to_string();
-                let _ = self.event_tx.try_send(SipEvent::IncomingBye {
+                self.emit_event(SipEvent::IncomingBye {
                     call_id,
                     request,
                     remote_addr: src,
-                });
+                })
+                .await;
             }
             _ => {
                 // Create non-INVITE server transaction
@@ -459,10 +503,11 @@ impl SipStack {
                     .non_invite_server_txns
                     .insert(branch, txn);
 
-                let _ = self.event_tx.try_send(SipEvent::IncomingRequest {
+                self.emit_event(SipEvent::IncomingRequest {
                     request,
                     remote_addr: src,
-                });
+                })
+                .await;
             }
         }
     }
@@ -522,19 +567,24 @@ impl SipStack {
 
         for branch in timed_out {
             warn!(branch = %branch, "Transaction timed out");
-            let mut txn_layer = self.transaction_layer.write();
-            if let Some(txn) = txn_layer.invite_client_txns.get_mut(&branch) {
-                txn.terminate();
+            // Terminate inside a scope so the lock is not held across the
+            // (potentially blocking) event emission below.
+            {
+                let mut txn_layer = self.transaction_layer.write();
+                if let Some(txn) = txn_layer.invite_client_txns.get_mut(&branch) {
+                    txn.terminate();
+                }
+                if let Some(txn) = txn_layer.non_invite_client_txns.get_mut(&branch) {
+                    txn.terminate();
+                }
+                if let Some(txn) = txn_layer.invite_server_txns.get_mut(&branch) {
+                    txn.terminate();
+                }
             }
-            if let Some(txn) = txn_layer.non_invite_client_txns.get_mut(&branch) {
-                txn.terminate();
-            }
-            if let Some(txn) = txn_layer.invite_server_txns.get_mut(&branch) {
-                txn.terminate();
-            }
-            let _ = self.event_tx.try_send(SipEvent::TransactionTimeout {
+            self.emit_event(SipEvent::TransactionTimeout {
                 branch,
-            });
+            })
+            .await;
         }
 
         // Clean up terminated transactions
@@ -657,5 +707,153 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    /// Build a minimal OPTIONS request for feeding handle_request directly.
+    fn build_options_request(call_id: &str, branch: &str) -> SipMessage {
+        use crate::parser::{SipHeader, SipUri, RequestLine, StartLine, SipMethod};
+
+        SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: SipMethod::Options,
+                uri: SipUri::parse("sip:127.0.0.1:5060").unwrap(),
+                version: "SIP/2.0".to_string(),
+            }),
+            headers: vec![
+                SipHeader {
+                    name: header_names::VIA.to_string(),
+                    value: format!("SIP/2.0/UDP 127.0.0.1:5061;branch={}", branch),
+                },
+                SipHeader {
+                    name: header_names::FROM.to_string(),
+                    value: "<sip:test@127.0.0.1:5061>;tag=t1".to_string(),
+                },
+                SipHeader {
+                    name: header_names::TO.to_string(),
+                    value: "<sip:test@127.0.0.1:5060>".to_string(),
+                },
+                SipHeader {
+                    name: header_names::CALL_ID.to_string(),
+                    value: call_id.to_string(),
+                },
+                SipHeader {
+                    name: header_names::CSEQ.to_string(),
+                    value: "1 OPTIONS".to_string(),
+                },
+                SipHeader {
+                    name: header_names::CONTENT_LENGTH.to_string(),
+                    value: "0".to_string(),
+                },
+            ],
+            body: String::new(),
+        }
+    }
+
+    /// Regression test for issue #26: events emitted while the queue is full
+    /// must be delivered once the consumer drains (backpressure), never
+    /// silently dropped. Before the fix, everything past EVENT_QUEUE_CAPACITY
+    /// was lost and this test timed out waiting for the missing events.
+    #[tokio::test]
+    async fn test_emit_event_backpressure_never_drops() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let stack = Arc::new(stack);
+
+        const TOTAL: usize = EVENT_QUEUE_CAPACITY + 44;
+
+        let producer = {
+            let stack = stack.clone();
+            tokio::spawn(async move {
+                for i in 0..TOTAL {
+                    stack
+                        .emit_event(SipEvent::TransactionTimeout {
+                            branch: format!("b{}", i),
+                        })
+                        .await;
+                }
+            })
+        };
+
+        // Let the producer run into the full queue so the overflow path
+        // (block, don't drop) is actually exercised before we drain.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for expected in 0..TOTAL {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "event {} never delivered — events were dropped under load",
+                        expected
+                    )
+                })
+                .expect("channel closed");
+            match event {
+                SipEvent::TransactionTimeout { branch } => {
+                    assert_eq!(branch, format!("b{}", expected), "events reordered");
+                }
+                other => panic!("Expected TransactionTimeout, got {:?}", other),
+            }
+        }
+
+        producer.await.unwrap();
+    }
+
+    /// Regression test for issue #26 at the request-handling call site: an
+    /// incoming request that arrives while the event queue is full must
+    /// still reach the application. Before the fix, handle_request absorbed
+    /// the request into a server transaction and then dropped the event —
+    /// retransmissions would match the transaction and be blackholed.
+    #[tokio::test]
+    async fn test_handle_request_delivers_event_when_queue_full() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let stack = Arc::new(stack);
+
+        // Fill the queue to exactly its capacity (none of these block).
+        for i in 0..EVENT_QUEUE_CAPACITY {
+            stack
+                .emit_event(SipEvent::TransactionTimeout {
+                    branch: format!("filler{}", i),
+                })
+                .await;
+        }
+
+        // Deliver a request while the queue is full; it must park in
+        // backpressure rather than dropping the IncomingRequest event.
+        let src: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let request = build_options_request("queue-full-call", "z9hG4bKqueuefull");
+        let handler = {
+            let stack = stack.clone();
+            tokio::spawn(async move {
+                stack.handle_request(request, src).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Drain the fillers, then the request event must arrive.
+        for _ in 0..EVENT_QUEUE_CAPACITY {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timeout draining filler events")
+                .expect("channel closed");
+            assert!(matches!(event, SipEvent::TransactionTimeout { .. }));
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("IncomingRequest never delivered — dropped while queue was full")
+            .expect("channel closed");
+        match event {
+            SipEvent::IncomingRequest { request, .. } => {
+                assert_eq!(request.call_id(), Some("queue-full-call"));
+            }
+            other => panic!("Expected IncomingRequest, got {:?}", other),
+        }
+
+        handler.await.unwrap();
     }
 }

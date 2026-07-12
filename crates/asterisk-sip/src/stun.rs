@@ -1496,7 +1496,7 @@ mod tests {
     #[test]
     fn test_stun_parse_truncated_message() {
         // Message that claims a body length longer than actual data
-        let mut msg = StunMessage::binding_request();
+        let msg = StunMessage::binding_request();
         let mut bytes = msg.to_bytes();
         // Set length to 100 but don't provide the body
         bytes[2] = 0;

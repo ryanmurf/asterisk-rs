@@ -1222,7 +1222,7 @@ mod tests {
     fn test_pair_priority_symmetric() {
         // When G == D, tie-breaker is 0
         let p = CandidatePair::compute_priority(100, 100);
-        let expected = (1u64 << 32) * 100 + 2 * 100 + 0;
+        let expected = (1u64 << 32) * 100 + 2 * 100;
         assert_eq!(p, expected);
     }
 
