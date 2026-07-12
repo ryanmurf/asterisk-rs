@@ -533,14 +533,14 @@ impl SipEventHandler {
                     }
                 }
 
-                // Clean up from global store
+                // Finalize teardown: deregister from the store, unregister from
+                // the NOTIFY service, and drop the media plane. Sharing one
+                // helper with handle_bye's path guarantees the NOTIFY
+                // registration is released on the dialog-timeout path too — it
+                // was previously leaked there (only the remote-BYE path in
+                // handle_bye called unregister_channel).
                 let uid = ch_for_cleanup.lock().unique_id.0.clone();
-                store::deregister(&uid);
-
-                // Tear down the inbound media plane (drop the RTP socket).
-                if let Some(driver) = &driver_for_cleanup {
-                    driver.remove_channel(&channel_name_for_media);
-                }
+                finalize_inbound_teardown(&channel_name_for_media, &uid, driver_for_cleanup.as_ref());
             });
         });
 
@@ -988,6 +988,27 @@ impl SipEventHandler {
     }
 }
 
+/// Finalize teardown of an inbound call's server-side resources:
+///   1. deregister the channel from the global store,
+///   2. unregister it from the NOTIFY service, and
+///   3. drop its media plane (RTP socket) in the driver.
+///
+/// Idempotent — each step is a no-op if already done — so it is safe to call
+/// after `handle_bye` has cleaned up some of the same state. Shared by the
+/// remote-BYE and dialog-timeout teardown paths so the NOTIFY registration is
+/// released consistently on both (it was previously leaked on the timeout path).
+fn finalize_inbound_teardown(
+    channel_name: &str,
+    unique_id: &str,
+    driver: Option<&Arc<SipChannelDriver>>,
+) {
+    store::deregister(unique_id);
+    crate::notify_service::global_notify_service().unregister_channel(channel_name);
+    if let Some(driver) = driver {
+        driver.remove_channel(channel_name);
+    }
+}
+
 /// Extract the caller's advertised RTP endpoint (IP + port) from an offer SDP.
 ///
 /// Prefers a media-level `c=` line, falling back to the session-level `c=`.
@@ -1161,5 +1182,47 @@ mod tests {
         let offer = SessionDescription::create_offer("203.0.113.7", 40000, &[codecs::pcma()]);
         let supported = vec![codecs::pcmu(), codecs::pcma()];
         assert_eq!(negotiated_payload_type(&offer, &supported), Some(8));
+    }
+
+    #[test]
+    fn test_finalize_inbound_teardown_unregisters_notify_and_store() {
+        // Regression: the dialog-timeout cleanup path previously deregistered
+        // the store channel but never unregistered the NOTIFY-service state,
+        // leaking a ChannelSipState per timed-out call. finalize_inbound_teardown
+        // must clear both.
+        let notify = crate::notify_service::global_notify_service();
+        let name = "PJSIP/teardown-test-0000ffff";
+
+        let ch = asterisk_core::channel::Channel::new(name);
+        let registered = store::register_existing_channel(ch);
+        let uid = registered.lock().unique_id.0.clone();
+        assert!(store::find_by_name(name).is_some(), "channel registered");
+
+        notify.register_channel(
+            name,
+            crate::notify_service::ChannelSipState {
+                call_id: "teardown-call".to_string(),
+                local_tag: "ltag".to_string(),
+                remote_tag: "rtag".to_string(),
+                local_uri: "sip:asterisk@127.0.0.1".to_string(),
+                remote_target: "sip:caller@127.0.0.1".to_string(),
+                remote_addr: "127.0.0.1:5062".parse().unwrap(),
+                local_seq: 100,
+            },
+        );
+        assert!(notify.is_registered(name), "notify state registered");
+
+        // driver=None exercises the store + notify teardown without needing a
+        // live SipChannelDriver.
+        finalize_inbound_teardown(name, &uid, None);
+
+        assert!(
+            !notify.is_registered(name),
+            "NOTIFY registration must be released on teardown (the leaked path)"
+        );
+        assert!(
+            store::find_by_name(name).is_none(),
+            "store channel must be deregistered on teardown"
+        );
     }
 }
