@@ -838,7 +838,7 @@ mod tests {
     fn test_100pct_loss() {
         let mos = g711_mos(40.0, 5.0, 100.0);
         assert!(
-            mos >= 1.0 && mos <= 1.5,
+            (1.0..=1.5).contains(&mos),
             "100% loss MOS should be near 1.0, got {:.3}",
             mos
         );
@@ -859,7 +859,7 @@ mod tests {
         let mos = g711_mos(2000.0, 0.0, 0.0);
         // 1000ms one-way delay should severely degrade quality
         assert!(
-            mos >= 1.0 && mos <= 4.5,
+            (1.0..=4.5).contains(&mos),
             "Extreme delay MOS {:.3} out of range",
             mos
         );
@@ -1171,7 +1171,7 @@ mod tests {
     fn test_adversarial_nan_rtt() {
         let mos = g711_mos(f64::NAN, 0.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "NaN RTT must produce valid MOS, got {}",
             mos
         );
@@ -1181,7 +1181,7 @@ mod tests {
     fn test_adversarial_nan_jitter() {
         let mos = g711_mos(40.0, f64::NAN, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "NaN jitter must produce valid MOS, got {}",
             mos
         );
@@ -1191,7 +1191,7 @@ mod tests {
     fn test_adversarial_nan_loss() {
         let mos = g711_mos(40.0, 0.0, f64::NAN);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "NaN loss must produce valid MOS, got {}",
             mos
         );
@@ -1201,7 +1201,7 @@ mod tests {
     fn test_adversarial_all_nan() {
         let mos = g711_mos(f64::NAN, f64::NAN, f64::NAN);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "All-NaN inputs must produce valid MOS, got {}",
             mos
         );
@@ -1211,7 +1211,7 @@ mod tests {
     fn test_adversarial_infinity_rtt() {
         let mos = g711_mos(f64::INFINITY, 0.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Inf RTT must produce valid MOS, got {}",
             mos
         );
@@ -1221,7 +1221,7 @@ mod tests {
     fn test_adversarial_infinity_jitter() {
         let mos = g711_mos(40.0, f64::INFINITY, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Inf jitter must produce valid MOS, got {}",
             mos
         );
@@ -1231,7 +1231,7 @@ mod tests {
     fn test_adversarial_infinity_loss() {
         let mos = g711_mos(40.0, 0.0, f64::INFINITY);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Inf loss must produce valid MOS, got {}",
             mos
         );
@@ -1241,7 +1241,7 @@ mod tests {
     fn test_adversarial_neg_infinity_all() {
         let mos = g711_mos(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "-Inf inputs must produce valid MOS, got {}",
             mos
         );
@@ -1251,7 +1251,7 @@ mod tests {
     fn test_adversarial_negative_rtt() {
         let mos = g711_mos(-100.0, 0.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Negative RTT must produce valid MOS, got {}",
             mos
         );
@@ -1269,7 +1269,7 @@ mod tests {
     fn test_adversarial_negative_jitter() {
         let mos = g711_mos(40.0, -50.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Negative jitter must produce valid MOS, got {}",
             mos
         );
@@ -1287,7 +1287,7 @@ mod tests {
     fn test_adversarial_negative_loss() {
         let mos = g711_mos(40.0, 0.0, -10.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Negative loss must produce valid MOS, got {}",
             mos
         );
@@ -1305,7 +1305,7 @@ mod tests {
     fn test_adversarial_all_negative() {
         let mos = g711_mos(-10.0, -5.0, -1.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "All-negative inputs must produce valid MOS, got {}",
             mos
         );
@@ -1315,7 +1315,7 @@ mod tests {
     fn test_adversarial_loss_over_100() {
         let mos = g711_mos(40.0, 0.0, 200.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "Loss > 100% must produce valid MOS, got {}",
             mos
         );
@@ -1356,7 +1356,7 @@ mod tests {
     fn test_adversarial_very_high_delay_10000ms() {
         let mos = g711_mos(20000.0, 0.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "10000ms delay must produce valid MOS, got {}",
             mos
         );
@@ -1367,7 +1367,7 @@ mod tests {
     fn test_adversarial_very_high_jitter_5000ms() {
         let mos = g711_mos(40.0, 5000.0, 0.0);
         assert!(
-            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+            mos.is_finite() && (1.0..=4.5).contains(&mos),
             "5000ms jitter must produce valid MOS, got {}",
             mos
         );
@@ -1427,7 +1427,7 @@ mod tests {
                     for &loss in &losses {
                         let mos = est.mos_score(rtt, jit, loss);
                         assert!(
-                            mos.is_finite() && mos >= 1.0 && mos <= 4.5,
+                            mos.is_finite() && (1.0..=4.5).contains(&mos),
                             "MOS out of range for {:?} rtt={} jit={} loss={}: {}",
                             codec,
                             rtt,
@@ -1458,7 +1458,7 @@ mod tests {
                     loss as f64,
                 );
                 assert!(
-                    r.is_finite() && r >= 0.0 && r <= 100.0,
+                    r.is_finite() && (0.0..=100.0).contains(&r),
                     "R out of [0,100] for delay={} loss={}: {}",
                     rtt / 2,
                     loss,
