@@ -1,0 +1,7 @@
+# Pin the toolchain so a newly-released `stable` cannot silently change build
+# behavior (a stricter clippy in stable 1.97.0 reddened master the week this was
+# added). CI and local `cargo` both resolve to this exact version; bump it
+# deliberately when adopting a new Rust release.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
