@@ -169,21 +169,27 @@ impl SipChannelDriver {
     /// Inbound INVITEs are handled by [`crate::event_handler::SipEventHandler`],
     /// which builds the channel directly in the global store rather than through
     /// this driver — so without this call an inbound channel has no RTP session
-    /// and carries no media (issue #7). The `session`/`transport` stored here are
-    /// only used by the outbound-oriented `answer`/`call`/`hangup`/`indicate`
-    /// paths; the inbound signaling is driven by the event handler, so a
-    /// lightweight placeholder session is sufficient — only `rtp` is load-bearing
-    /// for the media pump.
+    /// and carries no media (issue #7).
+    ///
+    /// `session` must be the **real inbound** [`SipSession`] (from the received
+    /// INVITE), not a fabricated outbound one. It previously stored
+    /// `SipSession::new_outbound(...)`, whose `invite` is `None` and
+    /// `is_outbound` is `true`; [`ChannelDriver::indicate`] requires
+    /// `session.invite` to be `Some`, so any app/AGI signalling Ringing /
+    /// Progress / Busy (180/183/486) on an inbound channel through the driver
+    /// hit `None` and silently no-op'd, and `hangup()` skipped the BYE
+    /// (state `Initiated`). Storing the inbound session — which carries the
+    /// INVITE and `is_outbound = false` — makes those uniform driver paths work
+    /// (issue #36).
     pub fn attach_inbound_media(
         &self,
         channel_name: &str,
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
+        session: SipSession,
         transport: Arc<dyn SipTransport>,
         rtp: RtpSession,
     ) {
         let priv_data = Arc::new(SipChannelPrivate {
-            session: Mutex::new(SipSession::new_outbound(local_addr, remote_addr)),
+            session: Mutex::new(session),
             rtp: Mutex::new(Some(Arc::new(rtp))),
             transport,
         });
@@ -634,6 +640,68 @@ mod tests {
             SipChannelDriver::resolve_endpoint_contact(&cfg, None, "999"),
             None
         );
+    }
+
+    // --- issue #36: inbound channel stores the real session so indicate works -
+
+    /// Build a minimal inbound INVITE targeting `to`, sent from `from_addr`.
+    fn inbound_invite(from_addr: SocketAddr) -> crate::parser::SipMessage {
+        let raw = format!(
+            "INVITE sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {from_addr};branch=z9hG4bKind1\r\n\
+             From: <sip:caller@{from_addr}>;tag=caller\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: indicate-call-1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        crate::parser::SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn indicate_ringing_sends_180_on_inbound_channel() {
+        use asterisk_core::channel::ChannelDriver;
+
+        // The "remote" (caller) socket that should receive our 180 Ringing.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // The driver's send transport.
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap(),
+        );
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // Attach an inbound channel with the REAL inbound session (carries the
+        // INVITE), exactly as the event handler now does.
+        let invite = inbound_invite(peer_addr);
+        let session = SipSession::new_inbound(&invite, local, peer_addr).expect("inbound session");
+        let rtp = RtpSession::bind(local).await.unwrap();
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport.clone());
+        let chan_name = "PJSIP/indicate-1";
+        driver.attach_inbound_media(chan_name, session, transport, rtp);
+
+        // Signal Ringing via the uniform driver API.
+        let mut channel = Channel::new(chan_name);
+        driver
+            .indicate(&mut channel, ControlFrame::Ringing as i32, &[])
+            .await
+            .unwrap();
+
+        // The caller must receive a 180 Ringing. Before the fix the driver
+        // stored a fabricated outbound session (invite = None), so indicate()
+        // silently no-op'd and nothing arrived.
+        let mut buf = [0u8; 4096];
+        let (n, _src) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.recv_from(&mut buf),
+        )
+        .await
+        .expect("timed out: no 180 was sent (indicate() no-op'd)")
+        .unwrap();
+        let resp = crate::parser::SipMessage::parse(&buf[..n]).expect("parse response");
+        assert_eq!(resp.status_code(), Some(180), "indicate(Ringing) must send 180");
     }
 
     /// Regression for the channel-name collision bug: the inbound INVITE path
