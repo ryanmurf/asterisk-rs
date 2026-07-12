@@ -5124,7 +5124,15 @@ second part\r\n\
         );
         let handler = SipEventHandler::new(Arc::new(dp), mock_transport);
 
-        // Build a mock INVITE SIP message
+        // Build a mock INVITE carrying a PCMU SDP offer. A no-SDP (delayed)
+        // offer is now correctly rejected with 488 (issue #30), so this
+        // call-setup test must present a real offer the handler can answer.
+        let offer = asterisk_sip::sdp::SessionDescription::create_offer(
+            "10.0.0.1",
+            40000,
+            &[asterisk_codecs::codecs::pcmu()],
+        )
+        .to_string();
         let invite = SipMessage {
             start_line: StartLine::Request(RequestLine {
                 method: SipMethod::Invite,
@@ -5149,11 +5157,15 @@ second part\r\n\
                     value: "1 INVITE".to_string(),
                 },
                 SipHeader {
+                    name: header_names::CONTENT_TYPE.to_string(),
+                    value: "application/sdp".to_string(),
+                },
+                SipHeader {
                     name: header_names::CONTENT_LENGTH.to_string(),
-                    value: "0".to_string(),
+                    value: offer.len().to_string(),
                 },
             ],
-            body: String::new(),
+            body: offer,
         };
 
         let remote_addr: std::net::SocketAddr = "10.0.0.1:5060".parse().unwrap();
