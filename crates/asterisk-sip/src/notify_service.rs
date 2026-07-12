@@ -70,6 +70,12 @@ impl NotifyService {
         self.channel_states.write().remove(channel_name);
     }
 
+    /// Whether a channel is currently registered for NOTIFY. Used by teardown
+    /// paths and tests to confirm cleanup.
+    pub fn is_registered(&self, channel_name: &str) -> bool {
+        self.channel_states.read().contains_key(channel_name)
+    }
+
     /// Update the remote tag for a channel (called when 1xx/2xx response arrives).
     pub fn update_remote_tag(&self, channel_name: &str, remote_tag: &str) {
         if let Some(state) = self.channel_states.write().get_mut(channel_name) {
