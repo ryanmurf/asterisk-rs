@@ -216,6 +216,33 @@ impl SipEventHandler {
             }
         }
 
+        // 5b. If the INVITE carries an SDP offer we cannot answer (no codec in
+        //     common on any stream), reject with 488 Not Acceptable Here rather
+        //     than sending a 200 OK whose media is entirely rejected — the
+        //     latter brings the call "up" with guaranteed silence and a leaked
+        //     RTP socket (RFC 3264 §6 / RFC 3261 §21.4.26). We probe by building
+        //     a trial answer with a dummy non-zero port so accepted streams
+        //     (port != 0) are distinguishable from rejected ones (port 0).
+        if let Some(ref offer) = session.remote_sdp {
+            let trial = SessionDescription::create_answer(
+                offer,
+                &session.local_addr.ip().to_string(),
+                1,
+                &self.supported_codecs,
+            );
+            let any_accepted = trial
+                .media_descriptions
+                .iter()
+                .any(|m| m.port != 0);
+            if !any_accepted {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    let _ = self.transport.send(&resp, remote_addr).await;
+                    debug!(call_id = %call_id, "Sent 488 Not Acceptable Here (no common codec)");
+                }
+                return None;
+            }
+        }
+
         // 6. Send 100 Trying
         match request.create_response(100, "Trying") {
             Ok(trying) => {
