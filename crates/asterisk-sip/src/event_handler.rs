@@ -931,13 +931,27 @@ impl SipEventHandler {
             false
         };
 
+        // Advertise the media plane's REAL bound RTP port in the answer, not a
+        // placeholder. Binding a re-INVITE answer to a bogus port (the old
+        // hardcoded 10000) breaks audio after every hold/unhold/renegotiation
+        // for peers that honor the answer SDP -- the same defect #8 fixed for
+        // the initial INVITE, which had been left unfixed on this path.
+        let channel_name = { cs_arc.lock().await.channel_name.clone() };
+        let media_port = match self.channel_driver.get() {
+            Some(driver) => driver
+                .channel_rtp_local_port(&channel_name)
+                .await
+                .unwrap_or(10000),
+            None => 10000,
+        };
+
         // Generate SDP answer
         let local_ip = session.local_addr.ip().to_string();
         let answer_sdp = if let Some(ref offer) = remote_sdp {
             let answer = SessionDescription::create_answer(
                 offer,
                 &local_ip,
-                10000,
+                media_port,
                 &self.supported_codecs,
             );
             Some(answer)
