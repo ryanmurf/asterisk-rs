@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# fetch-pjproject.sh -- download the pjproject 2.16 source tree that the
+# fetch-pjproject.sh -- download the pjproject 2.17 source tree that the
 # `pjsip-shim` crate compiles against when built with the `pjproject-cffi`
 # feature.
 #
-# The tree is placed at crates/pjsip-shim/vendor/pjproject-2.16, which the
+# The tree is placed at crates/pjsip-shim/vendor/pjproject-2.17, which the
 # crate's build.rs auto-detects. That directory is git-ignored, so the
 # third-party (GPL-2.0) sources are never committed to this repo.
 #
@@ -13,11 +13,11 @@
 #   cargo build -p pjsip-shim --features pjproject-cffi --release
 #
 # Override the version or download URL via env vars if needed:
-#   PJ_VERSION=2.16 PJ_URL=https://.../2.16.tar.gz scripts/fetch-pjproject.sh
+#   PJ_VERSION=2.17 PJ_URL=https://.../2.17.tar.gz scripts/fetch-pjproject.sh
 #
 set -euo pipefail
 
-PJ_VERSION="${PJ_VERSION:-2.16}"
+PJ_VERSION="${PJ_VERSION:-2.17}"
 PJ_URL="${PJ_URL:-https://github.com/pjsip/pjproject/archive/refs/tags/${PJ_VERSION}.tar.gz}"
 
 # Resolve repo paths relative to this script so it works from any CWD.
