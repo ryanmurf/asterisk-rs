@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::RwLock;
 use tokio::net::UdpSocket;
+use tracing::debug;
 
 use asterisk_types::{AsteriskError, AsteriskResult, Frame};
 
@@ -179,8 +181,10 @@ impl DtmfEvent {
 pub struct RtpSession {
     /// UDP socket for RTP.
     pub socket: Arc<UdpSocket>,
-    /// Remote address.
-    pub remote_addr: Option<SocketAddr>,
+    /// Remote media address. Interior-mutable so `recv_frame` (which takes
+    /// `&self`, as the session is shared via `Arc`) can latch it from the
+    /// first inbound packet under symmetric RTP (issue #34).
+    remote_addr: RwLock<Option<SocketAddr>>,
     /// Our SSRC.
     pub ssrc: u32,
     /// Outgoing sequence number.
@@ -213,7 +217,7 @@ impl RtpSession {
         let ssrc = generate_ssrc();
         Ok(Self {
             socket: Arc::new(socket),
-            remote_addr: None,
+            remote_addr: RwLock::new(None),
             ssrc,
             sequence: AtomicU16::new(0),
             timestamp: AtomicU32::new(0),
@@ -229,9 +233,17 @@ impl RtpSession {
         self.socket.local_addr().map_err(AsteriskError::Io)
     }
 
-    /// Set the remote address.
-    pub fn set_remote_addr(&mut self, addr: SocketAddr) {
-        self.remote_addr = Some(addr);
+    /// The current remote media address (from SDP or latched from the first
+    /// inbound packet), if known.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        *self.remote_addr.read()
+    }
+
+    /// Set the remote address (e.g. from an SDP `c=`/`m=` line). Takes
+    /// `&self` because the address is interior-mutable; a `&mut` binding
+    /// still works via auto-ref.
+    pub fn set_remote_addr(&self, addr: SocketAddr) {
+        *self.remote_addr.write() = Some(addr);
     }
 
     /// Send an audio frame as RTP.
@@ -242,7 +254,7 @@ impl RtpSession {
         };
 
         let remote = self
-            .remote_addr
+            .remote_addr()
             .ok_or_else(|| AsteriskError::InvalidArgument("No remote address".into()))?;
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -273,13 +285,45 @@ impl RtpSession {
         Ok(())
     }
 
+    /// Symmetric-RTP latch: adopt `src` as the remote media address when we
+    /// have not learned one yet. Returns `true` if this call latched.
+    ///
+    /// Guarded to fire only while unset — once the remote is known (from SDP
+    /// or a prior latch) it is never moved, so a packet injected from a third
+    /// address cannot redirect an established stream. This recovers the media
+    /// path when SDP gave us no usable remote: an FQDN `c=` line
+    /// (`IpAddr::parse` fails), a v6 `c=` against a v4 socket, or a held
+    /// (port 0) offer that later unholds — cases where `write_frame` would
+    /// otherwise fail forever with "No remote address" and the caller would
+    /// hear nothing (issue #34; RFC 4961 symmetric RTP, RFC 3581 rport).
+    fn latch_remote(&self, src: SocketAddr) -> bool {
+        // Fast path: already known — no write lock, no move.
+        if self.remote_addr.read().is_some() {
+            return false;
+        }
+        let mut guard = self.remote_addr.write();
+        // Re-check under the write lock in case another packet raced us.
+        if guard.is_none() {
+            *guard = Some(src);
+            debug!(learned_from = %src, "Symmetric RTP: latched remote address from first packet");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Receive an RTP packet and convert to a Frame.
     pub async fn recv_frame(&self) -> AsteriskResult<Frame> {
         let mut buf = vec![0u8; RTP_MAX_MTU];
-        let (len, _src) = self.socket.recv_from(&mut buf).await?;
+        let (len, src) = self.socket.recv_from(&mut buf).await?;
         buf.truncate(len);
 
         let (header, payload) = parse_rtp_header(&buf)?;
+
+        // Latch the remote from the first valid RTP packet if SDP left us
+        // without one (symmetric RTP). Done after a successful parse so
+        // non-RTP junk on the port cannot capture the endpoint (issue #34).
+        self.latch_remote(src);
 
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -317,7 +361,7 @@ impl RtpSession {
         duration_samples: u16,
     ) -> AsteriskResult<()> {
         let remote = self
-            .remote_addr
+            .remote_addr()
             .ok_or_else(|| AsteriskError::InvalidArgument("No remote address".into()))?;
 
         let event_num = DtmfEvent::digit_to_event(digit);
@@ -725,7 +769,7 @@ impl MuxedRtpSession {
     pub async fn send_rtcp_muxed(&self, rtcp_data: &[u8]) -> AsteriskResult<()> {
         let remote = self
             .rtp
-            .remote_addr
+            .remote_addr()
             .ok_or_else(|| AsteriskError::InvalidArgument("No remote address".into()))?;
         self.rtp.socket.send_to(rtcp_data, remote).await?;
         Ok(())
@@ -763,6 +807,102 @@ pub fn rtcp_mux_negotiated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- issue #34: symmetric-RTP latching --------------------------------
+
+    #[tokio::test]
+    async fn latch_adopts_source_when_remote_unset() {
+        let rtp = RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert!(rtp.remote_addr().is_none());
+
+        let src: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        assert!(rtp.latch_remote(src), "first packet should latch");
+        assert_eq!(rtp.remote_addr(), Some(src));
+    }
+
+    #[tokio::test]
+    async fn latch_does_not_override_sdp_remote() {
+        let rtp = RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        // Remote already known from SDP negotiation.
+        let sdp_remote: SocketAddr = "198.51.100.5:5004".parse().unwrap();
+        rtp.set_remote_addr(sdp_remote);
+
+        let attacker: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        assert!(!rtp.latch_remote(attacker), "must not move a known remote");
+        assert_eq!(rtp.remote_addr(), Some(sdp_remote));
+    }
+
+    #[tokio::test]
+    async fn latch_is_sticky_after_first_packet() {
+        let rtp = RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let first: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let second: SocketAddr = "203.0.113.50:5555".parse().unwrap();
+        assert!(rtp.latch_remote(first));
+        // A later packet from a different source cannot redirect the stream.
+        assert!(!rtp.latch_remote(second));
+        assert_eq!(rtp.remote_addr(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn recv_frame_latches_then_send_succeeds() {
+        // End-to-end proof of the one-way-audio fix: an RtpSession whose SDP
+        // gave no usable remote (remote_addr == None) learns the caller from
+        // the first inbound packet, after which write_frame no longer errors
+        // with "No remote address".
+        let server = Arc::new(
+            RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap(),
+        );
+        let server_addr = server.local_addr().unwrap();
+        assert!(server.remote_addr().is_none());
+
+        // Sending before we know the remote must fail (the bug's symptom).
+        let voice = Frame::voice(0, 160, Bytes::from_static(&[0x7F; 160]));
+        assert!(
+            server.send_frame(&voice).await.is_err(),
+            "no remote yet → send must error"
+        );
+
+        // A peer sends one PCMU packet to the server.
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let header = RtpHeader {
+            version: 2, padding: false, extension: false, csrc_count: 0,
+            marker: true, payload_type: 0, sequence: 1, timestamp: 160,
+            ssrc: 0x1234,
+        };
+        let packet = build_rtp_packet(&header, &[0x7F; 160]);
+        peer.send_to(&packet, server_addr).await.unwrap();
+
+        // recv_frame consumes it and latches the remote to the peer.
+        let srv = server.clone();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            srv.recv_frame(),
+        )
+        .await
+        .expect("recv_frame timed out")
+        .expect("recv_frame");
+        assert!(matches!(frame, Frame::Voice { .. }));
+        assert_eq!(
+            server.remote_addr(),
+            Some(peer_addr),
+            "remote must be latched to the packet source"
+        );
+
+        // Now write_frame succeeds and reaches the peer.
+        server.send_frame(&voice).await.expect("send after latch");
+        let mut buf = [0u8; 2048];
+        let (n, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.recv_from(&mut buf),
+        )
+        .await
+        .expect("peer recv timed out")
+        .unwrap();
+        assert_eq!(from, server_addr);
+        let (_h, pl) = parse_rtp_header(&buf[..n]).unwrap();
+        assert_eq!(pl, &[0x7F; 160], "peer must receive the echoed audio");
+    }
 
     #[test]
     fn test_rtp_header_roundtrip() {
