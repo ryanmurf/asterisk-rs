@@ -71,6 +71,10 @@ pub struct SipChannelDriver {
     transport: RwLock<Option<Arc<dyn SipTransport>>>,
     /// Supported codecs.
     codecs: Vec<Codec>,
+    /// Inbound registrar, shared from the event handler at startup. When set,
+    /// [`Self::request`] prefers a live dynamic contact binding over the
+    /// static AoR contact so registered devices are reachable (issue #33).
+    registrar: RwLock<Option<Arc<crate::registrar::Registrar>>>,
 }
 
 impl fmt::Debug for SipChannelDriver {
@@ -93,7 +97,43 @@ impl SipChannelDriver {
                 codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
             ],
+            registrar: RwLock::new(None),
         }
+    }
+
+    /// Share the inbound registrar so outbound `request()` can resolve a
+    /// dynamically-registered contact for an endpoint's AoR (issue #33).
+    /// Wired once at startup with the same registrar the event handler owns.
+    pub fn set_registrar(&self, registrar: Arc<crate::registrar::Registrar>) {
+        *self.registrar.write() = Some(registrar);
+    }
+
+    /// Resolve the contact URI to dial for a bare endpoint name.
+    ///
+    /// Prefers a live registrar binding for the endpoint's AoR over the
+    /// static configured contact, so a phone that REGISTERed from a dynamic
+    /// address is reachable via `Dial(PJSIP/<endpoint>)` (issue #33). Returns
+    /// `None` when neither a dynamic nor a static contact is available, so the
+    /// caller can apply its own last-resort fallback.
+    fn resolve_endpoint_contact(
+        config: &crate::pjsip_config::PjsipConfig,
+        registrar: Option<&crate::registrar::Registrar>,
+        dest: &str,
+    ) -> Option<String> {
+        let ep = config.find_endpoint(dest)?;
+        let aor_name = ep.aors.as_deref().unwrap_or(dest);
+
+        // A live registration wins over the static contact.
+        if let Some(reg) = registrar {
+            if let Some(contact) = reg.best_contact(aor_name) {
+                return Some(contact);
+            }
+        }
+
+        // Fall back to the statically configured AoR contact.
+        config
+            .find_aor(aor_name)
+            .and_then(|a| a.contact.first().cloned())
     }
 
     /// Initialize the transport layer.
@@ -203,15 +243,18 @@ impl ChannelDriver for SipChannelDriver {
                 .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid dest: {}", e)))?;
             (format!("sip:{}", dest), addr)
         } else {
-            // Treat as endpoint name -- look up AOR contact from config
+            // Treat as endpoint name -- resolve its AOR contact, preferring a
+            // live registration over the static config contact (issue #33).
             let config = endpoint_config.as_ref()
                 .ok_or_else(|| AsteriskError::NotFound(format!("No PJSIP config loaded for endpoint '{}'", dest)))?;
-            let ep = config.find_endpoint(dest)
-                .ok_or_else(|| AsteriskError::NotFound(format!("Endpoint '{}' not found", dest)))?;
-            let aor_name = ep.aors.as_deref().unwrap_or(dest);
-            let aor = config.find_aor(aor_name);
-            let contact_uri = aor.and_then(|a| a.contact.first()).cloned()
-                .unwrap_or_else(|| format!("sip:{}@127.0.0.1:5060", dest));
+            if config.find_endpoint(dest).is_none() {
+                return Err(AsteriskError::NotFound(format!("Endpoint '{}' not found", dest)));
+            }
+            let contact_uri = {
+                let reg_guard = self.registrar.read();
+                Self::resolve_endpoint_contact(config, reg_guard.as_deref(), dest)
+            }
+            .unwrap_or_else(|| format!("sip:{}@127.0.0.1:5060", dest));
             // Parse the contact URI to get the remote address
             let uri = crate::parser::SipUri::parse(&contact_uri)
                 .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid contact URI: {}", e.0)))?;
@@ -512,6 +555,77 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::thread;
+    use std::time::Instant;
+
+    // --- issue #33: outbound routing consults the registrar ---------------
+
+    fn routing_config(static_contact: Option<&str>) -> crate::pjsip_config::PjsipConfig {
+        use crate::pjsip_config::{AorConfig, EndpointConfig, PjsipConfig};
+        PjsipConfig {
+            endpoints: vec![EndpointConfig {
+                name: "100".to_string(),
+                aors: Some("100".to_string()),
+                ..Default::default()
+            }],
+            aors: vec![AorConfig {
+                name: "100".to_string(),
+                contact: static_contact.map(|c| vec![c.to_string()]).unwrap_or_default(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_uses_static_contact_when_no_registration() {
+        let cfg = routing_config(Some("sip:100@static.example:5060"));
+        assert_eq!(
+            SipChannelDriver::resolve_endpoint_contact(&cfg, None, "100"),
+            Some("sip:100@static.example:5060".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_dynamic_registration_over_static() {
+        use crate::registrar::{Registrar, Registration};
+        let cfg = routing_config(Some("sip:100@static.example:5060"));
+        let registrar = Registrar::new();
+        registrar.register(Registration {
+            aor: "100".to_string(),
+            contact_uri: "sip:100@10.0.0.55:5060".to_string(),
+            expiration: 3600,
+            registered_at: Instant::now(),
+            user_agent: "phone".to_string(),
+            path: None,
+            call_id: "c1".to_string(),
+            cseq: 1,
+        });
+        // The dynamically-registered address wins — without this, a phone
+        // that registered from a dynamic address is unreachable via Dial().
+        assert_eq!(
+            SipChannelDriver::resolve_endpoint_contact(&cfg, Some(&registrar), "100"),
+            Some("sip:100@10.0.0.55:5060".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_none_when_no_contact_anywhere() {
+        let cfg = routing_config(None);
+        let registrar = crate::registrar::Registrar::new();
+        assert_eq!(
+            SipChannelDriver::resolve_endpoint_contact(&cfg, Some(&registrar), "100"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_none_for_unknown_endpoint() {
+        let cfg = routing_config(Some("sip:100@static.example:5060"));
+        assert_eq!(
+            SipChannelDriver::resolve_endpoint_contact(&cfg, None, "999"),
+            None
+        );
+    }
 
     /// Regression for the channel-name collision bug: the inbound INVITE path
     /// previously derived its channel-name suffix from a truncated

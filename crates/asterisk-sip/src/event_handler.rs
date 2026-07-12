@@ -740,6 +740,40 @@ impl SipEventHandler {
                     }
                     return;
                 }
+
+                // Auth succeeded. Scope the binding: the authenticated user
+                // may only (de)register an AoR owned by an endpoint it
+                // authenticates for. Without this, ANY configured user's
+                // valid credentials could bind ANY AoR — e.g. alice REGISTERs
+                // `To: <sip:bob@…>` and hijacks bob's inbound calls the moment
+                // routing consults the registrar. Mirrors res_pjsip_registrar's
+                // `find_aor_name` against the identified endpoint's configured
+                // `aors` (RFC 3261 §10.3 — a registrar authorizes the binding,
+                // it does not merely authenticate the transaction).
+                let authed_user = request
+                    .get_header(crate::parser::header_names::AUTHORIZATION)
+                    .and_then(crate::authenticator::parse_authorization)
+                    .map(|p| p.username);
+                let requested_aor = crate::registrar::aor_name_from_request(request);
+
+                let allowed = match (authed_user.as_deref(), requested_aor.as_deref()) {
+                    (Some(user), Some(aor)) => user_may_register_aor(&cfg, user, aor),
+                    // Missing identity or target AoR: refuse rather than bind
+                    // blindly.
+                    _ => false,
+                };
+                if !allowed {
+                    warn!(
+                        call_id = %call_id,
+                        user = authed_user.as_deref().unwrap_or("<unknown>"),
+                        aor = requested_aor.as_deref().unwrap_or("<unknown>"),
+                        "REGISTER denied: authenticated user may not bind this AoR"
+                    );
+                    if let Ok(resp) = request.create_response(403, "Forbidden") {
+                        let _ = self.transport.send(&resp, remote_addr).await;
+                    }
+                    return;
+                }
             }
         }
 
@@ -1077,6 +1111,60 @@ fn negotiated_payload_type(sdp: &SessionDescription, supported: &[Codec]) -> Opt
     media.formats.first().copied()
 }
 
+/// Authorize a REGISTER: is `username` (a digest identity that has already
+/// authenticated) permitted to bind the Address-of-Record `aor`?
+///
+/// The rule mirrors real Asterisk: a REGISTER may only bind an AoR that
+/// belongs to the endpoint whose credentials authenticated the request. For
+/// each endpoint we check two things about the *same* endpoint:
+///   1. it authenticates the caller — it references an auth section whose
+///      `username` equals the authenticated user; and
+///   2. it owns `aor` — `aor` is in its configured `aors` list
+///      (comma-separated), or, when the endpoint configures no `aors`, `aor`
+///      matches the endpoint's own identity (its section name or its auth
+///      username). The no-`aors` fallback is the standard minimal-config
+///      convention (`endpoint == auth == aor`) and only ever grants an
+///      endpoint its *own* identity.
+///
+/// All comparisons are case-insensitive, consistent with the other config
+/// lookups. Because ownership is always evaluated against the very endpoint
+/// the caller authenticated as, the granted AoR can never be a *different*
+/// endpoint's — keying on the cryptographically-verified digest username
+/// (not the spoofable From/To) is what stops alice's valid credentials from
+/// binding bob's AoR (issue #33).
+fn user_may_register_aor(
+    cfg: &crate::pjsip_config::PjsipConfig,
+    username: &str,
+    aor: &str,
+) -> bool {
+    cfg.endpoints.iter().any(|ep| {
+        let auth_username = ep
+            .auth
+            .as_ref()
+            .and_then(|auth_name| cfg.find_auth(auth_name))
+            .map(|auth| auth.username.as_str());
+
+        // (1) This endpoint must authenticate the caller.
+        if !auth_username.is_some_and(|u| u.eq_ignore_ascii_case(username)) {
+            return false;
+        }
+
+        // (2) ...and own the requested AoR.
+        match ep
+            .aors
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(aors) => aors.split(',').any(|a| a.trim().eq_ignore_ascii_case(aor)),
+            None => {
+                ep.name.eq_ignore_ascii_case(aor)
+                    || auth_username.is_some_and(|u| u.eq_ignore_ascii_case(aor))
+            }
+        }
+    })
+}
+
 /// Extract the user part from a SIP header value like `"Name" <sip:user@host>` or `sip:user@host`.
 fn extract_user_from_header(header: &str) -> Option<String> {
     // Try to find a SIP URI in angle brackets first
@@ -1201,6 +1289,87 @@ mod tests {
         let mut offer = SessionDescription::create_offer("203.0.113.7", 0, &[codecs::pcmu()]);
         offer.media_descriptions[0].port = 0;
         assert!(remote_rtp_endpoint(&offer).is_none());
+    }
+
+    // --- issue #33: REGISTER AoR authorization scoping ---------------------
+
+    fn scoping_config() -> crate::pjsip_config::PjsipConfig {
+        use crate::pjsip_config::{AuthConfig, EndpointConfig, PjsipConfig};
+
+        let mk_auth = |name: &str, user: &str| AuthConfig {
+            name: name.to_string(),
+            username: user.to_string(),
+            password: "secret".to_string(),
+            ..Default::default()
+        };
+        let mk_ep = |name: &str, auth: &str, aors: Option<&str>| EndpointConfig {
+            name: name.to_string(),
+            auth: Some(auth.to_string()),
+            aors: aors.map(|s| s.to_string()),
+            ..Default::default()
+        };
+
+        PjsipConfig {
+            endpoints: vec![
+                mk_ep("alice", "alice-auth", Some("alice")),
+                mk_ep("bob", "bob-auth", Some("bob")),
+                // An endpoint with no AoR cannot register anything.
+                mk_ep("carol", "carol-auth", None),
+                // An endpoint owning several AoRs (comma list).
+                mk_ep("multi", "multi-auth", Some("m1, m2")),
+            ],
+            auths: vec![
+                mk_auth("alice-auth", "alice"),
+                mk_auth("bob-auth", "bob"),
+                mk_auth("carol-auth", "carol"),
+                mk_auth("multi-auth", "multi"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_user_may_register_own_aor() {
+        let cfg = scoping_config();
+        assert!(user_may_register_aor(&cfg, "alice", "alice"));
+    }
+
+    #[test]
+    fn test_user_may_not_register_another_users_aor() {
+        // The core hijack: alice's valid credentials must NOT bind bob's AoR.
+        let cfg = scoping_config();
+        assert!(!user_may_register_aor(&cfg, "alice", "bob"));
+    }
+
+    #[test]
+    fn test_aor_membership_is_case_insensitive() {
+        let cfg = scoping_config();
+        assert!(user_may_register_aor(&cfg, "ALICE", "Alice"));
+    }
+
+    #[test]
+    fn test_unknown_user_may_register_nothing() {
+        let cfg = scoping_config();
+        assert!(!user_may_register_aor(&cfg, "eve", "alice"));
+    }
+
+    #[test]
+    fn test_endpoint_without_explicit_aor_owns_its_own_identity() {
+        // carol has no `aors=` configured. Under the minimal-config
+        // convention it implicitly owns the AoR matching its own identity...
+        let cfg = scoping_config();
+        assert!(user_may_register_aor(&cfg, "carol", "carol"));
+        // ...but still nothing else — no cross-endpoint binding.
+        assert!(!user_may_register_aor(&cfg, "carol", "alice"));
+        assert!(!user_may_register_aor(&cfg, "carol", "dave"));
+    }
+
+    #[test]
+    fn test_comma_separated_aor_list_membership() {
+        let cfg = scoping_config();
+        assert!(user_may_register_aor(&cfg, "multi", "m1"));
+        assert!(user_may_register_aor(&cfg, "multi", "m2"));
+        assert!(!user_may_register_aor(&cfg, "multi", "m3"));
     }
 
     #[test]

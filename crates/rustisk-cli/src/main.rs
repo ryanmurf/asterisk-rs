@@ -1953,6 +1953,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                     // Give the handler the SIP channel driver so inbound calls
                     // bind an RTP session and carry media (mirrors outbound).
                     event_handler.set_channel_driver(sip_driver_ref.clone());
+                    // Share the registrar with the driver so outbound Dial()
+                    // routes to a dynamically-registered contact instead of
+                    // only the static AoR config (issue #33).
+                    sip_driver_ref.set_registrar(event_handler.registrar());
                     asterisk_sip::set_global_event_handler(event_handler.clone());
                     tokio::spawn(async move {
                         while let Some(event) = rx.recv().await {

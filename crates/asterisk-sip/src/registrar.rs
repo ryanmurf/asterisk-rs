@@ -134,6 +134,25 @@ impl Registrar {
             .unwrap_or_default()
     }
 
+    /// The single best live contact URI to route a new call to for an AoR:
+    /// the most-recently-refreshed non-expired binding. Returns `None` when
+    /// the AoR has no live registration, so callers can fall back to a
+    /// statically configured contact.
+    ///
+    /// Used by the channel driver to route `Dial(PJSIP/<endpoint>)` to a
+    /// device that registered from a dynamic address (issue #33). Only one
+    /// contact is returned; parallel forking to multiple bindings is not yet
+    /// implemented.
+    pub fn best_contact(&self, aor: &str) -> Option<String> {
+        self.contacts
+            .read()
+            .get(aor)?
+            .iter()
+            .filter(|r| !r.is_expired())
+            .max_by_key(|r| r.registered_at)
+            .map(|r| r.contact_uri.clone())
+    }
+
     // ----- request handling ------------------------------------------------
 
     /// Handle an incoming SIP REGISTER request.
@@ -145,21 +164,14 @@ impl Registrar {
             return self.make_error(request, 405, "Method Not Allowed");
         }
 
-        // Determine AoR from the To header.
-        let to_hdr = match request.to_header() {
-            Some(v) => v.to_string(),
+        // Determine the AoR from the To header (the user-part, or the whole
+        // URI when there is no user-part). Derived via the shared helper so
+        // that any caller-side authorization check binds under the exact same
+        // AoR name this method will use.
+        let aor_name = match aor_name_from_request(request) {
+            Some(name) => name,
             None => return self.make_error(request, 400, "Bad Request"),
         };
-        let aor_uri = match extract_uri(&to_hdr) {
-            Some(u) => u,
-            None => return self.make_error(request, 400, "Bad Request"),
-        };
-
-        // Derive AoR name (the user-part, or the whole URI if no user).
-        let aor_name = SipUri::parse(&aor_uri)
-            .ok()
-            .and_then(|u| u.user.clone())
-            .unwrap_or_else(|| aor_uri.clone());
 
         // Look up the AoR config; if not configured we use a liberal default.
         let config = self
@@ -405,6 +417,29 @@ impl Default for Registrar {
 }
 
 // ---------------------------------------------------------------------------
+// Request helpers
+// ---------------------------------------------------------------------------
+
+/// Derive the Address-of-Record name a REGISTER request targets: the
+/// user-part of the To-header URI, or the whole URI when it has no
+/// user-part.
+///
+/// This is the exact key [`Registrar::handle_register`] binds contacts
+/// under, exposed so authorization logic in the event handler can check a
+/// requested AoR against the same value the registrar will use — preventing
+/// the check and the binding from drifting apart (issue #33).
+pub fn aor_name_from_request(request: &SipMessage) -> Option<String> {
+    let to_hdr = request.to_header()?;
+    let aor_uri = extract_uri(to_hdr)?;
+    Some(
+        SipUri::parse(&aor_uri)
+            .ok()
+            .and_then(|u| u.user.clone())
+            .unwrap_or(aor_uri),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Contact header parsing helpers
 // ---------------------------------------------------------------------------
 
@@ -505,5 +540,70 @@ mod tests {
         let resp = registrar.handle_register(&unreg);
         assert_eq!(resp.status_code(), Some(200));
         assert_eq!(registrar.get_contacts("alice").len(), 0);
+    }
+
+    #[test]
+    fn test_aor_name_from_request_uses_to_user() {
+        // The AoR name is the user-part of the To URI (issue #33) — this is
+        // the key the binding lands under and that authorization checks
+        // against, so they cannot drift.
+        let reg = make_register("<sip:alice@10.0.0.1>", Some(3600));
+        assert_eq!(aor_name_from_request(&reg), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn test_best_contact_none_when_unregistered() {
+        let registrar = Registrar::new();
+        assert_eq!(registrar.best_contact("ghost"), None);
+    }
+
+    #[test]
+    fn test_best_contact_prefers_freshest_live_binding() {
+        let registrar = Registrar::new();
+
+        // An older binding and a newer one for the same AoR: routing must
+        // pick the most recently refreshed contact.
+        registrar.register(Registration {
+            aor: "alice".to_string(),
+            contact_uri: "sip:alice@10.0.0.9:5060".to_string(),
+            expiration: 3600,
+            registered_at: Instant::now() - Duration::from_secs(30),
+            user_agent: "old".to_string(),
+            path: None,
+            call_id: "c1".to_string(),
+            cseq: 1,
+        });
+        registrar.register(Registration {
+            aor: "alice".to_string(),
+            contact_uri: "sip:alice@10.0.0.10:5060".to_string(),
+            expiration: 3600,
+            registered_at: Instant::now(),
+            user_agent: "new".to_string(),
+            path: None,
+            call_id: "c2".to_string(),
+            cseq: 2,
+        });
+
+        assert_eq!(
+            registrar.best_contact("alice"),
+            Some("sip:alice@10.0.0.10:5060".to_string())
+        );
+    }
+
+    #[test]
+    fn test_best_contact_skips_expired() {
+        let registrar = Registrar::new();
+        // Only binding is already expired (registered 100s ago, 50s TTL).
+        registrar.register(Registration {
+            aor: "alice".to_string(),
+            contact_uri: "sip:alice@10.0.0.9:5060".to_string(),
+            expiration: 50,
+            registered_at: Instant::now() - Duration::from_secs(100),
+            user_agent: "stale".to_string(),
+            path: None,
+            call_id: "c1".to_string(),
+            cseq: 1,
+        });
+        assert_eq!(registrar.best_contact("alice"), None);
     }
 }
