@@ -114,12 +114,12 @@ fn build_pjproject_cffi() {
             "\n\
              ============================================================\n\
              pjsip-shim: the `pjproject-cffi` feature is enabled but the\n\
-             pjproject 2.16 source tree could not be found.\n\
+             pjproject 2.17 source tree could not be found.\n\
              \n\
              Provide it in one of these ways:\n\
                1. Run  scripts/fetch-pjproject.sh  (downloads it into\n\
-                  crates/pjsip-shim/vendor/pjproject-2.16), or\n\
-               2. Set  PJPROJECT_DIR=/path/to/pjproject-2.16  when building.\n\
+                  crates/pjsip-shim/vendor/pjproject-2.17), or\n\
+               2. Set  PJPROJECT_DIR=/path/to/pjproject-2.17  when building.\n\
              \n\
              The directory must contain pjlib/include/pj/types.h.\n\
              ============================================================\n"
@@ -188,11 +188,11 @@ fn build_pjproject_cffi() {
     }
 }
 
-/// Find the pjproject 2.16 source tree, in priority order:
+/// Find the pjproject 2.17 source tree, in priority order:
 ///   1. `$PJPROJECT_DIR`
-///   2. the vendored copy at `crates/pjsip-shim/vendor/pjproject-2.16`
+///   2. the vendored copy at `crates/pjsip-shim/vendor/pjproject-2.17`
 ///      (populated by `scripts/fetch-pjproject.sh`)
-///   3. `/tmp/pjproject-2.16` (historical default)
+///   3. `/tmp/pjproject-2.17` (historical default)
 /// A directory only counts if `pjlib/include/pj/types.h` exists under it.
 fn locate_pjproject() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -202,9 +202,9 @@ fn locate_pjproject() -> Option<PathBuf> {
     }
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    candidates.push(manifest_dir.join("vendor/pjproject-2.16"));
+    candidates.push(manifest_dir.join("vendor/pjproject-2.17"));
 
-    candidates.push(PathBuf::from("/tmp/pjproject-2.16"));
+    candidates.push(PathBuf::from("/tmp/pjproject-2.17"));
 
     candidates
         .into_iter()
