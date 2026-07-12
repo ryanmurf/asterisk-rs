@@ -213,6 +213,21 @@ impl SipChannelDriver {
         self.channels.read().len()
     }
 
+    /// The local UDP port currently bound for a channel's media plane, if the
+    /// channel exists and has an RTP session attached.
+    ///
+    /// The re-INVITE path uses this to advertise the *real* media port in its
+    /// SDP answer instead of a placeholder, so hold/unhold and other mid-call
+    /// renegotiations do not break audio for peers that honor the answer SDP
+    /// (mirrors the initial-INVITE fix for issue #8).
+    pub async fn channel_rtp_local_port(&self, channel_name: &str) -> Option<u16> {
+        let priv_data = self.channels.read().get(channel_name)?.clone();
+        let rtp = priv_data.rtp.lock().await;
+        rtp.as_ref()
+            .and_then(|r| r.local_addr().ok())
+            .map(|a| a.port())
+    }
+
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
         self.transport.read().clone().ok_or_else(|| {
             AsteriskError::Internal("SIP transport not initialized".into())
@@ -702,6 +717,43 @@ mod tests {
         .unwrap();
         let resp = crate::parser::SipMessage::parse(&buf[..n]).expect("parse response");
         assert_eq!(resp.status_code(), Some(180), "indicate(Ringing) must send 180");
+    }
+
+    /// Regression for issue #54: the re-INVITE answer must advertise the media
+    /// plane's REAL bound RTP port, not the hardcoded placeholder 10000. The
+    /// driver must expose the actual bound port for the channel so the
+    /// re-INVITE path can put it in the SDP answer; hold/unhold otherwise
+    /// breaks audio for peers that honor the answer.
+    #[tokio::test]
+    async fn channel_rtp_local_port_reports_real_bound_port() {
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap(),
+        );
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let invite = inbound_invite(peer);
+        let session = SipSession::new_inbound(&invite, local, peer).expect("inbound session");
+        let rtp = RtpSession::bind(local).await.unwrap();
+        let bound_port = rtp.local_addr().unwrap().port();
+        assert_ne!(bound_port, 0, "OS must assign a real port");
+        assert_ne!(bound_port, 10000, "bound port must not be the placeholder");
+
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport.clone());
+        let chan_name = "PJSIP/reinvite-port-1";
+        driver.attach_inbound_media(chan_name, session, transport, rtp);
+
+        assert_eq!(
+            driver.channel_rtp_local_port(chan_name).await,
+            Some(bound_port),
+            "must report the real bound RTP port for the re-INVITE answer"
+        );
+        assert_eq!(
+            driver.channel_rtp_local_port("PJSIP/does-not-exist").await,
+            None,
+            "unknown channel must return None"
+        );
     }
 
     /// Regression for the channel-name collision bug: the inbound INVITE path
