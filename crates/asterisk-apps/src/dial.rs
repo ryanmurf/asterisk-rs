@@ -1323,10 +1323,19 @@ impl AppDial {
                 let hangup_cause = dial_args.options.unanswered_hangup_cause();
                 for (i, leg) in legs.iter_mut().enumerate() {
                     if i != answered_idx && leg.state != DialLegState::HungUp {
-                        let mut chan = leg.channel.lock().await;
-                        chan.hangup_cause = hangup_cause;
-                        chan.state = ChannelState::Down;
+                        let leg_name = {
+                            let mut chan = leg.channel.lock().await;
+                            chan.hangup_cause = hangup_cause;
+                            chan.state = ChannelState::Down;
+                            chan.name.clone()
+                        };
                         leg.state = DialLegState::HungUp;
+                        // Release the losing leg's RTP socket / driver-map
+                        // entry so a parallel dial (N legs, 1 answers) does not
+                        // leak N-1 sockets per call (issue #28).
+                        if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                            handler.release_outbound_leg(&leg_name);
+                        }
                         debug!(
                             "Dial: hanging up non-answered leg {} ({}) cause={:?}",
                             i, leg.destination.resource, hangup_cause
@@ -1965,12 +1974,21 @@ impl AppDial {
     async fn hangup_all_legs(legs: &mut [DialLeg]) {
         for leg in legs.iter_mut() {
             if leg.state != DialLegState::HungUp {
-                let mut chan = leg.channel.lock().await;
-                if chan.state != ChannelState::Down {
-                    chan.state = ChannelState::Down;
-                    chan.hangup_cause = HangupCause::NormalClearing;
-                }
+                let leg_name = {
+                    let mut chan = leg.channel.lock().await;
+                    if chan.state != ChannelState::Down {
+                        chan.state = ChannelState::Down;
+                        chan.hangup_cause = HangupCause::NormalClearing;
+                    }
+                    chan.name.clone()
+                };
                 leg.state = DialLegState::HungUp;
+                // Release each leg's RTP socket / driver-map entry so a failed
+                // dial (busy/congestion/timeout/caller-hangup) does not leak
+                // the sockets bound by driver.request() (issue #28).
+                if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                    handler.release_outbound_leg(&leg_name);
+                }
             }
         }
     }
