@@ -698,6 +698,14 @@ impl SipEventHandler {
                     let mut ch = channel.lock();
                     ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
                 }
+                // Release the driver media plane so a remote-initiated BYE on
+                // an OUTBOUND leg does not leak its RTP socket / channel-map
+                // entry (issue #28). Idempotent, so the inbound path — whose
+                // media plane is finalized by the spawned cleanup task — is
+                // unaffected (the later finalize call is a no-op).
+                if let Some(driver) = self.channel_driver.get() {
+                    driver.remove_channel(&name);
+                }
             }
 
             // Clean up
@@ -948,36 +956,64 @@ impl SipEventHandler {
         Some(call_id)
     }
 
-    /// Send BYE for a channel by looking up its Call-ID in the callid_map.
+    /// Send BYE for a channel by looking up its Call-ID in the callid_map,
+    /// then release every local resource the leg held.
     pub async fn send_bye_for_channel(&self, channel_name: &str) {
-        // Find Call-ID for this channel
+        // Find Call-ID for this channel and send a BYE if we have session
+        // state for it. A leg with no Call-ID (never reached `call()`) still
+        // has a bound RTP socket in the driver map, so we fall through to the
+        // release step below regardless.
         let call_id = {
             let map = self.callid_map.read();
             map.iter().find(|(_, name)| name.as_str() == channel_name)
                 .map(|(cid, _)| cid.clone())
         };
-        let call_id = match call_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        let cs_arc = {
-            let states = self.call_states.read();
-            states.get(&call_id).cloned()
-        };
-        if let Some(cs_arc) = cs_arc {
-            let mut cs = cs_arc.lock().await;
-            if let Some(bye) = cs.session.build_bye() {
-                if let Err(e) = self.transport.send(&bye, cs.remote_addr).await {
-                    warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
-                } else {
-                    eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
+        if let Some(ref call_id) = call_id {
+            let cs_arc = {
+                let states = self.call_states.read();
+                states.get(call_id).cloned()
+            };
+            if let Some(cs_arc) = cs_arc {
+                let mut cs = cs_arc.lock().await;
+                if let Some(bye) = cs.session.build_bye() {
+                    if let Err(e) = self.transport.send(&bye, cs.remote_addr).await {
+                        warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
+                    } else {
+                        eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
+                    }
                 }
             }
         }
-        // Clean up
-        self.callid_map.write().remove(&call_id);
-        self.call_states.write().remove(&call_id);
+        // Release the driver media plane (RTP socket), NOTIFY registration,
+        // and Call-ID/state bookkeeping. Before this, only the two maps were
+        // cleared and the driver channel entry + its bound socket leaked for
+        // the lifetime of the process (issue #28).
+        self.release_outbound_leg(channel_name);
+    }
+
+    /// Release an outbound leg's local resources — its driver channel-map
+    /// entry (and thus the bound RTP socket), NOTIFY registration, and
+    /// Call-ID/state bookkeeping — WITHOUT sending any SIP.
+    ///
+    /// Used to reclaim abandoned Dial legs (losing legs in a parallel dial,
+    /// and every leg of a failed dial) so their sockets are not leaked
+    /// (issue #28). Sending the appropriate CANCEL/BYE for such legs is the
+    /// caller's concern; this only frees resources. Idempotent.
+    pub fn release_outbound_leg(&self, channel_name: &str) {
+        let call_id = {
+            let map = self.callid_map.read();
+            map.iter()
+                .find(|(_, name)| name.as_str() == channel_name)
+                .map(|(cid, _)| cid.clone())
+        };
+        if let Some(call_id) = call_id {
+            self.callid_map.write().remove(&call_id);
+            self.call_states.write().remove(&call_id);
+        }
+        crate::notify_service::global_notify_service().unregister_channel(channel_name);
+        if let Some(driver) = self.channel_driver.get() {
+            driver.remove_channel(channel_name);
+        }
     }
 
     /// Get the remote SDP for an active call (the SDP from the initial INVITE offer).
@@ -1370,6 +1406,109 @@ mod tests {
         assert!(user_may_register_aor(&cfg, "multi", "m1"));
         assert!(user_may_register_aor(&cfg, "multi", "m2"));
         assert!(!user_may_register_aor(&cfg, "multi", "m3"));
+    }
+
+    // --- issue #28: outbound legs release their RTP socket / driver entry --
+
+    // `request()` is a ChannelDriver trait method; bring the trait into scope.
+    use asterisk_core::channel::ChannelDriver;
+
+    async fn driver_and_handler() -> (Arc<SipChannelDriver>, Arc<SipEventHandler>) {
+        let transport: Arc<dyn crate::transport::SipTransport> = Arc::new(
+            crate::transport::UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let driver = Arc::new(SipChannelDriver::new("127.0.0.1:0".parse().unwrap()));
+        driver.set_transport(transport.clone());
+        let handler = Arc::new(SipEventHandler::new(
+            Arc::new(asterisk_core::pbx::Dialplan::new()),
+            transport,
+        ));
+        handler.set_channel_driver(driver.clone());
+        (driver, handler)
+    }
+
+    #[tokio::test]
+    async fn send_bye_for_channel_releases_driver_entry() {
+        let (driver, handler) = driver_and_handler().await;
+
+        // An outbound leg: request() binds an RTP socket and inserts a
+        // driver channel-map entry.
+        let ch = driver
+            .request("sip:bob@127.0.0.1:5060", None)
+            .await
+            .expect("outbound request");
+        // Register its Call-ID/session as call() would, so the BYE path runs.
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        handler.register_outbound_callid("out-1", &ch.name);
+        handler.register_outbound_session(
+            "out-1",
+            &ch.name,
+            SipSession::new_outbound("127.0.0.1:0".parse().unwrap(), remote),
+            remote,
+        );
+        assert_eq!(driver.active_channel_count(), 1);
+
+        handler.send_bye_for_channel(&ch.name).await;
+
+        assert_eq!(
+            driver.active_channel_count(),
+            0,
+            "outbound leg's RTP socket / driver entry must be released on hangup"
+        );
+        assert_eq!(handler.active_calls(), 0, "Call-ID bookkeeping must be cleared");
+    }
+
+    #[tokio::test]
+    async fn release_outbound_leg_frees_driver_entry_without_session() {
+        let (driver, handler) = driver_and_handler().await;
+
+        // A leg that never reached call() (no Call-ID/session) still holds a
+        // bound RTP socket — abandoning it must free that socket.
+        let ch = driver
+            .request("sip:carol@127.0.0.1:5060", None)
+            .await
+            .expect("outbound request");
+        assert_eq!(driver.active_channel_count(), 1);
+
+        handler.release_outbound_leg(&ch.name);
+
+        assert_eq!(
+            driver.active_channel_count(),
+            0,
+            "abandoned leg's RTP socket / driver entry must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_bye_releases_outbound_driver_entry() {
+        let (driver, handler) = driver_and_handler().await;
+
+        let ch = driver
+            .request("sip:dave@127.0.0.1:5060", None)
+            .await
+            .expect("outbound request");
+        handler.register_outbound_callid("bye-call-1", &ch.name);
+        assert_eq!(driver.active_channel_count(), 1);
+
+        // Remote sends a BYE for this call.
+        let bye_raw = "BYE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbye1\r\n\
+             From: <sip:dave@127.0.0.1>;tag=f1\r\n\
+             To: <sip:asterisk@127.0.0.1>;tag=t1\r\n\
+             Call-ID: bye-call-1\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\r\n";
+        let bye = SipMessage::parse(bye_raw.as_bytes()).unwrap();
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        handler.handle_bye(&bye, remote).await;
+
+        assert_eq!(
+            driver.active_channel_count(),
+            0,
+            "remote BYE on an outbound leg must release its RTP socket / driver entry"
+        );
     }
 
     #[test]

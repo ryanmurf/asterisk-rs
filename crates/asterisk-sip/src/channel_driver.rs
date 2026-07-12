@@ -192,10 +192,19 @@ impl SipChannelDriver {
 
     /// Remove a channel's private data (and its RTP socket) from the driver.
     ///
-    /// Used to tear down the inbound media plane when a call ends, so bound
-    /// RTP sockets are not leaked in the driver's channel map.
+    /// Used to tear down the media plane when a call ends, so bound RTP
+    /// sockets are not leaked in the driver's channel map. Idempotent — a
+    /// no-op if the channel is already gone.
     pub fn remove_channel(&self, name: &str) {
         self.remove_private(name);
+    }
+
+    /// Number of channels currently in the driver's map. Each entry owns a
+    /// bound RTP socket, so this is the live measure of media-plane resource
+    /// usage — used by tests to assert legs are released rather than leaked
+    /// (issue #28).
+    pub fn active_channel_count(&self) -> usize {
+        self.channels.read().len()
     }
 
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
