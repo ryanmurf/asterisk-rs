@@ -23,7 +23,7 @@ jobs:
             artifact: rustisk
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release
@@ -34,6 +34,6 @@ jobs:
           cp LICENSE README.md dist/
           tar czf rustisk-${{ matrix.target }}.tar.gz -C dist .
       - name: Upload Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: rustisk-*.tar.gz
