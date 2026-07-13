@@ -465,6 +465,12 @@ impl SipEventHandler {
                     if let Some(pt) = negotiated_payload_type(&remote_sdp, &self.supported_codecs) {
                         rtp.payload_type = pt;
                     }
+                    if let Some(pt) = crate::sdp_rtp::negotiated_dtmf_payload_type(
+                        &remote_sdp,
+                        &self.supported_codecs,
+                    ) {
+                        rtp.set_dtmf_payload_type(pt);
+                    }
                     // Store the REAL inbound session (carries the INVITE,
                     // is_outbound = false) so driver.indicate()/hangup()
                     // work on this channel instead of silently no-opping on
@@ -926,8 +932,10 @@ impl SipEventHandler {
                 };
                 if let Some(cs_arc) = cs_arc {
                     let mut cs = cs_arc.lock().await;
+                    let mut negotiated_sdp = None;
                     if cs.session.is_outbound {
                         cs.session.on_response(response);
+                        negotiated_sdp = cs.session.remote_sdp.clone();
                         if let Some(ack) = cs.session.build_ack() {
                             if let Err(e) = self.transport.send(&ack, remote_addr).await {
                                 warn!(call_id = %call_id, "Failed to send ACK: {}", e);
@@ -936,6 +944,22 @@ impl SipEventHandler {
                             }
                         } else {
                             eprintln!("[DEBUG] Failed to build ACK for call_id={}", call_id);
+                        }
+                    }
+                    drop(cs);
+
+                    if let (Some(driver), Some(sdp)) =
+                        (self.channel_driver.get(), negotiated_sdp.as_ref())
+                    {
+                        if let Err(e) = driver
+                            .install_negotiated_dtmf_payload(&channel_name, sdp)
+                            .await
+                        {
+                            warn!(
+                                call_id = %call_id,
+                                "Failed to install negotiated telephone-event payload type: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -1537,6 +1561,9 @@ fn negotiated_payload_type(sdp: &SessionDescription, supported: &[Codec]) -> Opt
         .iter()
         .find(|m| m.media_type == "audio")?;
     for oc in media.codecs() {
+        if oc.name.eq_ignore_ascii_case("telephone-event") {
+            continue;
+        }
         for sc in supported {
             if oc.name.eq_ignore_ascii_case(&sc.name) && oc.sample_rate == sc.sample_rate {
                 return Some(oc.payload_type);
