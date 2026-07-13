@@ -1986,6 +1986,16 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                                 } => {
                                     event_handler.handle_bye(&request, remote_addr).await;
                                 }
+                                asterisk_sip::stack::SipEvent::IncomingCancel {
+                                    call_id: _,
+                                    request,
+                                    remote_addr,
+                                } => {
+                                    // The stack already sent 200-to-CANCEL and
+                                    // 487-to-INVITE; abort the channel and its
+                                    // dialplan execution (issue #55).
+                                    event_handler.handle_cancel(&request, remote_addr).await;
+                                }
                                 asterisk_sip::stack::SipEvent::IncomingRequest {
                                     request,
                                     remote_addr,

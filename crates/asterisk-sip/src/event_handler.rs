@@ -756,6 +756,46 @@ impl SipEventHandler {
         }
     }
 
+    /// Handle an incoming CANCEL that terminated a pending INVITE (issue #55).
+    ///
+    /// The stack's transaction layer has already answered on the wire (200 OK
+    /// to the CANCEL, 487 Request Terminated to the INVITE, RFC 3261 §9.2);
+    /// this aborts the application side: soft-hangup the channel so the
+    /// running dialplan (Wait(), Echo(), ...) unwinds, and drop the call
+    /// state so a later Answer() can no longer emit a 200 OK for a call the
+    /// caller already abandoned. Mirrors the teardown in `handle_bye`; the
+    /// spawned per-call cleanup task finalizes the media plane once the call
+    /// state disappears.
+    pub async fn handle_cancel(&self, request: &SipMessage, _remote_addr: SocketAddr) {
+        let Some(call_id) = request.call_id() else {
+            return;
+        };
+        let call_id = call_id.to_string();
+
+        let channel_name = {
+            let map = self.callid_map.read();
+            map.get(&call_id).cloned()
+        };
+
+        if let Some(name) = channel_name {
+            crate::notify_service::global_notify_service().unregister_channel(&name);
+            if let Some(channel) = store::find_by_name(&name) {
+                let mut ch = channel.lock();
+                ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+            }
+            if let Some(driver) = self.channel_driver.get() {
+                driver.remove_channel(&name);
+            }
+            info!(call_id = %call_id, channel = %name, "CANCEL aborted pending call");
+        }
+
+        self.callid_map.write().remove(&call_id);
+        self.call_states.write().remove(&call_id);
+
+        // Notify any SFU conferences that this SIP call ended.
+        crate::notify_sip_hangup(&call_id);
+    }
+
     /// Handle an incoming SIP REGISTER request.
     ///
     /// Routes the request to the registrar (contact binding + expiry) and sends
@@ -1561,6 +1601,47 @@ mod tests {
             driver.active_channel_count(),
             0,
             "remote BYE on an outbound leg must release its RTP socket / driver entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_releases_call_state_and_driver_entry() {
+        let (driver, handler) = driver_and_handler().await;
+
+        // A leg with registered call state, as an in-flight call would have.
+        let ch = driver
+            .request("sip:erin@127.0.0.1:5060", None)
+            .await
+            .expect("request");
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        handler.register_outbound_callid("cancel-call-1", &ch.name);
+        handler.register_outbound_session(
+            "cancel-call-1",
+            &ch.name,
+            SipSession::new_outbound("127.0.0.1:0".parse().unwrap(), remote),
+            remote,
+        );
+        assert_eq!(driver.active_channel_count(), 1);
+
+        let cancel_raw = "CANCEL sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcxl1\r\n\
+             From: <sip:erin@127.0.0.1>;tag=f1\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: cancel-call-1\r\n\
+             CSeq: 1 CANCEL\r\n\
+             Content-Length: 0\r\n\r\n";
+        let cancel = SipMessage::parse(cancel_raw.as_bytes()).unwrap();
+        handler.handle_cancel(&cancel, remote).await;
+
+        assert_eq!(
+            driver.active_channel_count(),
+            0,
+            "CANCEL must release the leg's RTP socket / driver entry"
+        );
+        assert_eq!(
+            handler.active_calls(),
+            0,
+            "call state must be dropped so a later Answer() cannot send 200 OK"
         );
     }
 

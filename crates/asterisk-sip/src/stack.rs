@@ -43,6 +43,15 @@ pub enum SipEvent {
         request: SipMessage,
         remote_addr: SocketAddr,
     },
+    /// A CANCEL was received that terminated a pending INVITE. The stack has
+    /// already answered at the transaction layer (200 OK to the CANCEL, 487
+    /// Request Terminated to the INVITE, RFC 3261 §9.2); the application
+    /// layer must abort the channel and its dialplan execution.
+    IncomingCancel {
+        call_id: String,
+        request: SipMessage,
+        remote_addr: SocketAddr,
+    },
     /// A non-INVITE request was received (OPTIONS, REGISTER, etc.).
     IncomingRequest {
         request: SipMessage,
@@ -104,15 +113,29 @@ impl TransactionLayer {
         None
     }
 
-    /// Match an incoming request to a server transaction, or return None
-    /// if it is a new request.
-    fn match_request(&self, request: &SipMessage) -> Option<String> {
+    /// Match an incoming request against an existing server transaction and,
+    /// if it is a retransmission, return `Some(last_response)` to replay
+    /// (`Some(None)` when no response has been sent yet). Returns `None` for
+    /// a new request.
+    ///
+    /// Per RFC 3261 §17.2.3 a request matches a server transaction only if
+    /// the top-Via branch AND the method match (ACK matches its INVITE and is
+    /// routed separately before this check is consulted for it). Matching on
+    /// branch alone silently swallowed CANCELs — a CANCEL reuses the
+    /// cancelled INVITE's branch (§9.1) and was absorbed here as an "INVITE
+    /// retransmission" with nothing to replay (issue #55).
+    fn matched_retransmission(&self, request: &SipMessage) -> Option<Option<SipMessage>> {
         let branch = Self::extract_branch(request)?;
-        if self.invite_server_txns.contains_key(&branch) {
-            return Some(branch);
+        let method = request.method()?;
+        if let Some(txn) = self.invite_server_txns.get(&branch) {
+            if txn.request.method() == Some(method) {
+                return Some(txn.last_response.clone());
+            }
         }
-        if self.non_invite_server_txns.contains_key(&branch) {
-            return Some(branch);
+        if let Some(txn) = self.non_invite_server_txns.get(&branch) {
+            if txn.request.method() == Some(method) {
+                return Some(txn.last_response.clone());
+            }
         }
         None
     }
@@ -427,25 +450,16 @@ impl SipStack {
         // so transaction matching is unaffected (issue #27).
         request.stamp_via_received_rport(src);
 
-        // Check for retransmission (existing server transaction)
-        // Extract the response to retransmit (if any) without holding the lock across await.
-        let retransmit_response;
-        {
+        // Check for retransmission (existing server transaction with the same
+        // branch AND method, RFC 3261 §17.2.3). Extract the response to
+        // replay (if any) without holding the lock across await.
+        let retransmit_response = {
             let txn_layer = self.transaction_layer.read();
-            retransmit_response = if let Some(branch) = txn_layer.match_request(&request) {
-                debug!(branch = %branch, "Retransmission of existing request");
-                let resp = txn_layer
-                    .invite_server_txns
-                    .get(&branch)
-                    .and_then(|txn| txn.last_response.clone());
-                Some(resp)
-            } else {
-                None
-            };
-            drop(txn_layer);
-        }
+            txn_layer.matched_retransmission(&request)
+        };
 
         if let Some(maybe_resp) = retransmit_response {
+            debug!(method = ?method, "Retransmission of existing request");
             if let Some(resp) = maybe_resp {
                 let _ = self.transport.send(&resp, src).await;
             }
@@ -483,6 +497,9 @@ impl SipStack {
                     }
                 }
             }
+            SipMethod::Cancel => {
+                self.handle_cancel_request(request, src).await;
+            }
             SipMethod::Bye => {
                 // Create non-INVITE server transaction
                 let branch = TransactionLayer::extract_branch(&request)
@@ -517,6 +534,86 @@ impl SipStack {
                 })
                 .await;
             }
+        }
+    }
+
+    /// Handle an incoming CANCEL (RFC 3261 §9.2).
+    ///
+    /// A CANCEL forms its own (non-INVITE) server transaction but is matched
+    /// to the INVITE it cancels by the shared top-Via branch (§9.1). The
+    /// transaction layer answers both sides itself — `200 OK` to the CANCEL
+    /// and `487 Request Terminated` to the still-pending INVITE — recording
+    /// each in its transaction so retransmissions replay correctly. The
+    /// application layer is then told via `IncomingCancel` to abort the
+    /// channel and its dialplan. A CANCEL that arrives after the INVITE got
+    /// its final response still gets `200 OK` but has no further effect; a
+    /// CANCEL matching no transaction gets `481` (§9.2).
+    async fn handle_cancel_request(&self, request: SipMessage, src: SocketAddr) {
+        let branch = TransactionLayer::extract_branch(&request)
+            .unwrap_or_else(|| format!("z9hG4bK{}", uuid::Uuid::new_v4()));
+
+        // Resolve everything under one lock; send after dropping it.
+        let (cancel_response, invite_response, cancelled_call_id) = {
+            let mut txn_layer = self.transaction_layer.write();
+
+            let mut invite_response = None;
+            let mut cancelled_call_id = None;
+
+            let cancel_response = match txn_layer.invite_server_txns.get_mut(&branch) {
+                Some(invite_txn) => {
+                    if invite_txn.state == crate::transaction::InviteServerState::Proceeding {
+                        // INVITE still pending: terminate it with 487.
+                        if let Ok(resp) =
+                            invite_txn.request.create_response(487, "Request Terminated")
+                        {
+                            invite_txn.send_final(resp.clone());
+                            invite_response = Some(resp);
+                        }
+                        cancelled_call_id =
+                            request.call_id().map(|s| s.to_string());
+                    } else {
+                        // Final response already sent; the CANCEL still gets
+                        // its 200 OK but has no effect (§9.2).
+                        debug!(branch = %branch, "CANCEL after final response; no effect");
+                    }
+                    request.create_response(200, "OK").ok()
+                }
+                None => {
+                    debug!(branch = %branch, "CANCEL matched no INVITE transaction");
+                    request
+                        .create_response(481, "Call/Transaction Does Not Exist")
+                        .ok()
+                }
+            };
+
+            // Absorb CANCEL retransmissions: give the CANCEL its own server
+            // transaction with the response recorded for replay.
+            let mut cancel_txn =
+                NonInviteServerTransaction::new(request.clone(), src, branch.clone());
+            if let Some(ref resp) = cancel_response {
+                cancel_txn.send_final(resp.clone());
+            }
+            txn_layer
+                .non_invite_server_txns
+                .insert(branch.clone(), cancel_txn);
+
+            (cancel_response, invite_response, cancelled_call_id)
+        };
+
+        if let Some(resp) = cancel_response {
+            let _ = self.transport.send(&resp, src).await;
+        }
+        if let Some(resp) = invite_response {
+            info!(branch = %branch, "CANCEL terminated pending INVITE; sent 487");
+            let _ = self.transport.send(&resp, src).await;
+        }
+        if let Some(call_id) = cancelled_call_id {
+            self.emit_event(SipEvent::IncomingCancel {
+                call_id,
+                request,
+                remote_addr: src,
+            })
+            .await;
         }
     }
 
@@ -863,5 +960,158 @@ mod tests {
         }
 
         handler.await.unwrap();
+    }
+
+    /// Build a minimal INVITE for feeding handle_request directly.
+    fn build_invite_request(call_id: &str, branch: &str) -> SipMessage {
+        let raw = format!(
+            "INVITE sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1;branch={branch}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=c55\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:caller@127.0.0.1:5062>\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    /// Build the CANCEL for `build_invite_request` (same branch, RFC 3261 §9.1).
+    fn build_cancel_request(call_id: &str, branch: &str) -> SipMessage {
+        let raw = format!(
+            "CANCEL sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1;branch={branch}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=c55\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 CANCEL\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    /// Receive one SIP datagram on the test peer socket, bounded by 2s.
+    async fn recv_peer(sock: &tokio::net::UdpSocket) -> SipMessage {
+        let mut buf = [0u8; 4096];
+        let (len, _src) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for a SIP response")
+            .expect("recv failed");
+        SipMessage::parse(&buf[..len]).expect("response must parse")
+    }
+
+    /// Regression test for issue #55: a CANCEL matching a pending INVITE must
+    /// get 200 OK, the INVITE must get 487 Request Terminated, and the
+    /// application layer must see an IncomingCancel event (RFC 3261 §9.2).
+    /// Before the fix, branch-only transaction matching swallowed the CANCEL
+    /// as an "INVITE retransmission" and nothing happened at all.
+    #[tokio::test]
+    async fn test_cancel_terminates_pending_invite() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let branch = "z9hG4bKcxl55";
+        stack
+            .handle_request(build_invite_request("cancel-55-1", branch), peer_addr)
+            .await;
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(matches!(event, SipEvent::IncomingInvite { .. }));
+
+        stack
+            .handle_request(build_cancel_request("cancel-55-1", branch), peer_addr)
+            .await;
+
+        // Both responses arrive on the wire (order not significant): 200 for
+        // the CANCEL transaction, 487 for the INVITE transaction.
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let resp = recv_peer(&peer).await;
+            got.push((
+                resp.status_code().unwrap_or(0),
+                resp.get_header(header_names::CSEQ).unwrap_or("").to_string(),
+            ));
+        }
+        assert!(
+            got.contains(&(200, "1 CANCEL".to_string())),
+            "CANCEL must be answered 200 OK, got {:?}",
+            got
+        );
+        assert!(
+            got.contains(&(487, "1 INVITE".to_string())),
+            "pending INVITE must be terminated with 487, got {:?}",
+            got
+        );
+
+        // The application layer is told to abort the channel.
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("IncomingCancel event never emitted")
+            .expect("channel closed");
+        match event {
+            SipEvent::IncomingCancel { call_id, .. } => {
+                assert_eq!(call_id, "cancel-55-1");
+            }
+            other => panic!("Expected IncomingCancel, got {:?}", other),
+        }
+
+        // Retransmitted CANCEL replays the CANCEL's 200 (not the INVITE's
+        // 487): server-transaction matching is branch AND method (§17.2.3).
+        stack
+            .handle_request(build_cancel_request("cancel-55-1", branch), peer_addr)
+            .await;
+        let resp = recv_peer(&peer).await;
+        assert_eq!(resp.status_code(), Some(200));
+        assert_eq!(resp.get_header(header_names::CSEQ), Some("1 CANCEL"));
+
+        // Retransmitted INVITE replays the recorded 487 and must NOT re-emit
+        // IncomingInvite (it is a retransmission, not a new call).
+        stack
+            .handle_request(build_invite_request("cancel-55-1", branch), peer_addr)
+            .await;
+        let resp = recv_peer(&peer).await;
+        assert_eq!(resp.status_code(), Some(487));
+        assert_eq!(resp.get_header(header_names::CSEQ), Some("1 INVITE"));
+        assert!(
+            rx.try_recv().is_err(),
+            "retransmissions must not emit further events"
+        );
+    }
+
+    /// A CANCEL matching no INVITE transaction gets 481 Call/Transaction
+    /// Does Not Exist (RFC 3261 §9.2) and no application event.
+    #[tokio::test]
+    async fn test_cancel_unknown_transaction_gets_481() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        stack
+            .handle_request(
+                build_cancel_request("cancel-55-unknown", "z9hG4bKnosuch"),
+                peer_addr,
+            )
+            .await;
+
+        let resp = recv_peer(&peer).await;
+        assert_eq!(
+            resp.status_code(),
+            Some(481),
+            "CANCEL with no matching INVITE must get 481"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an unmatched CANCEL must not reach the application layer"
+        );
     }
 }
