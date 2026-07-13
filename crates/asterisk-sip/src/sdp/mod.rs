@@ -836,9 +836,144 @@ pub enum SdpError {
     Parse(String),
 }
 
+/// Pick the concrete IP address to advertise in SDP `c=`/`o=` lines toward
+/// `remote` (issue #56).
+///
+/// Never returns the unspecified address for a routable peer: `c=IN IP4
+/// 0.0.0.0` is not a valid media destination in an active session
+/// (RFC 3264 §5.1 reserves it for hold/black-hole semantics), so
+/// advertising the raw INADDR_ANY bind blackholes audio for any peer that
+/// honors the answer's c-line and lacks symmetric-RTP latching.
+///
+/// Selection order, mirroring pjsip's NAT handling:
+/// 1. a transport's configured `external_media_address`, unless the peer
+///    falls inside that transport's `local_net` CIDRs;
+/// 2. the concrete local bind address, when there is one;
+/// 3. for an unspecified bind (`0.0.0.0`/`::`), the local interface the
+///    kernel routes toward the peer.
+pub fn advertised_media_ip(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> String {
+    let (external, local_net) = match crate::pjsip_config::get_global_pjsip_config() {
+        Some(cfg) => {
+            // Prefer the transport bound to this local address; fall back to
+            // any transport that configures an external media address.
+            let transport = cfg
+                .transports
+                .iter()
+                .find(|t| t.external_media_address.is_some() && t.bind.ip() == local.ip())
+                .or_else(|| {
+                    cfg.transports
+                        .iter()
+                        .find(|t| t.external_media_address.is_some())
+                });
+            match transport {
+                Some(t) => (t.external_media_address.clone(), t.local_net.clone()),
+                None => (None, Vec::new()),
+            }
+        }
+        None => (None, Vec::new()),
+    };
+    advertised_media_ip_with(external.as_deref(), &local_net, local, remote)
+}
+
+/// Testable core of [`advertised_media_ip`] (config plumbed in explicitly).
+fn advertised_media_ip_with(
+    external: Option<&str>,
+    local_net: &[String],
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> String {
+    // 1. A configured NAT address wins for peers outside local_net.
+    if let Some(ext) = external.filter(|e| !e.is_empty()) {
+        let peer_is_local = local_net.iter().any(|cidr| {
+            crate::acl::AclRule::permit(cidr)
+                .map(|rule| rule.matches(&remote.ip()))
+                .unwrap_or(false)
+        });
+        if !peer_is_local {
+            return ext.to_string();
+        }
+    }
+
+    // 2. A concrete bound address is advertised as-is.
+    if !local.ip().is_unspecified() {
+        return local.ip().to_string();
+    }
+
+    // 3. Bound to INADDR_ANY: let the kernel pick the interface it would
+    //    route to the peer from. connect() on a UDP socket performs route
+    //    selection without sending any packet.
+    let wildcard = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    if let Ok(sock) = std::net::UdpSocket::bind(wildcard) {
+        if sock.connect(remote).is_ok() {
+            if let Ok(resolved) = sock.local_addr() {
+                if !resolved.ip().is_unspecified() {
+                    return resolved.ip().to_string();
+                }
+            }
+        }
+    }
+
+    // 4. No route to the peer: keep the bind address (previous behaviour)
+    //    rather than inventing one.
+    local.ip().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- advertised_media_ip (issue #56) --------------------------------
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A concrete bound address is advertised unchanged.
+    #[test]
+    fn test_media_ip_concrete_bind_passes_through() {
+        assert_eq!(
+            advertised_media_ip_with(None, &[], sa("192.0.2.10:5060"), sa("198.51.100.7:5060")),
+            "192.0.2.10"
+        );
+    }
+
+    /// INADDR_ANY must never be advertised: the routed interface toward the
+    /// peer is used instead (loopback peer -> loopback source).
+    #[test]
+    fn test_media_ip_unspecified_resolves_routable_source() {
+        let ip = advertised_media_ip_with(None, &[], sa("0.0.0.0:5060"), sa("127.0.0.1:5062"));
+        assert_ne!(ip, "0.0.0.0", "must never advertise INADDR_ANY (issue #56)");
+        assert_eq!(ip, "127.0.0.1", "loopback peer routes via loopback");
+    }
+
+    /// A configured external_media_address wins for a peer outside local_net.
+    #[test]
+    fn test_media_ip_external_applies_to_nonlocal_peer() {
+        assert_eq!(
+            advertised_media_ip_with(
+                Some("203.0.113.99"),
+                &["10.0.0.0/8".to_string()],
+                sa("0.0.0.0:5060"),
+                sa("198.51.100.7:5060"),
+            ),
+            "203.0.113.99"
+        );
+    }
+
+    /// A peer inside local_net bypasses the external address and gets the
+    /// real local/routed one.
+    #[test]
+    fn test_media_ip_local_net_peer_bypasses_external() {
+        assert_eq!(
+            advertised_media_ip_with(
+                Some("203.0.113.99"),
+                &["127.0.0.0/8".to_string()],
+                sa("127.0.0.1:5060"),
+                sa("127.0.0.1:5062"),
+            ),
+            "127.0.0.1"
+        );
+    }
 
     #[test]
     fn test_parse_sdp() {

@@ -367,8 +367,12 @@ impl SipEventHandler {
         //    select the negotiated payload type, then attach it to the channel
         //    via the driver so `read_frame`/`write_frame` (and thus `Echo`) can
         //    move media. The SDP answer advertises the socket's REAL port —
-        //    never the old hardcoded 10000 (issues #7, #8, #9).
-        let local_ip = session.local_addr.ip().to_string();
+        //    never the old hardcoded 10000 (issues #7, #8, #9) — and a
+        //    concrete, routable connection address: external_media_address
+        //    when configured, else the interface routed toward the caller.
+        //    Advertising a raw INADDR_ANY bind as `c=IN IP4 0.0.0.0`
+        //    blackholed audio for peers without symmetric RTP (issue #56).
+        let local_ip = crate::sdp::advertised_media_ip(session.local_addr, remote_addr);
         if let Some(remote_sdp) = session.remote_sdp.clone() {
             let mut answer_port: u16 = 0;
 
@@ -1057,8 +1061,10 @@ impl SipEventHandler {
             None => 10000,
         };
 
-        // Generate SDP answer
-        let local_ip = session.local_addr.ip().to_string();
+        // Generate SDP answer with a concrete, routable connection address
+        // (external_media_address / routed interface — never 0.0.0.0,
+        // issue #56).
+        let local_ip = crate::sdp::advertised_media_ip(session.local_addr, remote_addr);
         let answer_sdp = if let Some(ref offer) = remote_sdp {
             let answer = SessionDescription::create_answer(
                 offer,

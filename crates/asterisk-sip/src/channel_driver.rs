@@ -303,9 +303,11 @@ impl ChannelDriver for SipChannelDriver {
         // Create SIP session
         let mut sip_session = SipSession::new_outbound(self.local_addr, remote_addr);
 
-        // Create SDP offer
+        // Create SDP offer with a concrete, routable connection address
+        // (external_media_address / routed interface — never 0.0.0.0,
+        // issue #56).
         let sdp = SessionDescription::create_offer(
-            &self.local_addr.ip().to_string(),
+            &crate::sdp::advertised_media_ip(self.local_addr, remote_addr),
             rtp_port,
             &self.codecs,
         );
