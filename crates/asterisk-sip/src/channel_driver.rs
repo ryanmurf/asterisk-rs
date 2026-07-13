@@ -18,7 +18,7 @@ use asterisk_codecs::{codecs, Codec};
 use asterisk_core::channel::{Channel, ChannelDriver};
 use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
 
-use crate::rtp::RtpSession;
+use crate::rtp::{RtpPortAllocator, RtpPortRange, RtpSession};
 use crate::sdp::SessionDescription;
 use crate::session::{SessionState, SipSession};
 use crate::transport::{SipTransport, UdpTransport};
@@ -71,6 +71,8 @@ pub struct SipChannelDriver {
     transport: RwLock<Option<Arc<dyn SipTransport>>>,
     /// Supported codecs.
     codecs: Vec<Codec>,
+    /// Shared bounded allocator used by inbound and outbound RTP legs.
+    rtp_allocator: Arc<RtpPortAllocator>,
     /// Inbound registrar, shared from the event handler at startup. When set,
     /// [`Self::request`] prefers a live dynamic contact binding over the
     /// static AoR contact so registered devices are reachable (issue #33).
@@ -82,6 +84,7 @@ impl fmt::Debug for SipChannelDriver {
         f.debug_struct("SipChannelDriver")
             .field("local_addr", &self.local_addr)
             .field("active_channels", &self.channels.read().len())
+            .field("rtp_port_range", &self.rtp_allocator.range())
             .finish()
     }
 }
@@ -89,6 +92,11 @@ impl fmt::Debug for SipChannelDriver {
 impl SipChannelDriver {
     /// Create a new SIP channel driver.
     pub fn new(local_addr: SocketAddr) -> Self {
+        Self::with_rtp_port_range(local_addr, RtpPortRange::default())
+    }
+
+    /// Create a SIP channel driver with a validated bounded RTP range.
+    pub fn with_rtp_port_range(local_addr: SocketAddr, range: RtpPortRange) -> Self {
         Self {
             local_addr,
             channels: RwLock::new(HashMap::new()),
@@ -97,8 +105,17 @@ impl SipChannelDriver {
                 codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
             ],
+            rtp_allocator: Arc::new(RtpPortAllocator::new(range)),
             registrar: RwLock::new(None),
         }
+    }
+
+    /// Allocate an RTP session for either side of the SIP event/driver path.
+    pub(crate) async fn allocate_rtp_session(
+        &self,
+        bind_ip: std::net::IpAddr,
+    ) -> AsteriskResult<RtpSession> {
+        self.rtp_allocator.allocate(bind_ip).await
     }
 
     /// Share the inbound registrar so outbound `request()` can resolve a
@@ -296,8 +313,7 @@ impl ChannelDriver for SipChannelDriver {
         };
 
         // Create RTP session
-        let rtp_bind = SocketAddr::new(self.local_addr.ip(), 0);
-        let rtp_session = RtpSession::bind(rtp_bind).await?;
+        let rtp_session = self.allocate_rtp_session(self.local_addr.ip()).await?;
         let rtp_port = rtp_session.local_addr()?.port();
 
         // Create SIP session
@@ -755,6 +771,54 @@ mod tests {
             driver.channel_rtp_local_port("PJSIP/does-not-exist").await,
             None,
             "unknown channel must return None"
+        );
+    }
+
+    /// Regression for issue #70: call RTP allocation must stay inside the
+    /// configured range, report exhaustion, and release the reservation when
+    /// channel teardown drops the owning session.
+    #[tokio::test]
+    async fn bounded_call_rtp_range_exhausts_and_reuses_after_hangup() {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind(local).await.unwrap(),
+        );
+        let range = RtpPortRange::new(rtp_port, rtp_port).unwrap();
+        let driver = SipChannelDriver::with_rtp_port_range(local, range);
+        driver.set_transport(transport);
+
+        let mut first = driver
+            .request("sip:first@127.0.0.1:9", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.channel_rtp_local_port(&first.name).await,
+            Some(rtp_port)
+        );
+
+        let exhausted = driver
+            .request("sip:second@127.0.0.1:9", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            exhausted,
+            AsteriskError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::AddrNotAvailable
+                    && error.to_string().contains("exhausted")
+        ));
+
+        driver.hangup(&mut first).await.unwrap();
+        let reused = driver
+            .request("sip:third@127.0.0.1:9", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.channel_rtp_local_port(&reused.name).await,
+            Some(rtp_port)
         );
     }
 

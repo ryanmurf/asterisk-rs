@@ -252,13 +252,15 @@ async fn e2e_inbound_register_auth_and_media_echo() {
         .find(|m| m.media_type == "audio")
         .expect("answer must contain an audio stream");
     assert_ne!(audio.port, 0, "answer must advertise a live RTP port");
-    assert_ne!(
-        audio.port, 10000,
-        "answer port must be the real bound socket, not the old hardcoded 10000 (issue #8)"
+    assert!(
+        (asterisk_sip::rtp::DEFAULT_RTP_PORT_START
+            ..=asterisk_sip::rtp::DEFAULT_RTP_PORT_END)
+            .contains(&audio.port),
+        "answer port must be inside the configured default RTP range"
     );
     let media_addr: SocketAddr = format!("127.0.0.1:{}", audio.port).parse().unwrap();
     println!(
-        "[E2E] INVITE (qop=auth) -> 100 Trying -> 200 OK; SDP answer RTP port = {} (bound socket, not 10000)",
+        "[E2E] INVITE (qop=auth) -> 100 Trying -> 200 OK; SDP answer RTP port = {} (bounded socket)",
         audio.port
     );
 

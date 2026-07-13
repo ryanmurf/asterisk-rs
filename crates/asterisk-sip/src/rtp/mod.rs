@@ -18,6 +18,7 @@ pub mod ice_transport;
 pub mod mos;
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +38,144 @@ const RTP_MAX_MTU: usize = 1500;
 const RTCP_PT_SR: u8 = 200;
 /// RTCP receiver report type.
 const RTCP_PT_RR: u8 = 201;
+
+/// Default inclusive RTP range used when `rtp.conf` is absent.
+pub const DEFAULT_RTP_PORT_START: u16 = 10000;
+pub const DEFAULT_RTP_PORT_END: u16 = 20000;
+
+/// Validated inclusive RTP port range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpPortRange {
+    start: u16,
+    end: u16,
+}
+
+impl RtpPortRange {
+    /// Create a non-zero inclusive port range.
+    pub fn new(start: u16, end: u16) -> AsteriskResult<Self> {
+        if start == 0 || end == 0 {
+            return Err(AsteriskError::InvalidArgument(
+                "RTP port range must not include port 0".to_string(),
+            ));
+        }
+        if start > end {
+            return Err(AsteriskError::InvalidArgument(format!(
+                "RTP port range start {} exceeds end {}",
+                start, end
+            )));
+        }
+        Ok(Self { start, end })
+    }
+
+    /// Parse Asterisk-compatible `[general] rtpstart/rtpend` settings.
+    pub fn from_config(config: &asterisk_config::AsteriskConfig) -> AsteriskResult<Self> {
+        let start = parse_rtp_port(
+            config.get_variable("general", "rtpstart"),
+            DEFAULT_RTP_PORT_START,
+            "rtpstart",
+        )?;
+        let end = parse_rtp_port(
+            config.get_variable("general", "rtpend"),
+            DEFAULT_RTP_PORT_END,
+            "rtpend",
+        )?;
+        Self::new(start, end)
+    }
+
+    /// Load and validate an Asterisk-style `rtp.conf` file.
+    pub fn load(path: &Path) -> AsteriskResult<Self> {
+        let config = asterisk_config::AsteriskConfig::load(path)
+            .map_err(|e| AsteriskError::Parse(e.to_string()))?;
+        Self::from_config(&config)
+    }
+
+    pub fn start(self) -> u16 {
+        self.start
+    }
+
+    pub fn end(self) -> u16 {
+        self.end
+    }
+
+    pub fn capacity(self) -> u32 {
+        u32::from(self.end) - u32::from(self.start) + 1
+    }
+}
+
+impl Default for RtpPortRange {
+    fn default() -> Self {
+        Self {
+            start: DEFAULT_RTP_PORT_START,
+            end: DEFAULT_RTP_PORT_END,
+        }
+    }
+}
+
+fn parse_rtp_port(value: Option<&str>, default: u16, name: &str) -> AsteriskResult<u16> {
+    match value {
+        Some(value) => value.trim().parse::<u16>().map_err(|_| {
+            AsteriskError::InvalidArgument(format!(
+                "{} must be an integer from 1 through 65535, got '{}'",
+                name, value
+            ))
+        }),
+        None => Ok(default),
+    }
+}
+
+/// Concurrent allocator that binds sockets only inside one inclusive range.
+///
+/// The UDP socket itself is the reservation. Dropping the returned
+/// [`RtpSession`] releases the port, including when a channel is torn down.
+#[derive(Debug)]
+pub struct RtpPortAllocator {
+    range: RtpPortRange,
+    next_offset: AtomicU32,
+}
+
+impl RtpPortAllocator {
+    pub fn new(range: RtpPortRange) -> Self {
+        Self {
+            range,
+            next_offset: AtomicU32::new(0),
+        }
+    }
+
+    pub fn range(&self) -> RtpPortRange {
+        self.range
+    }
+
+    /// Bind the next available port in the configured range.
+    pub async fn allocate(&self, bind_ip: std::net::IpAddr) -> AsteriskResult<RtpSession> {
+        let capacity = self.range.capacity();
+        let first = self.next_offset.fetch_add(1, Ordering::Relaxed) % capacity;
+
+        for attempt in 0..capacity {
+            let offset = (first + attempt) % capacity;
+            let port = u32::from(self.range.start) + offset;
+            let addr = SocketAddr::new(bind_ip, port as u16);
+            match UdpSocket::bind(addr).await {
+                Ok(socket) => return Ok(RtpSession::from_socket(socket)),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => return Err(AsteriskError::Io(e)),
+            }
+        }
+
+        Err(AsteriskError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!(
+                "RTP port range {}-{} exhausted",
+                self.range.start, self.range.end
+            ),
+        )))
+    }
+}
+
+impl Default for RtpPortAllocator {
+    fn default() -> Self {
+        Self::new(RtpPortRange::default())
+    }
+}
 
 /// RTP header.
 #[derive(Debug, Clone)]
@@ -214,8 +353,12 @@ impl RtpSession {
     /// Bind an RTP session to a local address.
     pub async fn bind(addr: SocketAddr) -> AsteriskResult<Self> {
         let socket = UdpSocket::bind(addr).await?;
+        Ok(Self::from_socket(socket))
+    }
+
+    fn from_socket(socket: UdpSocket) -> Self {
         let ssrc = generate_ssrc();
-        Ok(Self {
+        Self {
             socket: Arc::new(socket),
             remote_addr: RwLock::new(None),
             ssrc,
@@ -225,7 +368,7 @@ impl RtpSession {
             dtmf_payload_type: 101,
             samples_per_packet: 160,
             stats: RtpStats::default(),
-        })
+        }
     }
 
     /// Get the local address.
@@ -807,6 +950,61 @@ pub fn rtcp_mux_negotiated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtp_port_range_parses_asterisk_config() {
+        let config = asterisk_config::AsteriskConfig::from_str(
+            "[general]\nrtpstart=20000\nrtpend=20100\n",
+            "rtp.conf",
+        )
+        .unwrap();
+
+        let range = RtpPortRange::from_config(&config).unwrap();
+
+        assert_eq!(range.start(), 20000);
+        assert_eq!(range.end(), 20100);
+        assert_eq!(range.capacity(), 101);
+    }
+
+    #[test]
+    fn rtp_port_range_rejects_zero_and_reversed_ranges() {
+        assert!(RtpPortRange::new(0, 10000).is_err());
+        assert!(RtpPortRange::new(10000, 0).is_err());
+        assert!(RtpPortRange::new(20000, 19999).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_allocator_exhausts_and_reuses_port_after_drop() {
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let range = RtpPortRange::new(port, port).unwrap();
+        let allocator = RtpPortAllocator::new(range);
+        let first = allocator
+            .allocate(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        assert_eq!(first.local_addr().unwrap().port(), port);
+
+        let exhausted = allocator
+            .allocate(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            exhausted,
+            AsteriskError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::AddrNotAvailable
+                    && error.to_string().contains("exhausted")
+        ));
+
+        drop(first);
+        let reused = allocator
+            .allocate(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        assert_eq!(reused.local_addr().unwrap().port(), port);
+    }
 
     // --- issue #34: symmetric-RTP latching --------------------------------
 
