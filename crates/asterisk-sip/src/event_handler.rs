@@ -38,6 +38,8 @@ struct CallState {
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
 pub struct SipEventHandler {
     dialplan: Arc<Dialplan>,
+    /// Configuration snapshot used for endpoint identification and auth.
+    pjsip_config: Option<Arc<crate::pjsip_config::PjsipConfig>>,
     /// Call-ID to channel name mapping for response/BYE routing.
     callid_map: Arc<RwLock<HashMap<String, String>>>,
     /// SIP transport for sending responses.
@@ -66,10 +68,27 @@ pub struct SipEventHandler {
 impl SipEventHandler {
     /// Create a new event handler with the given dialplan and transport.
     pub fn new(dialplan: Arc<Dialplan>, transport: Arc<dyn SipTransport>) -> Self {
+        Self::new_with_pjsip_config(
+            dialplan,
+            transport,
+            crate::pjsip_config::get_global_pjsip_config(),
+        )
+    }
+
+    /// Create an event handler with an explicit PJSIP configuration snapshot.
+    ///
+    /// Startup uses [`Self::new`]; this constructor keeps source-policy tests
+    /// independent of the process-global configuration.
+    pub fn new_with_pjsip_config(
+        dialplan: Arc<Dialplan>,
+        transport: Arc<dyn SipTransport>,
+        pjsip_config: Option<Arc<crate::pjsip_config::PjsipConfig>>,
+    ) -> Self {
         // Register transport with global notify service
         crate::notify_service::global_notify_service().set_transport(transport.clone());
         Self {
             dialplan,
+            pjsip_config,
             callid_map: Arc::new(RwLock::new(HashMap::new())),
             transport,
             call_states: Arc::new(RwLock::new(HashMap::new())),
@@ -124,6 +143,41 @@ impl SipEventHandler {
         remote_addr: SocketAddr,
         mut session: SipSession,
     ) -> Option<String> {
+        // Treat configured IP/CIDR identify rules as an allowlist. This must be
+        // the first policy decision: an untrusted source must not receive an
+        // auth challenge, probe dialplan existence, or create channel state.
+        // The transport source is authoritative here, never Via or From (RFC
+        // 3261 section 18.2.1).
+        let pjsip_config = self.pjsip_config.clone();
+        let matched_endpoint_name = match source_acl_endpoint(
+            pjsip_config.as_deref(),
+            remote_addr.ip(),
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(SourceAclDenied) => {
+                let call_id = request.call_id().unwrap_or("<missing>");
+                if let Ok(forbidden) = request.create_response(403, "Forbidden") {
+                    if self.may_send_invite_final(request, &forbidden) {
+                        if let Err(e) = self.transport.send(&forbidden, remote_addr).await {
+                            warn!(
+                                call_id,
+                                source = %remote_addr,
+                                "Failed to send source ACL rejection: {}",
+                                e
+                            );
+                        } else {
+                            warn!(
+                                call_id,
+                                source = %remote_addr,
+                                "Rejected INVITE from source outside configured identify CIDRs"
+                            );
+                        }
+                    }
+                }
+                return None;
+            }
+        };
+
         // 1. Extract caller info from From header
         let from = request.get_header("From")?;
         let caller_num = extract_user_from_header(from).unwrap_or_default();
@@ -165,9 +219,16 @@ impl SipEventHandler {
 
         // 4. Authenticate the request against configured endpoints.
         //    Build credentials from all endpoints that have auth configured.
-        let pjsip_config = crate::pjsip_config::get_global_pjsip_config();
-        let mut endpoint_context = "default".to_string();
-        let mut allow_overlap = true;
+        let mut endpoint_context = matched_endpoint_name
+            .as_deref()
+            .and_then(|name| pjsip_config.as_ref()?.find_endpoint(name))
+            .map(|endpoint| endpoint.context.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let mut allow_overlap = matched_endpoint_name
+            .as_deref()
+            .and_then(|name| pjsip_config.as_ref()?.find_endpoint(name))
+            .map(|endpoint| endpoint.allow_overlap)
+            .unwrap_or(true);
 
         if let Some(ref cfg) = pjsip_config {
             // Collect all auth credentials and their associated endpoint names
@@ -321,9 +382,6 @@ impl SipEventHandler {
         //    accountcode) are set before the Newchannel AMI event is emitted.
         //    In real Asterisk, the inbound PJSIP channel is named after the
         //    matched endpoint (e.g. PJSIP/alice-00000001), not the caller.
-        let matched_endpoint_name = pjsip_config.as_ref()
-            .and_then(|cfg| cfg.identify_endpoint_by_ip(&remote_addr.ip().to_string()))
-            .map(|s| s.to_string());
         let chan_label = matched_endpoint_name.as_deref().unwrap_or(&caller_num);
         let channel_name = format!(
             "PJSIP/{}-{:08}",
@@ -978,9 +1036,22 @@ impl SipEventHandler {
     /// inbound REGISTER received no response at all.
     pub async fn handle_register(&self, request: &SipMessage, remote_addr: SocketAddr) {
         let call_id = request.call_id().unwrap_or("").to_string();
+        let pjsip_config = self.pjsip_config.clone();
+
+        if source_acl_endpoint(pjsip_config.as_deref(), remote_addr.ip()).is_err() {
+            warn!(
+                call_id = %call_id,
+                source = %remote_addr,
+                "Rejected REGISTER from source outside configured identify CIDRs"
+            );
+            if let Ok(resp) = request.create_response(403, "Forbidden") {
+                let _ = self.transport.send(&resp, remote_addr).await;
+            }
+            return;
+        }
 
         // Enforce digest auth if any endpoint has credentials configured.
-        if let Some(cfg) = crate::pjsip_config::get_global_pjsip_config() {
+        if let Some(cfg) = pjsip_config {
             let mut creds: Vec<AuthCredentials> = Vec::new();
             for ep in &cfg.endpoints {
                 if let Some(ref auth_name) = ep.auth {
@@ -1381,6 +1452,36 @@ fn finalize_inbound_teardown(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceAclDenied;
+
+/// Apply configured `type=identify` IP/CIDR rules as a source allowlist.
+///
+/// A deployment that configures at least one `match=` entry has explicitly
+/// enabled source identification, so no match is a denial. Configurations
+/// without any IP match entries retain authenticated endpoint behavior; a
+/// `match_header` entry alone is not an IP source ACL.
+fn source_acl_endpoint(
+    config: Option<&crate::pjsip_config::PjsipConfig>,
+    source_ip: std::net::IpAddr,
+) -> Result<Option<String>, SourceAclDenied> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let acl_configured = config
+        .identifies
+        .iter()
+        .any(|identify| !identify.matches.is_empty());
+    if !acl_configured {
+        return Ok(None);
+    }
+
+    config
+        .identify_endpoint_by_ip(&source_ip.to_string())
+        .map(|endpoint| Some(endpoint.to_string()))
+        .ok_or(SourceAclDenied)
+}
+
 /// Extract the caller's advertised RTP endpoint (IP + port) from an offer SDP.
 ///
 /// Prefers a media-level `c=` line, falling back to the session-level `c=`.
@@ -1545,6 +1646,152 @@ fn extract_display_name(header: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct RecordingTransport {
+        local_addr: SocketAddr,
+        sent: std::sync::Mutex<Vec<SipMessage>>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self {
+                local_addr: "127.0.0.1:5060".parse().unwrap(),
+                sent: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn statuses(&self) -> Vec<u16> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(SipMessage::status_code)
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SipTransport for RecordingTransport {
+        async fn send(
+            &self,
+            msg: &SipMessage,
+            _addr: SocketAddr,
+        ) -> Result<(), crate::transport::TransportError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr, crate::transport::TransportError> {
+            Ok(self.local_addr)
+        }
+
+        fn protocol(&self) -> &str {
+            "UDP"
+        }
+    }
+
+    fn source_acl_test_config() -> crate::pjsip_config::PjsipConfig {
+        use crate::pjsip_config::{
+            AuthConfig, EndpointConfig, IdentifyConfig, PjsipConfig,
+        };
+
+        PjsipConfig {
+            endpoints: vec![EndpointConfig {
+                name: "carrier".to_string(),
+                auth: Some("carrier-auth".to_string()),
+                ..Default::default()
+            }],
+            auths: vec![AuthConfig {
+                name: "carrier-auth".to_string(),
+                username: "carrier".to_string(),
+                password: "secret".to_string(),
+                ..Default::default()
+            }],
+            identifies: vec![IdentifyConfig {
+                name: "carrier-identify".to_string(),
+                endpoint: "carrier".to_string(),
+                matches: vec!["192.0.2.0/24".to_string()],
+                match_header: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn source_acl_test_invite(call_id: &str) -> SipMessage {
+        let wire = format!(
+            "INVITE sip:100@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-acl\r\n\
+             From: <sip:caller@example.net>;tag=acl-test\r\n\
+             To: <sip:100@example.com>\r\n\
+             Call-ID: {}\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: 0\r\n\r\n",
+            call_id
+        );
+        SipMessage::parse(wire.as_bytes()).unwrap()
+    }
+
+    fn source_acl_test_register(call_id: &str) -> SipMessage {
+        let wire = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+             Via: SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-register-acl\r\n\
+             From: <sip:carrier@example.com>;tag=register-acl\r\n\
+             To: <sip:carrier@example.com>\r\n\
+             Call-ID: {}\r\n\
+             CSeq: 1 REGISTER\r\n\
+             Contact: <sip:carrier@client.example.com>\r\n\
+             Content-Length: 0\r\n\r\n",
+            call_id
+        );
+        SipMessage::parse(wire.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn source_acl_rejects_before_auth_and_allows_configured_cidr() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new_with_pjsip_config(
+            Arc::new(Dialplan::new()),
+            transport.clone(),
+            Some(Arc::new(source_acl_test_config())),
+        );
+
+        let denied_addr = "198.51.100.10:5060".parse().unwrap();
+        let denied_invite = source_acl_test_invite("source-acl-denied");
+        let denied_session = SipSession::new_outbound(transport.local_addr, denied_addr);
+        let denied = handler
+            .handle_incoming_invite(&denied_invite, denied_addr, denied_session)
+            .await;
+
+        assert!(denied.is_none());
+        assert_eq!(transport.statuses(), vec![403]);
+        assert_eq!(handler.active_calls(), 0);
+
+        let allowed_addr = "192.0.2.42:5060".parse().unwrap();
+        let allowed_invite = source_acl_test_invite("source-acl-allowed");
+        let allowed_session = SipSession::new_outbound(transport.local_addr, allowed_addr);
+        let allowed = handler
+            .handle_incoming_invite(&allowed_invite, allowed_addr, allowed_session)
+            .await;
+
+        assert!(allowed.is_none());
+        assert_eq!(transport.statuses(), vec![403, 401]);
+        assert_eq!(handler.active_calls(), 0);
+
+        let denied_register = source_acl_test_register("source-acl-register-denied");
+        handler.handle_register(&denied_register, denied_addr).await;
+
+        assert_eq!(transport.statuses(), vec![403, 401, 403]);
+    }
+
+    #[test]
+    fn source_acl_is_inactive_without_ip_match_rules() {
+        let config = crate::pjsip_config::PjsipConfig::default();
+        let source = "203.0.113.10".parse().unwrap();
+
+        assert_eq!(source_acl_endpoint(Some(&config), source), Ok(None));
+        assert_eq!(source_acl_endpoint(None, source), Ok(None));
+    }
 
     #[test]
     fn test_extract_user_from_header_angle_brackets() {
