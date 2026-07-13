@@ -1953,6 +1953,11 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                     // Give the handler the SIP channel driver so inbound calls
                     // bind an RTP session and carry media (mirrors outbound).
                     event_handler.set_channel_driver(sip_driver_ref.clone());
+                    // Give the handler the stack so its final INVITE
+                    // responses are recorded in the transaction layer:
+                    // answers racing a CANCEL-sent 487 are suppressed and
+                    // finals gain Timer G retransmission (issue #55).
+                    event_handler.set_stack(sip_stack.clone());
                     // Share the registrar with the driver so outbound Dial()
                     // routes to a dynamically-registered contact instead of
                     // only the static AoR config (issue #33).

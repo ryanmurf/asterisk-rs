@@ -345,6 +345,44 @@ impl SipStack {
         self.transport.clone()
     }
 
+    /// Record a final response the application layer is about to send for an
+    /// INVITE server transaction, and report whether sending it is allowed.
+    ///
+    /// Returns `false` when the transaction already holds a final response —
+    /// e.g. a CANCEL-triggered 487 — in which case the caller must NOT put
+    /// its response on the wire (RFC 3261 §9.2: a cancelled INVITE must not
+    /// also be answered). The check-and-record is atomic under the
+    /// transaction lock, which closes the CANCEL/Answer() race: whichever
+    /// side records its final first wins, the other is suppressed.
+    ///
+    /// Recording also arms the transaction layer's retransmission machinery:
+    /// non-2xx finals are re-sent by Timer G until the ACK arrives, and
+    /// request retransmissions replay the recorded response.
+    ///
+    /// A request with no matching transaction (e.g. handler-level tests that
+    /// bypass the stack) is allowed without recording.
+    pub fn record_invite_final(&self, request: &SipMessage, response: &SipMessage) -> bool {
+        let Some(branch) = TransactionLayer::extract_branch(request) else {
+            return true;
+        };
+        let mut txn_layer = self.transaction_layer.write();
+        match txn_layer.invite_server_txns.get_mut(&branch) {
+            Some(txn) => {
+                if txn.state == crate::transaction::InviteServerState::Proceeding {
+                    txn.send_final(response.clone());
+                    true
+                } else {
+                    debug!(
+                        branch = %branch,
+                        "suppressing INVITE final: transaction already completed"
+                    );
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
     /// Deliver a stack event to the application layer, never dropping it.
     ///
     /// `try_send` covers the common (non-full) case without a context
@@ -552,6 +590,20 @@ impl SipStack {
         let branch = TransactionLayer::extract_branch(&request)
             .unwrap_or_else(|| format!("z9hG4bK{}", uuid::Uuid::new_v4()));
 
+        // A matching CANCEL copies the INVITE's identity (RFC 3261 §9.1):
+        // beyond the shared branch it must carry the same Call-ID, From tag,
+        // and CSeq number. Guard against a colliding/forged branch
+        // terminating an unrelated INVITE.
+        fn cseq_number(msg: &SipMessage) -> Option<&str> {
+            msg.get_header(header_names::CSEQ)?.split_whitespace().next()
+        }
+        let identity_matches = |invite: &SipMessage, cancel: &SipMessage| {
+            invite.call_id() == cancel.call_id()
+                && cseq_number(invite) == cseq_number(cancel)
+                && invite.from_header().and_then(extract_tag)
+                    == cancel.from_header().and_then(extract_tag)
+        };
+
         // Resolve everything under one lock; send after dropping it.
         let (cancel_response, invite_response, cancelled_call_id) = {
             let mut txn_layer = self.transaction_layer.write();
@@ -559,7 +611,12 @@ impl SipStack {
             let mut invite_response = None;
             let mut cancelled_call_id = None;
 
-            let cancel_response = match txn_layer.invite_server_txns.get_mut(&branch) {
+            let matched_txn = txn_layer
+                .invite_server_txns
+                .get_mut(&branch)
+                .filter(|txn| identity_matches(&txn.request, &request));
+
+            let cancel_response = match matched_txn {
                 Some(invite_txn) => {
                     if invite_txn.state == crate::transaction::InviteServerState::Proceeding {
                         // INVITE still pending: terminate it with 487.
@@ -661,6 +718,36 @@ impl SipStack {
                 if let Some(txn) = txn_layer.non_invite_client_txns.get_mut(&branch) {
                     txn.advance_retransmit_timer();
                 }
+            }
+        }
+
+        // Timer G: retransmit final non-2xx responses on INVITE server
+        // transactions until the ACK arrives (RFC 3261 §17.2.1). Without
+        // this, a lost 487/4xx datagram hangs the caller's transaction —
+        // after 100 Trying the UAC stops retransmitting the INVITE, so the
+        // request-retransmission replay path never fires (issue #55 review).
+        let server_retransmits: Vec<(SipMessage, SocketAddr, String)> = {
+            let txn_layer = self.transaction_layer.read();
+            txn_layer
+                .invite_server_txns
+                .iter()
+                .filter(|(_, txn)| txn.needs_retransmit())
+                .filter_map(|(branch, txn)| {
+                    txn.last_response
+                        .clone()
+                        .map(|resp| (resp, txn.remote_addr, branch.clone()))
+                })
+                .collect()
+        };
+
+        for (response, addr, branch) in server_retransmits {
+            debug!(branch = %branch, "Timer G: retransmitting final response");
+            if let Err(e) = self.transport.send(&response, addr).await {
+                error!(branch = %branch, error = %e, "Response retransmit failed");
+            }
+            let mut txn_layer = self.transaction_layer.write();
+            if let Some(txn) = txn_layer.invite_server_txns.get_mut(&branch) {
+                txn.advance_retransmit_timer();
             }
         }
 
@@ -1082,6 +1169,184 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "retransmissions must not emit further events"
+        );
+    }
+
+    /// Receive one SIP datagram if one arrives within `ms`, else None.
+    async fn recv_peer_opt(sock: &tokio::net::UdpSocket, ms: u64) -> Option<SipMessage> {
+        let mut buf = [0u8; 4096];
+        let (len, _src) =
+            tokio::time::timeout(Duration::from_millis(ms), sock.recv_from(&mut buf))
+                .await
+                .ok()?
+                .ok()?;
+        SipMessage::parse(&buf[..len]).ok()
+    }
+
+    /// A CANCEL that arrives after the INVITE already got its final response
+    /// gets 200 OK but has NO effect: no 487, no IncomingCancel (RFC 3261
+    /// §9.2). The application layer reports its finals through
+    /// record_invite_final, so the transaction layer knows the INVITE was
+    /// answered — before this wiring, a late CANCEL tore down established
+    /// calls with a bogus 487.
+    #[tokio::test]
+    async fn test_cancel_after_final_response_has_no_effect() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let branch = "z9hG4bKlate55";
+        let invite = build_invite_request("cancel-55-late", branch);
+        stack.handle_request(invite.clone(), peer_addr).await;
+        let _ = rx.recv().await; // IncomingInvite
+
+        // The application answers (as the Answer() path does).
+        let ok = invite.create_response(200, "OK").unwrap();
+        assert!(
+            stack.record_invite_final(&invite, &ok),
+            "first final response must be allowed"
+        );
+
+        // Late CANCEL: answered 200, but the call must be left alone.
+        stack
+            .handle_request(build_cancel_request("cancel-55-late", branch), peer_addr)
+            .await;
+        let resp = recv_peer(&peer).await;
+        assert_eq!(resp.status_code(), Some(200));
+        assert_eq!(resp.get_header(header_names::CSEQ), Some("1 CANCEL"));
+        assert!(
+            recv_peer_opt(&peer, 300).await.is_none(),
+            "no 487 may follow a CANCEL on an answered INVITE"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a no-effect CANCEL must not reach the application layer"
+        );
+    }
+
+    /// The CANCEL/Answer() race is resolved atomically in the transaction
+    /// layer: once a CANCEL recorded its 487, record_invite_final refuses
+    /// the answer (returns false), so the 200 OK never hits the wire.
+    #[tokio::test]
+    async fn test_record_invite_final_suppresses_answer_after_cancel() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let branch = "z9hG4bKrace55";
+        let invite = build_invite_request("cancel-55-race", branch);
+        stack.handle_request(invite.clone(), peer_addr).await;
+        let _ = rx.recv().await; // IncomingInvite
+
+        stack
+            .handle_request(build_cancel_request("cancel-55-race", branch), peer_addr)
+            .await;
+
+        // The CANCEL won: the racing answer must be suppressed.
+        let ok = invite.create_response(200, "OK").unwrap();
+        assert!(
+            !stack.record_invite_final(&invite, &ok),
+            "an answer racing a CANCEL-sent 487 must be suppressed"
+        );
+    }
+
+    /// A CANCEL whose branch matches but whose identity (Call-ID here) does
+    /// not belong to the INVITE must not terminate it (RFC 3261 §9.1: a
+    /// matching CANCEL copies the INVITE's Call-ID, From tag, and CSeq
+    /// number). It is answered 481 as an unmatched CANCEL.
+    #[tokio::test]
+    async fn test_cancel_identity_mismatch_gets_481() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let branch = "z9hG4bKident55";
+        stack
+            .handle_request(build_invite_request("cancel-55-real", branch), peer_addr)
+            .await;
+        let _ = rx.recv().await; // IncomingInvite
+
+        // Same branch, different Call-ID: must NOT cancel the INVITE.
+        stack
+            .handle_request(build_cancel_request("cancel-55-forged", branch), peer_addr)
+            .await;
+        let resp = recv_peer(&peer).await;
+        assert_eq!(
+            resp.status_code(),
+            Some(481),
+            "an identity-mismatched CANCEL must be rejected with 481"
+        );
+        assert!(
+            recv_peer_opt(&peer, 300).await.is_none(),
+            "the unrelated INVITE must not receive a 487"
+        );
+        assert!(rx.try_recv().is_err(), "no IncomingCancel for a forged CANCEL");
+    }
+
+    /// Timer G: the CANCEL-triggered 487 is retransmitted until the ACK
+    /// arrives (RFC 3261 §17.2.1). Without this, a lost 487 hangs the
+    /// caller's INVITE transaction — after 100 Trying the UAC no longer
+    /// retransmits the INVITE, so replay-on-retransmission never fires.
+    #[tokio::test]
+    async fn test_timer_g_retransmits_487_until_ack() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let branch = "z9hG4bKtimerg55";
+        stack
+            .handle_request(build_invite_request("cancel-55-tg", branch), peer_addr)
+            .await;
+        let _ = rx.recv().await; // IncomingInvite
+        stack
+            .handle_request(build_cancel_request("cancel-55-tg", branch), peer_addr)
+            .await;
+        let _ = rx.recv().await; // IncomingCancel
+        // Drain the immediate 200 + 487.
+        let _ = recv_peer(&peer).await;
+        let _ = recv_peer(&peer).await;
+
+        // After T1 (500ms) with no ACK, the timer pass must re-send the 487.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        stack.handle_timers().await;
+        let retrans = recv_peer(&peer).await;
+        assert_eq!(
+            retrans.status_code(),
+            Some(487),
+            "Timer G must retransmit the un-ACKed 487"
+        );
+        assert_eq!(retrans.get_header(header_names::CSEQ), Some("1 INVITE"));
+
+        // The ACK confirms the transaction; retransmission stops.
+        let ack_raw = format!(
+            "ACK sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1;branch={branch}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=c55\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: cancel-55-tg\r\n\
+             CSeq: 1 ACK\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        stack
+            .handle_request(SipMessage::parse(ack_raw.as_bytes()).unwrap(), peer_addr)
+            .await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        stack.handle_timers().await;
+        assert!(
+            recv_peer_opt(&peer, 300).await.is_none(),
+            "no further retransmissions after the ACK confirms the transaction"
         );
     }
 

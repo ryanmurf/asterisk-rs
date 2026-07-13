@@ -53,6 +53,14 @@ pub struct SipEventHandler {
     channel_driver: OnceLock<Arc<SipChannelDriver>>,
     /// Inbound REGISTER handler (contact bindings per AoR).
     registrar: Arc<Registrar>,
+    /// The SIP stack whose transaction layer tracks INVITE server
+    /// transactions. Set once at startup via [`Self::set_stack`]. Every
+    /// final INVITE response the handler sends is first recorded through
+    /// [`crate::stack::SipStack::record_invite_final`], which suppresses an
+    /// answer racing a CANCEL-sent 487 and arms Timer G retransmission
+    /// (issue #55). When absent (handler-level tests), finals are sent
+    /// unrecorded.
+    stack: OnceLock<Arc<crate::stack::SipStack>>,
 }
 
 impl SipEventHandler {
@@ -71,6 +79,24 @@ impl SipEventHandler {
             ],
             channel_driver: OnceLock::new(),
             registrar: Arc::new(Registrar::new()),
+            stack: OnceLock::new(),
+        }
+    }
+
+    /// Attach the SIP stack so final INVITE responses are recorded in (and
+    /// gated by) its transaction layer. See the `stack` field docs.
+    pub fn set_stack(&self, stack: Arc<crate::stack::SipStack>) {
+        let _ = self.stack.set(stack);
+    }
+
+    /// Record `response` as the final response for `request`'s INVITE server
+    /// transaction. Returns whether the caller may put it on the wire —
+    /// `false` means the transaction already got a final (e.g. a
+    /// CANCEL-triggered 487) and the response must be suppressed.
+    fn may_send_invite_final(&self, request: &SipMessage, response: &SipMessage) -> bool {
+        match self.stack.get() {
+            Some(stack) => stack.record_invite_final(request, response),
+            None => true,
         }
     }
 
@@ -182,10 +208,12 @@ impl SipEventHandler {
                     Err(challenge) => {
                         eprintln!("[DEBUG] Auth failed, sending 401 for call_id={}", call_id);
                         // Send 401 challenge
-                        if let Err(e) = self.transport.send(&challenge, remote_addr).await {
-                            warn!(call_id = %call_id, "Failed to send 401 challenge: {}", e);
-                        } else {
-                            debug!(call_id = %call_id, "Sent 401 Unauthorized challenge");
+                        if self.may_send_invite_final(request, &challenge) {
+                            if let Err(e) = self.transport.send(&challenge, remote_addr).await {
+                                warn!(call_id = %call_id, "Failed to send 401 challenge: {}", e);
+                            } else {
+                                debug!(call_id = %call_id, "Sent 401 Unauthorized challenge");
+                            }
                         }
                         return None;
                     }
@@ -202,15 +230,19 @@ impl SipEventHandler {
             if allow_overlap && self.dialplan.could_match(&endpoint_context, &exten) {
                 // Overlap enabled and extension could match with more digits -> 484
                 if let Ok(resp) = request.create_response(484, "Address Incomplete") {
-                    let _ = self.transport.send(&resp, remote_addr).await;
-                    debug!(call_id = %call_id, exten = %exten, "Sent 484 Address Incomplete (overlap enabled)");
+                    if self.may_send_invite_final(request, &resp) {
+                        let _ = self.transport.send(&resp, remote_addr).await;
+                        debug!(call_id = %call_id, exten = %exten, "Sent 484 Address Incomplete (overlap enabled)");
+                    }
                 }
                 return None;
             } else {
                 // No match possible -> 404
                 if let Ok(resp) = request.create_response(404, "Not Found") {
-                    let _ = self.transport.send(&resp, remote_addr).await;
-                    debug!(call_id = %call_id, exten = %exten, "Sent 404 Not Found");
+                    if self.may_send_invite_final(request, &resp) {
+                        let _ = self.transport.send(&resp, remote_addr).await;
+                        debug!(call_id = %call_id, exten = %exten, "Sent 404 Not Found");
+                    }
                 }
                 return None;
             }
@@ -230,11 +262,13 @@ impl SipEventHandler {
         //     earlier (step 3b), so this only affects initial INVITEs.
         if session.remote_sdp.is_none() {
             if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
-                let _ = self.transport.send(&resp, remote_addr).await;
-                info!(
-                    call_id = %call_id,
-                    "Sent 488 Not Acceptable Here (delayed-offer INVITE with no SDP not supported)"
-                );
+                if self.may_send_invite_final(request, &resp) {
+                    let _ = self.transport.send(&resp, remote_addr).await;
+                    info!(
+                        call_id = %call_id,
+                        "Sent 488 Not Acceptable Here (delayed-offer INVITE with no SDP not supported)"
+                    );
+                }
             }
             return None;
         }
@@ -259,8 +293,10 @@ impl SipEventHandler {
                 .any(|m| m.port != 0);
             if !any_accepted {
                 if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
-                    let _ = self.transport.send(&resp, remote_addr).await;
-                    debug!(call_id = %call_id, "Sent 488 Not Acceptable Here (no common codec)");
+                    if self.may_send_invite_final(request, &resp) {
+                        let _ = self.transport.send(&resp, remote_addr).await;
+                        debug!(call_id = %call_id, "Sent 488 Not Acceptable Here (no common codec)");
+                    }
                 }
                 return None;
             }
@@ -456,6 +492,9 @@ impl SipEventHandler {
         let call_id_for_task = call_id.clone();
         let call_states_ref = self.call_states.clone();
         let callid_map_ref = self.callid_map.clone();
+        // For gating the Answer-triggered 200 OK against a racing CANCEL:
+        // the transaction layer atomically decides which final wins.
+        let stack_for_answer = self.stack.get().cloned();
         // Tear down the inbound media plane (drop the RTP socket) when the call
         // ends, so bound sockets are not leaked in the driver's channel map.
         let driver_for_cleanup = self.channel_driver.get().cloned();
@@ -530,7 +569,22 @@ impl SipEventHandler {
                 if still_active {
                     let mut cs = call_state.lock().await;
                     if let Some(ok_response) = cs.session.build_200_ok() {
-                        if let Err(e) = transport.send(&ok_response, cs.remote_addr).await {
+                        // Atomically record the 200 as the INVITE's final
+                        // response. If a CANCEL-triggered 487 won the race,
+                        // the answer must never hit the wire (RFC 3261 §9.2).
+                        let allowed = match (stack_for_answer.as_ref(), cs.session.invite.as_ref())
+                        {
+                            (Some(stack), Some(invite)) => {
+                                stack.record_invite_final(invite, &ok_response)
+                            }
+                            _ => true,
+                        };
+                        if !allowed {
+                            info!(
+                                call_id = %call_id_for_task,
+                                "Suppressing 200 OK: INVITE already has a final response (cancelled)"
+                            );
+                        } else if let Err(e) = transport.send(&ok_response, cs.remote_addr).await {
                             warn!(call_id = %call_id_for_task, "Failed to send 200 OK: {}", e);
                         } else {
                             info!(call_id = %call_id_for_task, "Sent 200 OK (triggered by Answer app)");
@@ -771,6 +825,24 @@ impl SipEventHandler {
             return;
         };
         let call_id = call_id.to_string();
+
+        // A CANCEL has no effect on an already-answered call (RFC 3261
+        // §9.2). The transaction layer suppresses the bogus 487 for this
+        // case; guard here too so a late-delivered IncomingCancel can never
+        // tear down an established session.
+        {
+            let cs_arc = {
+                let states = self.call_states.read();
+                states.get(&call_id).cloned()
+            };
+            if let Some(cs_arc) = cs_arc {
+                let cs = cs_arc.lock().await;
+                if cs.session.state == crate::session::SessionState::Established {
+                    info!(call_id = %call_id, "Ignoring CANCEL for an established call");
+                    return;
+                }
+            }
+        }
 
         let channel_name = {
             let map = self.callid_map.read();
@@ -1015,7 +1087,12 @@ impl SipEventHandler {
             ok_resp.body = sdp_str;
         }
 
-        // Send 200 OK
+        // Send 200 OK (recorded in the re-INVITE's own server transaction,
+        // so a CANCEL racing this answer is resolved atomically).
+        if !self.may_send_invite_final(request, &ok_resp) {
+            info!(call_id = %call_id, "Suppressing re-INVITE 200 OK: transaction already completed");
+            return None;
+        }
         if let Err(e) = self.transport.send(&ok_resp, remote_addr).await {
             warn!(call_id = %call_id, "Failed to send 200 OK for re-INVITE: {}", e);
             return None;
@@ -1643,6 +1720,40 @@ mod tests {
             0,
             "call state must be dropped so a later Answer() cannot send 200 OK"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_ignores_established_call() {
+        let (driver, handler) = driver_and_handler().await;
+
+        let ch = driver
+            .request("sip:frank@127.0.0.1:5060", None)
+            .await
+            .expect("request");
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut session = SipSession::new_outbound("127.0.0.1:0".parse().unwrap(), remote);
+        // The call was answered: a CANCEL has no effect (RFC 3261 §9.2).
+        session.state = crate::session::SessionState::Established;
+        handler.register_outbound_callid("cancel-est-1", &ch.name);
+        handler.register_outbound_session("cancel-est-1", &ch.name, session, remote);
+        assert_eq!(driver.active_channel_count(), 1);
+
+        let cancel_raw = "CANCEL sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcxl2\r\n\
+             From: <sip:frank@127.0.0.1>;tag=f1\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: cancel-est-1\r\n\
+             CSeq: 1 CANCEL\r\n\
+             Content-Length: 0\r\n\r\n";
+        let cancel = SipMessage::parse(cancel_raw.as_bytes()).unwrap();
+        handler.handle_cancel(&cancel, remote).await;
+
+        assert_eq!(
+            driver.active_channel_count(),
+            1,
+            "a CANCEL must not tear down an established call"
+        );
+        assert_eq!(handler.active_calls(), 1, "established call state must survive");
     }
 
     #[test]

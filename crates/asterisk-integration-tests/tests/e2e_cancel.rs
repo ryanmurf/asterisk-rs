@@ -132,6 +132,7 @@ async fn cancel_during_pending_invite_gets_200_and_487_and_no_answer() {
     handler.set_channel_driver(driver.clone());
 
     let stack = Arc::new(stack);
+    handler.set_stack(stack.clone());
     let stack_run = stack.clone();
     tokio::spawn(async move { stack_run.run().await });
 
