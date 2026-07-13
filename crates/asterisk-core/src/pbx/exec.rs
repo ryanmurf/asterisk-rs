@@ -321,10 +321,18 @@ pub async fn pbx_run(
     // Run hangup extension 'h' if it exists
     run_hangup_extension(&channel, &dialplan).await;
 
-    // Hangup the channel if not already done
+    // Hangup the channel if not already done. Preserve a cause an app
+    // already set (Hangup(17) sets the cause and defers the hangup to us —
+    // overwriting it with NormalClearing collapsed every explicit
+    // pre-answer cause to the default SIP 480, issue #57 review).
     {
         let mut chan = channel.lock().await;
-        chan.hangup(HangupCause::NormalClearing);
+        let cause = if chan.hangup_cause != HangupCause::NotDefined {
+            chan.hangup_cause
+        } else {
+            HangupCause::NormalClearing
+        };
+        chan.hangup(cause);
     }
 
     if found || error {

@@ -561,19 +561,55 @@ impl SipEventHandler {
             // triggers our answer_notify, at which point we send 200 OK.
             let dialplan_clone = dialplan.clone();
             let tokio_channel_clone = tokio_channel.clone();
-            let pbx_handle = tokio::spawn(async move {
+            let mut pbx_handle = tokio::spawn(async move {
                 asterisk_core::pbx::exec::pbx_run(tokio_channel_clone, dialplan_clone).await
             });
 
-            // Wait for Answer() to be called (or pbx_run to finish without
-            // answering, in which case we never send 200 OK).
-            // Timeout after 30s to avoid leaking.
-            let answered = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                answer_notify.notified(),
-            ).await;
+            // Wait for Answer() to be called, for the dialplan to finish
+            // WITHOUT answering (failed/unknown app, pre-answer hangup), or
+            // for the 30s answer timeout. The old flat 30s wait left an
+            // early-aborting call in limbo for the full window (issue #57).
+            let mut early_pbx_result = None;
+            let answered = tokio::select! {
+                // Poll in declared order: Answer() and dialplan completion
+                // become ready near-simultaneously when Answer() is the last
+                // priority — the stored Notify permit must win so the call
+                // is answered, not torn down as "never answered".
+                biased;
+                _ = answer_notify.notified() => true,
+                res = &mut pbx_handle => {
+                    debug!(call_id = %call_id_for_task, "Dialplan finished before Answer()");
+                    early_pbx_result = Some(res);
+                    false
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    info!(
+                        call_id = %call_id_for_task,
+                        "Answer() not called within timeout; unwinding dialplan"
+                    );
+                    // Give up on the call: soft-hangup both channel copies so
+                    // the dialplan unwinds and the pending INVITE gets its
+                    // final failure response now, instead of staying open
+                    // indefinitely (and instead of a late Answer() racing a
+                    // failure final — post-timeout the call is unanswerable).
+                    {
+                        let mut ch = tokio_channel.lock().await;
+                        ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
+                    if let Some(store_chan) = store::find_by_name(&ch_name_for_cleanup) {
+                        let mut ch = store_chan.lock();
+                        ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
+                    false
+                }
+            };
 
-            if answered.is_ok() {
+            // Whether OUR 200 OK actually went on the wire (vs. suppressed
+            // by a racing CANCEL or never attempted): selects BYE vs.
+            // final-failure teardown below.
+            let mut established = false;
+
+            if answered {
                 // Answer() was called -- send 200 OK now.
                 let still_active = call_states_ref.read().contains_key(&call_id_for_task);
                 if still_active {
@@ -599,15 +635,17 @@ impl SipEventHandler {
                         } else {
                             info!(call_id = %call_id_for_task, "Sent 200 OK (triggered by Answer app)");
                             cs.session.state = crate::session::SessionState::Established;
+                            established = true;
                         }
                     }
                 }
-            } else {
-                debug!(call_id = %call_id_for_task, "Answer() not called within timeout");
             }
 
-            // Wait for pbx_run to finish.
-            let result = pbx_handle.await;
+            // Wait for pbx_run to finish (unless it already has).
+            let result = match early_pbx_result {
+                Some(r) => r,
+                None => pbx_handle.await,
+            };
             match &result {
                 Ok(r) => info!(channel = %ch_name_for_cleanup, "PBX completed with result: {:?}", r),
                 Err(e) => warn!(channel = %ch_name_for_cleanup, "PBX task failed: {}", e),
@@ -620,8 +658,8 @@ impl SipEventHandler {
                 hangup_notify.notified(),
             ).await;
 
-            // Send BYE to the remote endpoint to tear down the SIP dialog.
-            {
+            if established {
+                // Send BYE to the remote endpoint to tear down the SIP dialog.
                 let cs_arc_opt = {
                     let states = call_states_ref.read();
                     states.get(&call_id_for_task).cloned()
@@ -635,6 +673,59 @@ impl SipEventHandler {
                             eprintln!("[DEBUG] Sent BYE for call_id={}", call_id_for_task);
                         }
                     }
+                }
+            } else {
+                // The dialplan ended without the call ever being answered
+                // (unknown app, pre-answer hangup, no Answer() step). The
+                // still-open INVITE must get a final response — leaving it
+                // unanswered after 100 Trying forces the caller to
+                // retransmit and time out (issue #57). The status is mapped
+                // from the channel's hangup cause (486/503/...; default
+                // 480), and recording it through the transaction layer both
+                // arms Timer G and makes this a no-op when a CANCEL's 487
+                // already terminated the transaction.
+                let cause = { tokio_channel.lock().await.hangup_cause as u32 };
+                let (status, reason) = crate::rfc3326::hangup_cause_to_sip_status(cause);
+                let cs_arc_opt = {
+                    let states = call_states_ref.read();
+                    states.get(&call_id_for_task).cloned()
+                };
+                if let Some(cs_arc) = cs_arc_opt {
+                    {
+                        let cs = cs_arc.lock().await;
+                        if let Some(ref invite) = cs.session.invite {
+                            if let Ok(resp) = invite.create_response(status, reason) {
+                                let allowed = match stack_for_answer.as_ref() {
+                                    Some(stack) => stack.record_invite_final(invite, &resp),
+                                    None => true,
+                                };
+                                if !allowed {
+                                    debug!(
+                                        call_id = %call_id_for_task,
+                                        "INVITE already has a final response; no pre-answer failure sent"
+                                    );
+                                } else if let Err(e) =
+                                    transport.send(&resp, cs.remote_addr).await
+                                {
+                                    warn!(
+                                        call_id = %call_id_for_task,
+                                        "Failed to send {} for unanswered INVITE: {}", status, e
+                                    );
+                                } else {
+                                    info!(
+                                        call_id = %call_id_for_task,
+                                        status,
+                                        "Sent final response for INVITE (dialplan ended pre-answer)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // No dialog was ever established: drop the call state now
+                    // so the cleanup task finalizes immediately instead of
+                    // idling out the 32s dialog timeout.
+                    call_states_ref.write().remove(&call_id_for_task);
+                    callid_map_ref.write().remove(&call_id_for_task);
                 }
             }
 
