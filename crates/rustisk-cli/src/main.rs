@@ -1746,7 +1746,7 @@ fn load_pjsip_notify_config(content: &str, config: &asterisk_sip::notify::Notify
 }
 
 /// Perform the startup sequence.
-async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
+async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), String> {
     info!("Loading configuration from: {}", config_dir);
 
     // Create module stubs (item 4)
@@ -2039,10 +2039,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to start SIP stack on {}: {} (continuing without SIP)",
+                return Err(format!(
+                    "Failed to start SIP stack on {}: {}",
                     bind_addr, e
-                );
+                ));
             }
         }
     }
@@ -2101,6 +2101,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
     asterisk_ami::publish_event(
         asterisk_ami::AmiEvent::new("FullyBooted", 0x01).with_header("Status", "Fully Booted"),
     );
+    Ok(())
 }
 
 /// Run the interactive CLI console using rustyline.
@@ -2331,7 +2332,11 @@ async fn main() {
     }
 
     // Run the full startup sequence (config, codecs, SIP, AMI, etc.)
-    startup_sequence(&config_dir, &dirs).await;
+    if let Err(e) = startup_sequence(&config_dir, &dirs).await {
+        error!("Startup failed: {}", e);
+        shutdown_sequence(&run_dir);
+        std::process::exit(1);
+    }
 
     // Signal that the daemon is fully booted.  Any pending
     // `core waitfullybooted` connections will now unblock.

@@ -256,6 +256,37 @@ fn foreground_mode_without_console_waits_for_shutdown_signal() {
 }
 
 #[test]
+fn sip_bind_failure_exits_without_becoming_fully_booted() {
+    let _guard = lock_cli_tests();
+    let fixture = Fixture::new();
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let occupied_addr = occupied.local_addr().unwrap();
+    fs::write(
+        fixture.config_file.parent().unwrap().join("pjsip.conf"),
+        format!(
+            "[transport-udp]\ntype=transport\nprotocol=udp\nbind={}\n",
+            occupied_addr
+        ),
+    )
+    .unwrap();
+
+    let output = run_asterisk(&fixture, &["-f"], None, Duration::from_secs(10));
+
+    assert!(!output.timed_out, "{}", output.combined());
+    assert!(!output.status.success(), "{}", output.combined());
+    assert!(
+        output.combined().contains("Failed to start SIP stack"),
+        "{}",
+        output.combined()
+    );
+    assert!(
+        !output.combined().contains("Rustisk is fully booted"),
+        "{}",
+        output.combined()
+    );
+}
+
+#[test]
 fn always_fork_flag_does_not_enter_console_mode() {
     let _guard = lock_cli_tests();
     let fixture = Fixture::new();
