@@ -28,6 +28,23 @@ impl DialplanApp for AppRinging {
 impl AppRinging {
     /// Execute the Ringing application on a channel.
     pub async fn exec(channel: &mut Channel, _args: &str) -> PbxExecResult {
+        // An answered call must not regress to ringing: a 180 after the
+        // 200 OK violates RFC 3261 response ordering. Check the store copy
+        // too — Answer() may have run on a different Channel instance.
+        let store_chan = asterisk_core::channel_store::find_by_name(&channel.name);
+        let already_up = channel.state == ChannelState::Up
+            || store_chan
+                .as_ref()
+                .map(|c| c.lock().state == ChannelState::Up)
+                .unwrap_or(false);
+        if already_up {
+            debug!(
+                "Ringing: channel '{}' already answered; not indicating",
+                channel.name
+            );
+            return PbxExecResult::Success;
+        }
+
         // Indicate through the technology driver, looked up by the
         // channel-name prefix (e.g. "PJSIP/alice-00000001" -> "PJSIP"),
         // exactly like Echo()/Playback(). For SIP this sends 180 Ringing.
@@ -56,15 +73,11 @@ impl AppRinging {
 
         // Move the channel to Ringing pre-answer. Update the store copy too,
         // so observers (AMI, other apps polling the store) see the state.
-        if channel.state != ChannelState::Up {
-            channel.set_state(ChannelState::Ringing);
-            if let Some(store_chan) =
-                asterisk_core::channel_store::find_by_name(&channel.name)
-            {
-                let mut ch = store_chan.lock();
-                if ch.state != ChannelState::Up {
-                    ch.set_state(ChannelState::Ringing);
-                }
+        channel.set_state(ChannelState::Ringing);
+        if let Some(store_chan) = store_chan {
+            let mut ch = store_chan.lock();
+            if ch.state != ChannelState::Up {
+                ch.set_state(ChannelState::Ringing);
             }
         }
 

@@ -162,7 +162,7 @@ pub fn sip_to_hangup_cause(sip_code: u32) -> u32 {
 /// the C driver's pre-answer default (issue #57).
 pub fn hangup_cause_to_sip_status(cause: u32) -> (u16, &'static str) {
     match cause {
-        1 | 2 | 3 => (404, "Not Found"),
+        1..=3 => (404, "Not Found"),
         17 => (486, "Busy Here"),
         18 => (408, "Request Timeout"),
         21 => (403, "Forbidden"),

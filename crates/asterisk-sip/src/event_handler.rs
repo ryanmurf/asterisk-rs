@@ -583,7 +583,23 @@ impl SipEventHandler {
                     false
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    debug!(call_id = %call_id_for_task, "Answer() not called within timeout");
+                    info!(
+                        call_id = %call_id_for_task,
+                        "Answer() not called within timeout; unwinding dialplan"
+                    );
+                    // Give up on the call: soft-hangup both channel copies so
+                    // the dialplan unwinds and the pending INVITE gets its
+                    // final failure response now, instead of staying open
+                    // indefinitely (and instead of a late Answer() racing a
+                    // failure final — post-timeout the call is unanswerable).
+                    {
+                        let mut ch = tokio_channel.lock().await;
+                        ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
+                    if let Some(store_chan) = store::find_by_name(&ch_name_for_cleanup) {
+                        let mut ch = store_chan.lock();
+                        ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
                     false
                 }
             };
