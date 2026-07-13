@@ -154,6 +154,29 @@ pub fn sip_to_hangup_cause(sip_code: u32) -> u32 {
     }
 }
 
+/// Map a Q.850 hangup cause to the SIP final response for a call that ended
+/// before it was answered (the inverse of [`sip_to_hangup_cause`]).
+///
+/// Mirrors `hangup_cause2sip()` from the C source; anything unmapped —
+/// including normal clearing — falls back to `480 Temporarily Unavailable`,
+/// the C driver's pre-answer default (issue #57).
+pub fn hangup_cause_to_sip_status(cause: u32) -> (u16, &'static str) {
+    match cause {
+        1 | 2 | 3 => (404, "Not Found"),
+        17 => (486, "Busy Here"),
+        18 => (408, "Request Timeout"),
+        21 => (403, "Forbidden"),
+        22 => (410, "Gone"),
+        27 => (502, "Bad Gateway"),
+        28 => (484, "Address Incomplete"),
+        29 => (501, "Not Implemented"),
+        38 => (500, "Server Internal Error"),
+        34 | 41 | 42 | 44 => (503, "Service Unavailable"),
+        57 | 58 | 65 | 88 => (488, "Not Acceptable Here"),
+        _ => (480, "Temporarily Unavailable"),
+    }
+}
+
 /// Get a human-readable description for a Q.850 cause code.
 fn q850_cause_text(cause: u32) -> &'static str {
     match cause {
@@ -240,5 +263,18 @@ mod tests {
         assert_eq!(sip_to_hangup_cause(486), 17); // Busy
         assert_eq!(sip_to_hangup_cause(404), 1);  // Unallocated
         assert_eq!(sip_to_hangup_cause(408), 19); // No answer
+    }
+
+    /// Pre-answer final-response mapping (issue #57): known causes map to
+    /// their SIP status; anything else — including normal clearing — falls
+    /// back to 480, the pre-answer default.
+    #[test]
+    fn test_hangup_cause_to_sip_status() {
+        assert_eq!(hangup_cause_to_sip_status(17), (486, "Busy Here"));
+        assert_eq!(hangup_cause_to_sip_status(1), (404, "Not Found"));
+        assert_eq!(hangup_cause_to_sip_status(34), (503, "Service Unavailable"));
+        assert_eq!(hangup_cause_to_sip_status(38), (500, "Server Internal Error"));
+        assert_eq!(hangup_cause_to_sip_status(16), (480, "Temporarily Unavailable"));
+        assert_eq!(hangup_cause_to_sip_status(0), (480, "Temporarily Unavailable"));
     }
 }

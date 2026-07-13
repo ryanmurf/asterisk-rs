@@ -66,6 +66,7 @@
 
 pub mod adapter;
 pub mod answer;
+pub mod ringing;
 pub mod hangup;
 pub mod dial;
 pub mod playback;

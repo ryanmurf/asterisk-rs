@@ -231,6 +231,13 @@ pub fn register_all_apps() {
         |channel, args| Box::pin(AppAnswer::exec(channel, args)),
     )));
 
+    // Ringing - async exec (indicate 180 via the tech driver, issue #57)
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "Ringing",
+        "Indicate ringing tone",
+        |channel, args| Box::pin(crate::ringing::AppRinging::exec(channel, args)),
+    )));
+
     // Dial - async exec, returns (PbxExecResult, DialStatus)
     // We call the real exec and set DIALSTATUS on the channel.
     APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
