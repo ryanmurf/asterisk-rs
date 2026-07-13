@@ -245,6 +245,44 @@ impl SipChannelDriver {
             .map(|a| a.port())
     }
 
+    /// Install (or clear) the telephone-event payload type from negotiated
+    /// remote SDP on an existing call.
+    pub(crate) async fn install_negotiated_dtmf_payload(
+        &self,
+        channel_name: &str,
+        sdp: &SessionDescription,
+    ) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel_name)
+            .ok_or_else(|| AsteriskError::NotFound(channel_name.to_string()))?;
+        let rtp = priv_data
+            .rtp
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+
+        let negotiated = crate::sdp_rtp::negotiated_dtmf_payload_type(sdp, &self.codecs);
+        if let Some(payload_type) = negotiated {
+            rtp.set_dtmf_payload_type(payload_type);
+        } else {
+            rtp.clear_dtmf_payload_type();
+        }
+        debug!(
+            channel = channel_name,
+            payload_type = ?negotiated,
+            "Installed negotiated telephone-event payload type"
+        );
+        Ok(())
+    }
+
+    /// Return the channel's negotiated telephone-event payload type.
+    pub async fn channel_rtp_dtmf_payload_type(&self, channel_name: &str) -> Option<u8> {
+        let priv_data = self.get_private(channel_name)?;
+        let rtp = priv_data.rtp.lock().await.clone()?;
+        rtp.dtmf_payload_type()
+    }
+
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
         self.transport.read().clone().ok_or_else(|| {
             AsteriskError::Internal("SIP transport not initialized".into())
@@ -314,6 +352,13 @@ impl ChannelDriver for SipChannelDriver {
 
         // Create RTP session
         let rtp_session = self.allocate_rtp_session(self.local_addr.ip()).await?;
+        if let Some(codec) = self
+            .codecs
+            .iter()
+            .find(|codec| codec.name.eq_ignore_ascii_case("telephone-event"))
+        {
+            rtp_session.set_dtmf_payload_type(codec.payload_type);
+        }
         let rtp_port = rtp_session.local_addr()?.port();
 
         // Create SIP session
@@ -820,6 +865,84 @@ mod tests {
             driver.channel_rtp_local_port(&reused.name).await,
             Some(rtp_port)
         );
+    }
+
+    #[tokio::test]
+    async fn negotiated_dtmf_payload_controls_receiver_detection() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind(local).await.unwrap(),
+        );
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport);
+        let mut channel = driver
+            .request("sip:dtmf@127.0.0.1:9", None)
+            .await
+            .unwrap();
+        let rtp_port = driver
+            .channel_rtp_local_port(&channel.name)
+            .await
+            .unwrap();
+
+        let negotiated = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 127.0.0.1\r\n\
+             s=Test\r\n\
+             c=IN IP4 127.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0 110\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:110 telephone-event/8000\r\n",
+        )
+        .unwrap();
+        driver
+            .install_negotiated_dtmf_payload(&channel.name, &negotiated)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.channel_rtp_dtmf_payload_type(&channel.name).await,
+            Some(110)
+        );
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target: SocketAddr = format!("127.0.0.1:{}", rtp_port).parse().unwrap();
+        let event = crate::rtp::DtmfEvent {
+            event: 5,
+            end: true,
+            volume: 10,
+            duration: 800,
+        };
+        let packet = |payload_type| {
+            crate::rtp::build_rtp_packet(
+                &crate::rtp::RtpHeader {
+                    version: 2,
+                    padding: false,
+                    extension: false,
+                    csrc_count: 0,
+                    marker: false,
+                    payload_type,
+                    sequence: 1,
+                    timestamp: 160,
+                    ssrc: 0x12345678,
+                },
+                &event.to_bytes(),
+            )
+        };
+
+        peer.send_to(&packet(101), target).await.unwrap();
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            Frame::Voice { .. }
+        ));
+
+        peer.send_to(&packet(110), target).await.unwrap();
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            Frame::DtmfEnd {
+                digit: '5',
+                duration_ms: 100
+            }
+        ));
     }
 
     /// Regression for the channel-name collision bug: the inbound INVITE path

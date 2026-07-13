@@ -11,7 +11,7 @@ use tracing::{debug, info};
 use asterisk_codecs::Codec;
 
 use crate::rtp::RtpSession;
-use crate::sdp::{ConnectionData, MediaDescription, MediaDirection};
+use crate::sdp::{ConnectionData, MediaDescription, MediaDirection, SessionDescription};
 
 // ---------------------------------------------------------------------------
 // RTP session parameters from SDP
@@ -114,7 +114,9 @@ pub async fn create_rtp_from_sdp(
 
     // Set DTMF payload type.
     if let Some(dtmf_pt) = params.dtmf_payload_type {
-        session.dtmf_payload_type = dtmf_pt;
+        session.set_dtmf_payload_type(dtmf_pt);
+    } else {
+        session.clear_dtmf_payload_type();
     }
 
     // Determine samples per packet from the primary codec.
@@ -174,12 +176,40 @@ pub fn negotiate_codecs(
     result
 }
 
+/// Return the dynamic telephone-event payload type accepted for the active
+/// audio stream.
+///
+/// RFC 4733 section 2.1 assigns no static payload number to telephone-event;
+/// the number is established out of band (normally by SDP). Matching both the
+/// encoding name and clock rate prevents an unrelated dynamic format from
+/// being interpreted as DTMF.
+pub fn negotiated_dtmf_payload_type(
+    sdp: &SessionDescription,
+    supported_codecs: &[Codec],
+) -> Option<u8> {
+    let audio = sdp
+        .media_descriptions
+        .iter()
+        .find(|media| media.media_type.eq_ignore_ascii_case("audio") && media.port != 0)?;
+
+    audio.codecs().into_iter().find_map(|remote| {
+        let is_telephone_event = remote.name.eq_ignore_ascii_case("telephone-event");
+        let is_supported = supported_codecs.iter().any(|local| {
+            local.name.eq_ignore_ascii_case(&remote.name)
+                && local.sample_rate == remote.sample_rate
+        });
+        (is_telephone_event && is_supported).then_some(remote.payload_type)
+    })
+}
+
 /// Apply negotiated RTP parameters to an existing RTP session.
 pub fn apply_sdp_to_rtp(session: &mut RtpSession, params: &RtpParameters) {
     session.payload_type = params.primary_payload_type;
 
     if let Some(dtmf_pt) = params.dtmf_payload_type {
-        session.dtmf_payload_type = dtmf_pt;
+        session.set_dtmf_payload_type(dtmf_pt);
+    } else {
+        session.clear_dtmf_payload_type();
     }
 
     if let Some(remote) = params.remote_addr {
@@ -351,6 +381,32 @@ mod tests {
         assert_eq!(params.primary_payload_type, 0);
         assert_eq!(params.dtmf_payload_type, Some(101));
         assert_eq!(params.direction, MediaDirection::SendRecv);
+    }
+
+    #[test]
+    fn negotiated_dtmf_payload_uses_dynamic_sdp_mapping() {
+        let sdp = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 127.0.0.1\r\n\
+             s=Test\r\n\
+             c=IN IP4 127.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 20000 RTP/AVP 0 110\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:110 telephone-event/8000\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            negotiated_dtmf_payload_type(
+                &sdp,
+                &[
+                    asterisk_codecs::codecs::pcmu(),
+                    asterisk_codecs::codecs::telephone_event(),
+                ],
+            ),
+            Some(110)
+        );
     }
 
     #[test]

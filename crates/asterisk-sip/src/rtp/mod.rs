@@ -1,7 +1,7 @@
 //! RTP/RTCP session management.
 //!
 //! Provides RTP send/receive with proper header handling, payload type
-//! mapping, and RFC 2833 DTMF support. Also includes RTCP SR/RR.
+//! mapping, and RFC 4733 DTMF support. Also includes RTCP SR/RR.
 //!
 //! Sub-modules:
 //! - `jitter_buffer`: Fixed and adaptive jitter buffer implementations.
@@ -19,7 +19,7 @@ pub mod mos;
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +38,8 @@ const RTP_MAX_MTU: usize = 1500;
 const RTCP_PT_SR: u8 = 200;
 /// RTCP receiver report type.
 const RTCP_PT_RR: u8 = 201;
+/// Sentinel outside RTP's 7-bit payload type space: no telephone-event map.
+const NO_DTMF_PAYLOAD_TYPE: u8 = u8::MAX;
 
 /// Default inclusive RTP range used when `rtp.conf` is absent.
 pub const DEFAULT_RTP_PORT_START: u16 = 10000;
@@ -254,7 +256,7 @@ pub fn parse_rtp_header(data: &[u8]) -> Result<(RtpHeader, &[u8]), AsteriskError
     Ok((header, &data[offset..]))
 }
 
-/// RFC 2833 DTMF event payload.
+/// RFC 4733 DTMF event payload.
 #[derive(Debug, Clone)]
 pub struct DtmfEvent {
     pub event: u8,
@@ -332,8 +334,8 @@ pub struct RtpSession {
     timestamp: AtomicU32,
     /// Payload type for outgoing packets.
     pub payload_type: u8,
-    /// DTMF payload type (RFC 2833).
-    pub dtmf_payload_type: u8,
+    /// Negotiated telephone-event payload type (RFC 4733).
+    dtmf_payload_type: AtomicU8,
     /// Samples per packet (for timestamp advancement).
     pub samples_per_packet: u32,
     /// Statistics.
@@ -365,7 +367,7 @@ impl RtpSession {
             sequence: AtomicU16::new(0),
             timestamp: AtomicU32::new(0),
             payload_type: 0,
-            dtmf_payload_type: 101,
+            dtmf_payload_type: AtomicU8::new(NO_DTMF_PAYLOAD_TYPE),
             samples_per_packet: 160,
             stats: RtpStats::default(),
         }
@@ -387,6 +389,30 @@ impl RtpSession {
     /// still works via auto-ref.
     pub fn set_remote_addr(&self, addr: SocketAddr) {
         *self.remote_addr.write() = Some(addr);
+    }
+
+    /// Return the negotiated RFC 4733 telephone-event payload type.
+    pub fn dtmf_payload_type(&self) -> Option<u8> {
+        match self.dtmf_payload_type.load(Ordering::Relaxed) {
+            NO_DTMF_PAYLOAD_TYPE => None,
+            payload_type => Some(payload_type),
+        }
+    }
+
+    /// Install the dynamic telephone-event payload type negotiated in SDP.
+    pub fn set_dtmf_payload_type(&self, payload_type: u8) {
+        let payload_type = if payload_type <= 0x7f {
+            payload_type
+        } else {
+            NO_DTMF_PAYLOAD_TYPE
+        };
+        self.dtmf_payload_type.store(payload_type, Ordering::Relaxed);
+    }
+
+    /// Disable RFC 4733 send/receive when SDP did not negotiate it.
+    pub fn clear_dtmf_payload_type(&self) {
+        self.dtmf_payload_type
+            .store(NO_DTMF_PAYLOAD_TYPE, Ordering::Relaxed);
     }
 
     /// Send an audio frame as RTP.
@@ -473,8 +499,8 @@ impl RtpSession {
             .octets_received
             .fetch_add(payload.len() as u32, Ordering::Relaxed);
 
-        // Check for DTMF (RFC 2833)
-        if header.payload_type == self.dtmf_payload_type {
+        // Check for DTMF (RFC 4733)
+        if self.dtmf_payload_type() == Some(header.payload_type) {
             if let Some(event) = DtmfEvent::from_bytes(payload) {
                 let digit = DtmfEvent::event_to_digit(event.event);
                 if event.end {
@@ -497,7 +523,7 @@ impl RtpSession {
         ))
     }
 
-    /// Send a DTMF digit via RFC 2833.
+    /// Send a DTMF digit via RFC 4733.
     pub async fn send_dtmf(
         &self,
         digit: char,
@@ -506,6 +532,9 @@ impl RtpSession {
         let remote = self
             .remote_addr()
             .ok_or_else(|| AsteriskError::InvalidArgument("No remote address".into()))?;
+        let dtmf_payload_type = self.dtmf_payload_type().ok_or_else(|| {
+            AsteriskError::InvalidArgument("telephone-event was not negotiated".into())
+        })?;
 
         let event_num = DtmfEvent::digit_to_event(digit);
         let start_seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -525,7 +554,7 @@ impl RtpSession {
                 extension: false,
                 csrc_count: 0,
                 marker: i == 0,
-                payload_type: self.dtmf_payload_type,
+                payload_type: dtmf_payload_type,
                 sequence: start_seq.wrapping_add(i),
                 timestamp: start_ts,
                 ssrc: self.ssrc,
@@ -548,7 +577,7 @@ impl RtpSession {
                 extension: false,
                 csrc_count: 0,
                 marker: false,
-                payload_type: self.dtmf_payload_type,
+                payload_type: dtmf_payload_type,
                 sequence: start_seq.wrapping_add(3 + i),
                 timestamp: start_ts,
                 ssrc: self.ssrc,
