@@ -255,17 +255,22 @@ pub struct ServerTransaction {
     pub remote_addr: SocketAddr,
     pub last_response: Option<SipMessage>,
     started_at: Instant,
+    timer_g_interval: Duration,
+    last_retransmit: Instant,
 }
 
 impl ServerTransaction {
     pub fn new(request: SipMessage, remote_addr: SocketAddr, branch: String) -> Self {
+        let now = Instant::now();
         Self {
             branch,
             state: InviteServerState::Proceeding,
             request,
             remote_addr,
             last_response: None,
-            started_at: Instant::now(),
+            started_at: now,
+            timer_g_interval: timers::T1,
+            last_retransmit: now,
         }
     }
 
@@ -279,6 +284,7 @@ impl ServerTransaction {
     pub fn send_final(&mut self, response: SipMessage) {
         let status = response.status_code().unwrap_or(0);
         self.last_response = Some(response);
+        self.last_retransmit = Instant::now();
 
         if (200..300).contains(&status) {
             // For 2xx, the TU handles retransmission, not the transaction layer.
@@ -288,6 +294,19 @@ impl ServerTransaction {
             self.state = InviteServerState::Completed;
             debug!(branch = %self.branch, status, "INVITE server -> Completed");
         }
+    }
+
+    /// Timer G: while a non-2xx final response awaits its ACK (Completed),
+    /// it must be retransmitted at T1, doubling up to T2 (RFC 3261 §17.2.1).
+    pub fn needs_retransmit(&self) -> bool {
+        self.state == InviteServerState::Completed
+            && self.last_retransmit.elapsed() >= self.timer_g_interval
+    }
+
+    /// Advance Timer G after a retransmission (double up to T2).
+    pub fn advance_retransmit_timer(&mut self) {
+        self.timer_g_interval = (self.timer_g_interval * 2).min(timers::T2);
+        self.last_retransmit = Instant::now();
     }
 
     /// Process received ACK.

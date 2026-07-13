@@ -1953,6 +1953,11 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                     // Give the handler the SIP channel driver so inbound calls
                     // bind an RTP session and carry media (mirrors outbound).
                     event_handler.set_channel_driver(sip_driver_ref.clone());
+                    // Give the handler the stack so its final INVITE
+                    // responses are recorded in the transaction layer:
+                    // answers racing a CANCEL-sent 487 are suppressed and
+                    // finals gain Timer G retransmission (issue #55).
+                    event_handler.set_stack(sip_stack.clone());
                     // Share the registrar with the driver so outbound Dial()
                     // routes to a dynamically-registered contact instead of
                     // only the static AoR config (issue #33).
@@ -1985,6 +1990,16 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) {
                                     remote_addr,
                                 } => {
                                     event_handler.handle_bye(&request, remote_addr).await;
+                                }
+                                asterisk_sip::stack::SipEvent::IncomingCancel {
+                                    call_id: _,
+                                    request,
+                                    remote_addr,
+                                } => {
+                                    // The stack already sent 200-to-CANCEL and
+                                    // 487-to-INVITE; abort the channel and its
+                                    // dialplan execution (issue #55).
+                                    event_handler.handle_cancel(&request, remote_addr).await;
                                 }
                                 asterisk_sip::stack::SipEvent::IncomingRequest {
                                     request,
