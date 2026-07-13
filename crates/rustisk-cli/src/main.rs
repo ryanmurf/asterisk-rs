@@ -1086,9 +1086,9 @@ struct ManagerConfig {
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             port: 5038,
-            bind_addr: "0.0.0.0".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
             users: Vec::new(),
         }
     }
@@ -1099,20 +1099,14 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
     let mut config = ManagerConfig::default();
 
     if !manager_path.exists() {
-        // No manager.conf -- fall back to admin/admin
-        config
-            .users
-            .push(asterisk_ami::auth::AmiUser::new("admin", "admin"));
+        info!("No manager.conf found; AMI remains disabled");
         return config;
     }
 
     let content = match std::fs::read_to_string(&manager_path) {
         Ok(c) => c,
         Err(e) => {
-            warn!("Could not read manager.conf: {}, using defaults", e);
-            config
-                .users
-                .push(asterisk_ami::auth::AmiUser::new("admin", "admin"));
+            warn!("Could not read manager.conf: {}; AMI remains disabled", e);
             return config;
         }
     };
@@ -1125,10 +1119,12 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
     let flush_user =
         |config: &mut ManagerConfig, name: &Option<String>, secret: &Option<String>| {
             if let Some(ref uname) = name {
-                let sec = secret.as_deref().unwrap_or("");
-                config
-                    .users
-                    .push(asterisk_ami::auth::AmiUser::new(uname, sec));
+                match secret.as_deref() {
+                    Some(sec) if !sec.is_empty() => config
+                        .users
+                        .push(asterisk_ami::auth::AmiUser::new(uname, sec)),
+                    _ => warn!("AMI user '{}' has no secret; ignoring user", uname),
+                }
             }
         };
 
@@ -1194,11 +1190,9 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
     // Flush last user
     flush_user(&mut config, &current_user_name, &current_secret);
 
-    // If no users were found, add default
-    if config.users.is_empty() {
-        config
-            .users
-            .push(asterisk_ami::auth::AmiUser::new("admin", "admin"));
+    if config.enabled && config.users.is_empty() {
+        warn!("manager.conf enables AMI without any users; disabling AMI");
+        config.enabled = false;
     }
 
     info!(
@@ -1206,6 +1200,18 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
         config.users.len()
     );
     config
+}
+
+fn manager_bind_addr(config: &ManagerConfig) -> SocketAddr {
+    let bind_str = format!("{}:{}", config.bind_addr, config.port);
+    bind_str.parse().unwrap_or_else(|_| {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], config.port));
+        warn!(
+            "Invalid AMI bind address '{}', using {}",
+            bind_str, loopback
+        );
+        loopback
+    })
 }
 
 /// Parse ari.conf and return (enabled, AriConfig) -- kept for future use.
@@ -2054,16 +2060,12 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
         use asterisk_ami::server::{AmiServer, AmiServerConfig};
 
         let manager = parse_manager_conf(config_dir);
-
-        let bind_str = format!("{}:{}", manager.bind_addr, manager.port);
-        let bind_addr: SocketAddr = bind_str.parse().unwrap_or_else(|_| {
-            warn!("Invalid AMI bind address '{}', using default", bind_str);
-            "0.0.0.0:5038".parse().unwrap()
-        });
+        let bind_addr = manager_bind_addr(&manager);
+        let ami_enabled = manager.enabled;
 
         let ami_config = AmiServerConfig {
             bind_addr,
-            enabled: manager.enabled,
+            enabled: ami_enabled,
             ..Default::default()
         };
         let ami_server = AmiServer::new(ami_config);
@@ -2074,9 +2076,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
         }
 
         match ami_server.start().await {
-            Ok(()) => {
+            Ok(()) if ami_enabled => {
                 info!("AMI server started on {}", bind_addr);
             }
+            Ok(()) => {}
             Err(e) => {
                 warn!("Failed to start AMI server: {} (continuing without AMI)", e);
             }
@@ -2466,5 +2469,101 @@ mod tests {
         assert_eq!(dirs.include_dir, "/var/run/asterisk/include");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_defaults_are_disabled_loopback_only_and_have_no_users() {
+        let config = ManagerConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.bind_addr, "127.0.0.1");
+        assert_eq!(config.port, 5038);
+        assert!(config.users.is_empty());
+    }
+
+    #[test]
+    fn missing_manager_conf_does_not_create_a_default_credential() {
+        let dir = test_dir("manager-missing");
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert!(!config.enabled);
+        assert_eq!(config.bind_addr, "127.0.0.1");
+        assert!(config.users.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_manager_conf_does_not_create_a_default_credential() {
+        let dir = test_dir("manager-unreadable");
+        std::fs::create_dir(dir.join("manager.conf")).unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert!(!config.enabled);
+        assert_eq!(config.bind_addr, "127.0.0.1");
+        assert!(config.users.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_cannot_enable_ami_without_a_user() {
+        let dir = test_dir("manager-no-users");
+        std::fs::write(dir.join("manager.conf"), "[general]\nenabled = yes\n").unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert!(!config.enabled);
+        assert!(config.users.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_cannot_enable_ami_with_a_passwordless_user() {
+        let dir = test_dir("manager-passwordless");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[operator]\nread = all\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert!(!config.enabled);
+        assert!(config.users.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enabled_manager_conf_defaults_to_loopback_with_explicit_user() {
+        let dir = test_dir("manager-loopback");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[operator]\nsecret = not-a-default\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert!(config.enabled);
+        assert_eq!(config.bind_addr, "127.0.0.1");
+        assert_eq!(config.users.len(), 1);
+        assert_eq!(config.users[0].username, "operator");
+        assert_eq!(config.users[0].secret, "not-a-default");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_manager_bind_address_falls_back_to_loopback() {
+        let config = ManagerConfig {
+            bind_addr: "not-an-ip-address".to_string(),
+            port: 65000,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            manager_bind_addr(&config),
+            SocketAddr::from(([127, 0, 0, 1], 65000))
+        );
     }
 }
