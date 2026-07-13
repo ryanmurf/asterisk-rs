@@ -103,9 +103,10 @@ async fn answer_connection_addr(
     caller: &UdpSocket,
     call_id: &str,
     branch: &str,
+    offer_media_addr: &str,
 ) -> String {
     let caller_addr = caller.local_addr().unwrap();
-    let offer = SessionDescription::create_offer("127.0.0.1", 40000, &[codecs::pcmu()]);
+    let offer = SessionDescription::create_offer(offer_media_addr, 40000, &[codecs::pcmu()]);
     let invite = invite_request(call_id, branch, &offer.to_string());
     let session = SipSession::new_inbound(&invite, sip_local, caller_addr).expect("session");
 
@@ -159,14 +160,18 @@ async fn sdp_answer_never_advertises_inaddr_any() {
 
     // ---- 1. No external_media_address: the routed interface is used ------
     set_global_pjsip_config(endpoint_only_config(None, vec![]));
-    let addr = answer_connection_addr(&handler, sip_local, &caller, "media-56-1", "z9hG4bK561").await;
+    let addr =
+        answer_connection_addr(&handler, sip_local, &caller, "media-56-1", "z9hG4bK561", "127.0.0.1")
+            .await;
     assert_ne!(addr, "0.0.0.0", "answer must never advertise INADDR_ANY (issue #56)");
     assert_eq!(addr, "127.0.0.1", "loopback caller must be answered via loopback");
     println!("[E2E] INADDR_ANY bind, no external_media_address -> c={addr}");
 
     // ---- 2. external_media_address applies to a non-local peer -----------
     set_global_pjsip_config(endpoint_only_config(Some("203.0.113.99"), vec![]));
-    let addr = answer_connection_addr(&handler, sip_local, &caller, "media-56-2", "z9hG4bK562").await;
+    let addr =
+        answer_connection_addr(&handler, sip_local, &caller, "media-56-2", "z9hG4bK562", "127.0.0.1")
+            .await;
     assert_eq!(
         addr, "203.0.113.99",
         "configured external_media_address must be applied to the answer (issue #56)"
@@ -178,10 +183,27 @@ async fn sdp_answer_never_advertises_inaddr_any() {
         Some("203.0.113.99"),
         vec!["127.0.0.0/8".to_string()],
     ));
-    let addr = answer_connection_addr(&handler, sip_local, &caller, "media-56-3", "z9hG4bK563").await;
+    let addr =
+        answer_connection_addr(&handler, sip_local, &caller, "media-56-3", "z9hG4bK563", "127.0.0.1")
+            .await;
     assert_eq!(
         addr, "127.0.0.1",
         "a peer inside local_net must get the real local address, not the external one"
     );
     println!("[E2E] local_net peer -> c={addr}");
+
+    // ---- 4. NAT decisions target the MEDIA peer, not the SIP source ------
+    // Signaling still arrives from loopback (inside local_net), but the
+    // offer's c-line — where RTP will actually flow — is non-local. The
+    // external address must be applied (review finding: routing toward the
+    // signaling source exempted this case wrongly).
+    let addr = answer_connection_addr(
+        &handler, sip_local, &caller, "media-56-4", "z9hG4bK564", "198.51.100.7",
+    )
+    .await;
+    assert_eq!(
+        addr, "203.0.113.99",
+        "NAT selection must follow the offer's media endpoint, not the signaling source"
+    );
+    println!("[E2E] non-local media peer behind local signaling -> c={addr}");
 }

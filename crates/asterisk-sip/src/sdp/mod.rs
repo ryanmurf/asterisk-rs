@@ -500,6 +500,7 @@ impl SessionDescription {
             bandwidth: Vec::new(),
         };
 
+        let addr_type = addr_type_for(addr);
         SessionDescription {
             version: 0,
             origin: Origin {
@@ -507,13 +508,13 @@ impl SessionDescription {
                 session_id: session_id.clone(),
                 session_version: session_id,
                 net_type: "IN".to_string(),
-                addr_type: "IP4".to_string(),
+                addr_type: addr_type.to_string(),
                 addr: addr.to_string(),
             },
             session_name: "Asterisk".to_string(),
             connection: Some(ConnectionData {
                 net_type: "IN".to_string(),
-                addr_type: "IP4".to_string(),
+                addr_type: addr_type.to_string(),
                 addr: addr.to_string(),
             }),
             time: (0, 0),
@@ -546,6 +547,7 @@ impl SessionDescription {
             .as_secs()
             .to_string();
 
+        let addr_type = addr_type_for(addr);
         let mut answer = SessionDescription {
             version: 0,
             origin: Origin {
@@ -553,13 +555,13 @@ impl SessionDescription {
                 session_id: session_id.clone(),
                 session_version: session_id,
                 net_type: "IN".to_string(),
-                addr_type: "IP4".to_string(),
+                addr_type: addr_type.to_string(),
                 addr: addr.to_string(),
             },
             session_name: "Asterisk".to_string(),
             connection: Some(ConnectionData {
                 net_type: "IN".to_string(),
-                addr_type: "IP4".to_string(),
+                addr_type: addr_type.to_string(),
                 addr: addr.to_string(),
             }),
             time: (0, 0),
@@ -836,6 +838,11 @@ pub enum SdpError {
     Parse(String),
 }
 
+/// RFC 4566 address type for an address literal: `IP6` for IPv6, else `IP4`.
+fn addr_type_for(addr: &str) -> &'static str {
+    if addr.contains(':') { "IP6" } else { "IP4" }
+}
+
 /// Pick the concrete IP address to advertise in SDP `c=`/`o=` lines toward
 /// `remote` (issue #56).
 ///
@@ -854,17 +861,20 @@ pub enum SdpError {
 pub fn advertised_media_ip(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> String {
     let (external, local_net) = match crate::pjsip_config::get_global_pjsip_config() {
         Some(cfg) => {
-            // Prefer the transport bound to this local address; fall back to
-            // any transport that configures an external media address.
-            let transport = cfg
-                .transports
-                .iter()
-                .find(|t| t.external_media_address.is_some() && t.bind.ip() == local.ip())
-                .or_else(|| {
-                    cfg.transports
-                        .iter()
-                        .find(|t| t.external_media_address.is_some())
-                });
+            // NAT config is transport-specific: use the transport whose bind
+            // covers `local` — exact ip+port, then exact ip, then a wildcard
+            // bind (which covers every interface). A transport bound to a
+            // DIFFERENT concrete address never donates its NAT config.
+            // (Dialogs don't yet carry their transport name; when they do,
+            // that binding should replace this bind-coverage lookup.)
+            let with_ext = |pred: &dyn Fn(&crate::pjsip_config::TransportConfig) -> bool| {
+                cfg.transports
+                    .iter()
+                    .find(|t| t.external_media_address.is_some() && pred(t))
+            };
+            let transport = with_ext(&|t| t.bind.ip() == local.ip() && t.bind.port() == local.port())
+                .or_else(|| with_ext(&|t| t.bind.ip() == local.ip()))
+                .or_else(|| with_ext(&|t| t.bind.ip().is_unspecified()));
             match transport {
                 Some(t) => (t.external_media_address.clone(), t.local_net.clone()),
                 None => (None, Vec::new()),
@@ -973,6 +983,55 @@ mod tests {
             ),
             "127.0.0.1"
         );
+    }
+
+    /// IPv6 addresses must be typed IP6 in o=/c= lines (RFC 4566); a
+    /// half-IPv6 SDP like `c=IN IP4 2001:db8::1` is invalid.
+    #[test]
+    fn test_sdp_addr_type_follows_family() {
+        let v6 = SessionDescription::create_offer("2001:db8::1", 40000, &[codecs_pcmu()]);
+        assert_eq!(v6.origin.addr_type, "IP6");
+        assert_eq!(v6.connection.as_ref().unwrap().addr_type, "IP6");
+
+        let v4 = SessionDescription::create_offer("192.0.2.1", 40000, &[codecs_pcmu()]);
+        assert_eq!(v4.origin.addr_type, "IP4");
+        assert_eq!(v4.connection.as_ref().unwrap().addr_type, "IP4");
+
+        let answer =
+            SessionDescription::create_answer(&v6, "2001:db8::2", 40002, &[codecs_pcmu()]);
+        assert_eq!(answer.connection.as_ref().unwrap().addr_type, "IP6");
+    }
+
+    fn codecs_pcmu() -> Codec {
+        asterisk_codecs::codecs::pcmu()
+    }
+
+    /// A transport bound to a DIFFERENT concrete address must not donate its
+    /// external_media_address; only a covering bind (same ip, or wildcard)
+    /// may.
+    #[test]
+    fn test_media_ip_foreign_transport_does_not_donate_external() {
+        use crate::pjsip_config::{set_global_pjsip_config, PjsipConfig, TransportConfig};
+        let cfg = PjsipConfig {
+            transports: vec![TransportConfig {
+                name: "other".to_string(),
+                protocol: "udp".to_string(),
+                bind: "192.0.2.50:5060".parse().unwrap(),
+                external_media_address: Some("203.0.113.99".to_string()),
+                external_signaling_address: None,
+                cert_file: None,
+                priv_key_file: None,
+                local_net: vec![],
+            }],
+            ..Default::default()
+        };
+        set_global_pjsip_config(cfg);
+        // Local bind 127.0.0.1 is NOT covered by the 192.0.2.50 transport:
+        // its external address must not leak into this dialog's SDP.
+        let ip = advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062"));
+        assert_eq!(ip, "127.0.0.1");
+        // Reset the process-global config for other tests in this binary.
+        set_global_pjsip_config(PjsipConfig::default());
     }
 
     #[test]
