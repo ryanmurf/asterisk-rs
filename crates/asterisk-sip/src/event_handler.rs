@@ -367,9 +367,19 @@ impl SipEventHandler {
         //    select the negotiated payload type, then attach it to the channel
         //    via the driver so `read_frame`/`write_frame` (and thus `Echo`) can
         //    move media. The SDP answer advertises the socket's REAL port —
-        //    never the old hardcoded 10000 (issues #7, #8, #9).
-        let local_ip = session.local_addr.ip().to_string();
+        //    never the old hardcoded 10000 (issues #7, #8, #9) — and a
+        //    concrete, routable connection address: external_media_address
+        //    when configured, else the interface routed toward the caller.
+        //    Advertising a raw INADDR_ANY bind as `c=IN IP4 0.0.0.0`
+        //    blackholed audio for peers without symmetric RTP (issue #56).
         if let Some(remote_sdp) = session.remote_sdp.clone() {
+            // Route/NAT selection targets the peer that will actually send
+            // RTP — the offer's media endpoint — not the SIP signaling
+            // source; they differ behind proxies/SBCs and with third-party
+            // media. Signaling source is the fallback for an unresolvable
+            // offer address.
+            let media_peer = remote_rtp_endpoint(&remote_sdp).unwrap_or(remote_addr);
+            let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
             let mut answer_port: u16 = 0;
 
             let rtp_bind = SocketAddr::new(session.local_addr.ip(), 0);
@@ -1057,9 +1067,13 @@ impl SipEventHandler {
             None => 10000,
         };
 
-        // Generate SDP answer
-        let local_ip = session.local_addr.ip().to_string();
+        // Generate SDP answer with a concrete, routable connection address
+        // (external_media_address / routed interface — never 0.0.0.0,
+        // issue #56). Route/NAT selection targets the re-INVITE's media
+        // endpoint, falling back to the signaling source.
         let answer_sdp = if let Some(ref offer) = remote_sdp {
+            let media_peer = remote_rtp_endpoint(offer).unwrap_or(remote_addr);
+            let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
             let answer = SessionDescription::create_answer(
                 offer,
                 &local_ip,
