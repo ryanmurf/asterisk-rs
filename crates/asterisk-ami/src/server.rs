@@ -46,8 +46,8 @@ pub struct AmiServerConfig {
 impl Default for AmiServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from(([0, 0, 0, 0], DEFAULT_AMI_PORT)),
-            enabled: true,
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_AMI_PORT)),
+            enabled: false,
             auth_timeout: 30,
             auth_limit: 50,
             display_connects: true,
@@ -400,8 +400,9 @@ mod tests {
     #[test]
     fn test_server_config_default() {
         let config = AmiServerConfig::default();
+        assert_eq!(config.bind_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
         assert_eq!(config.bind_addr.port(), 5038);
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert_eq!(config.auth_timeout, 30);
     }
 
