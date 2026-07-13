@@ -1864,6 +1864,23 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
         })
         .unwrap_or_else(|| "0.0.0.0:5060".parse().unwrap());
 
+    // Match Asterisk's rtp.conf contract: RTP sockets are allocated only
+    // inside the inclusive [general] rtpstart/rtpend range. An invalid or
+    // unreadable configured file is a startup error; silently falling back to
+    // kernel-ephemeral ports would invalidate firewall and Service rules.
+    let rtp_path = std::path::Path::new(config_dir).join("rtp.conf");
+    let rtp_port_range = if rtp_path.exists() {
+        asterisk_sip::rtp::RtpPortRange::load(&rtp_path)
+            .map_err(|e| format!("Failed to load {}: {}", rtp_path.display(), e))?
+    } else {
+        asterisk_sip::rtp::RtpPortRange::default()
+    };
+    info!(
+        "Configured RTP port range: {}-{}",
+        rtp_port_range.start(),
+        rtp_port_range.end()
+    );
+
     info!("Registering channel technologies...");
     use asterisk_core::channel::tech_registry::TECH_REGISTRY;
     TECH_REGISTRY.register(Arc::new(asterisk_channels::local::LocalChannelDriver::new()));
@@ -1872,9 +1889,12 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
     TECH_REGISTRY.register(Arc::new(asterisk_channels::rtp_channel::RtpChannelDriver::new()));
 
     // Register SIP/PJSIP channel driver
-    let sip_driver = Arc::new(asterisk_sip::channel_driver::SipChannelDriver::new(
-        sip_bind,
-    ));
+    let sip_driver = Arc::new(
+        asterisk_sip::channel_driver::SipChannelDriver::with_rtp_port_range(
+            sip_bind,
+            rtp_port_range,
+        ),
+    );
     let sip_driver_ref = sip_driver.clone();
     TECH_REGISTRY.register(sip_driver);
     info!("Registered PJSIP channel technology");

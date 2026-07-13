@@ -15,7 +15,7 @@ use crate::channel_driver::SipChannelDriver;
 use crate::parser::SipMessage;
 use crate::authenticator::AuthCredentials;
 use crate::registrar::Registrar;
-use crate::rtp::RtpSession;
+use crate::rtp::{RtpPortAllocator, RtpSession};
 use crate::sdp::SessionDescription;
 use crate::session::SipSession;
 use crate::transport::SipTransport;
@@ -33,6 +33,9 @@ struct CallState {
     remote_addr: SocketAddr,
     /// Channel name for correlation.
     channel_name: String,
+    /// Bounded socket reservation used only by signaling-only handlers that
+    /// were constructed without a channel driver (primarily unit tests).
+    _rtp_reservation: Option<RtpSession>,
 }
 
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
@@ -53,6 +56,9 @@ pub struct SipEventHandler {
     /// at startup via [`Self::set_channel_driver`]; when absent, inbound calls
     /// still signal but carry no media.
     channel_driver: OnceLock<Arc<SipChannelDriver>>,
+    /// Bounded fallback for signaling-only handler users that do not attach a
+    /// channel driver. The reservation is retained in [`CallState`].
+    fallback_rtp_allocator: RtpPortAllocator,
     /// Inbound REGISTER handler (contact bindings per AoR).
     registrar: Arc<Registrar>,
     /// The SIP stack whose transaction layer tracks INVITE server
@@ -97,6 +103,7 @@ impl SipEventHandler {
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
             ],
             channel_driver: OnceLock::new(),
+            fallback_rtp_allocator: RtpPortAllocator::default(),
             registrar: Arc::new(Registrar::new()),
             stack: OnceLock::new(),
         }
@@ -424,12 +431,13 @@ impl SipEventHandler {
         //    local RTP socket, point it at the caller's advertised RTP endpoint,
         //    select the negotiated payload type, then attach it to the channel
         //    via the driver so `read_frame`/`write_frame` (and thus `Echo`) can
-        //    move media. The SDP answer advertises the socket's REAL port —
-        //    never the old hardcoded 10000 (issues #7, #8, #9) — and a
+        //    move media. The SDP answer advertises the socket's real,
+        //    bounded port (issues #7, #8, #9, #70) and a
         //    concrete, routable connection address: external_media_address
         //    when configured, else the interface routed toward the caller.
         //    Advertising a raw INADDR_ANY bind as `c=IN IP4 0.0.0.0`
         //    blackholed audio for peers without symmetric RTP (issue #56).
+        let mut rtp_reservation = None;
         if let Some(remote_sdp) = session.remote_sdp.clone() {
             // Route/NAT selection targets the peer that will actually send
             // RTP — the offer's media endpoint — not the SIP signaling
@@ -438,72 +446,85 @@ impl SipEventHandler {
             // offer address.
             let media_peer = remote_rtp_endpoint(&remote_sdp).unwrap_or(remote_addr);
             let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
-            let mut answer_port: u16 = 0;
-
-            let rtp_bind = SocketAddr::new(session.local_addr.ip(), 0);
-            match RtpSession::bind(rtp_bind).await {
-                Ok(mut rtp) => {
+            let rtp_result = match self.channel_driver.get() {
+                Some(driver) => driver.allocate_rtp_session(session.local_addr.ip()).await,
+                None => self
+                    .fallback_rtp_allocator
+                    .allocate(session.local_addr.ip())
+                    .await,
+            }
+            .and_then(|rtp| {
+                let port = rtp.local_addr()?.port();
+                Ok((rtp, port))
+            });
+            match rtp_result {
+                Ok((mut rtp, answer_port)) => {
                     if let Some(remote_rtp) = remote_rtp_endpoint(&remote_sdp) {
                         rtp.set_remote_addr(remote_rtp);
                     }
                     if let Some(pt) = negotiated_payload_type(&remote_sdp, &self.supported_codecs) {
                         rtp.payload_type = pt;
                     }
-                    answer_port = rtp.local_addr().map(|a| a.port()).unwrap_or(0);
-
+                    // Store the REAL inbound session (carries the INVITE,
+                    // is_outbound = false) so driver.indicate()/hangup()
+                    // work on this channel instead of silently no-opping on
+                    // a fabricated outbound placeholder (issue #36). Built
+                    // fresh from the same INVITE; the event handler keeps
+                    // its own `session` for the 200 OK / BYE path.
+                    let driver_session =
+                        SipSession::new_inbound(request, session.local_addr, remote_addr)
+                            .unwrap_or_else(|| {
+                                let mut s = SipSession::new_outbound(
+                                    session.local_addr,
+                                    remote_addr,
+                                );
+                                s.is_outbound = false;
+                                s.invite = Some(request.clone());
+                                s
+                            });
                     if let Some(driver) = self.channel_driver.get() {
-                        // Store the REAL inbound session (carries the INVITE,
-                        // is_outbound = false) so driver.indicate()/hangup()
-                        // work on this channel instead of silently no-opping on
-                        // a fabricated outbound placeholder (issue #36). Built
-                        // fresh from the same INVITE; the event handler keeps
-                        // its own `session` for the 200 OK / BYE path.
-                        let driver_session =
-                            SipSession::new_inbound(request, session.local_addr, remote_addr)
-                                .unwrap_or_else(|| {
-                                    let mut s = SipSession::new_outbound(
-                                        session.local_addr,
-                                        remote_addr,
-                                    );
-                                    s.is_outbound = false;
-                                    s.invite = Some(request.clone());
-                                    s
-                                });
                         driver.attach_inbound_media(
                             &channel_name,
                             driver_session,
                             self.transport.clone(),
                             rtp,
                         );
-                        debug!(
-                            call_id = %call_id,
-                            channel = %channel_name,
-                            port = answer_port,
-                            "Bound inbound RTP and attached media plane"
-                        );
                     } else {
                         warn!(
                             call_id = %call_id,
-                            "No channel driver set -- inbound call will carry no media"
+                            "No channel driver set -- retaining bounded RTP socket for signaling-only call"
                         );
+                        rtp_reservation = Some(rtp);
                     }
+                    debug!(
+                        call_id = %call_id,
+                        channel = %channel_name,
+                        port = answer_port,
+                        "Bound inbound RTP media plane"
+                    );
+
+                    let answer_sdp = SessionDescription::create_answer(
+                        &remote_sdp,
+                        &local_ip,
+                        answer_port,
+                        &self.supported_codecs,
+                    );
+                    session.local_sdp = Some(answer_sdp.clone());
+                    session.initial_local_sdp = Some(answer_sdp);
                 }
                 Err(e) => {
-                    warn!(call_id = %call_id, "Failed to bind inbound RTP socket: {}", e);
+                    let unique_id = channel.lock().unique_id.0.clone();
+                    store::deregister(&unique_id);
+                    self.callid_map.write().remove(&call_id);
+                    warn!(call_id = %call_id, "Failed to allocate inbound RTP socket: {}", e);
+                    if let Ok(resp) = request.create_response(503, "Service Unavailable") {
+                        if self.may_send_invite_final(request, &resp) {
+                            let _ = self.transport.send(&resp, remote_addr).await;
+                        }
+                    }
+                    return None;
                 }
             }
-
-            // Advertise the socket's real port. Only if the bind failed do we
-            // fall back to a placeholder so the SDP still parses.
-            let sdp_port = if answer_port != 0 { answer_port } else { 10000 };
-            let answer_sdp = SessionDescription::create_answer(
-                &remote_sdp,
-                &local_ip,
-                sdp_port,
-                &self.supported_codecs,
-            );
-            session.local_sdp = Some(answer_sdp.clone());
-            session.initial_local_sdp = Some(answer_sdp);
         }
 
         // 8. Store the SIP session state for later signaling (200 OK, BYE)
@@ -534,6 +555,7 @@ impl SipEventHandler {
             session,
             remote_addr,
             channel_name: channel_name.clone(),
+            _rtp_reservation: rtp_reservation,
         }));
         {
             let mut states = self.call_states.write();
@@ -839,6 +861,7 @@ impl SipEventHandler {
             session,
             remote_addr,
             channel_name: channel_name.to_string(),
+            _rtp_reservation: None,
         }));
         self.call_states.write().insert(call_id.to_string(), call_state);
     }
@@ -1745,6 +1768,66 @@ mod tests {
             call_id
         );
         SipMessage::parse(wire.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn inbound_rtp_exhaustion_returns_503_without_live_call_state() {
+        use asterisk_core::pbx::{Context, Extension, Priority};
+
+        let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rtp_port = occupied.local_addr().unwrap().port();
+        let range = crate::rtp::RtpPortRange::new(rtp_port, rtp_port).unwrap();
+
+        let mut dialplan = Dialplan::new();
+        let mut context = Context::new("default");
+        let mut extension = Extension::new("100");
+        extension.add_priority(Priority {
+            priority: 1,
+            app: "Answer".to_string(),
+            app_data: String::new(),
+            label: None,
+        });
+        context.add_extension(extension);
+        dialplan.add_context(context);
+
+        let transport = Arc::new(RecordingTransport::new());
+        let driver = Arc::new(SipChannelDriver::with_rtp_port_range(
+            transport.local_addr,
+            range,
+        ));
+        driver.set_transport(transport.clone());
+        let handler = SipEventHandler::new(Arc::new(dialplan), transport.clone());
+        handler.set_channel_driver(driver.clone());
+
+        let sdp = SessionDescription::create_offer(
+            "127.0.0.1",
+            40000,
+            &[codecs::pcmu()],
+        )
+        .to_string();
+        let wire = format!(
+            "INVITE sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5090;branch=z9hG4bK-rtp-full\r\n\
+             From: <sip:caller@127.0.0.1>;tag=rtp-full\r\n\
+             To: <sip:100@127.0.0.1>\r\n\
+             Call-ID: rtp-range-exhausted\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            sdp.len(), sdp
+        );
+        let invite = SipMessage::parse(wire.as_bytes()).unwrap();
+        let remote_addr = "127.0.0.1:5090".parse().unwrap();
+        let session = SipSession::new_inbound(&invite, transport.local_addr, remote_addr).unwrap();
+
+        let accepted = handler
+            .handle_incoming_invite(&invite, remote_addr, session)
+            .await;
+
+        assert!(accepted.is_none());
+        assert_eq!(transport.statuses(), vec![100, 503]);
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(driver.active_channel_count(), 0);
     }
 
     #[tokio::test]
