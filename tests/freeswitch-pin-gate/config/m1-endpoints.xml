@@ -1,0 +1,18 @@
+<include>
+  <extension name="rustisk-listen-only-receiver">
+    <condition field="destination_number" expression="^9100$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="set" data="send_silence_when_idle=-1" inline="true"/>
+      <action application="answer"/>
+      <action application="record_session" data="/var/lib/freeswitch/recordings/m1-listen-only.wav"/>
+      <action application="sleep" data="10000"/>
+    </condition>
+  </extension>
+
+  <extension name="rustisk-cancel-receiver">
+    <condition field="destination_number" expression="^9199$">
+      <action application="ring_ready"/>
+      <action application="sleep" data="10000"/>
+    </condition>
+  </extension>
+</include>
