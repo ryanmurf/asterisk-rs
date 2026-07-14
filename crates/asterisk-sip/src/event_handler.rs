@@ -38,6 +38,14 @@ struct CallState {
     _rtp_reservation: Option<RtpSession>,
 }
 
+/// Exact live-resource counts for SIP call teardown verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SipResourceCounts {
+    pub driver_channels: usize,
+    pub call_id_mappings: usize,
+    pub call_states: usize,
+}
+
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
 pub struct SipEventHandler {
     dialplan: Arc<Dialplan>,
@@ -1573,6 +1581,17 @@ impl SipEventHandler {
     /// Get the current count of active call-id mappings.
     pub fn active_calls(&self) -> usize {
         self.callid_map.read().len()
+    }
+
+    /// Snapshot the resource owners that must return to baseline after a call.
+    pub fn resource_counts(&self) -> SipResourceCounts {
+        SipResourceCounts {
+            driver_channels: self.channel_driver.get()
+                .map(|driver| driver.active_channel_count())
+                .unwrap_or(0),
+            call_id_mappings: self.callid_map.read().len(),
+            call_states: self.call_states.read().len(),
+        }
     }
 }
 

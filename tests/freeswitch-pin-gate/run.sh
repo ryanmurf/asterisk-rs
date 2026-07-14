@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 HARNESS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,24 +10,40 @@ RUN_DIR="$RUNTIME_DIR/run"
 PROMPT_DIR="$RUNTIME_DIR/prompts"
 RUSTISK_LOG="$RUNTIME_DIR/rustisk.log"
 FS_IMAGE="safarov/freeswitch@sha256:b31c743f4c911a19687c61e3214968f2a24f93f9d3d667cc26284192e158ffc6"
+RUSTISK_IMAGE="python@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3"
 FS_CONTAINER="rustisk-fs-pin-gate-$$"
-FS_CONTAINER_IP=""
-FS_HOST_IP=""
+RUSTISK_CONTAINER="rustisk-m1-gate-$$"
+FS_NETWORK="rustisk-fs-pin-gate-net-$$"
+NETWORK_THIRD_OCTET="$((20 + ($$ % 200)))"
+FS_SUBNET="10.253.$NETWORK_THIRD_OCTET.0/24"
+FS_CONTAINER_IP="10.253.$NETWORK_THIRD_OCTET.2"
+FS_HOST_IP="10.253.$NETWORK_THIRD_OCTET.3"
+AMI_HOST="$FS_HOST_IP"
 RUSTISK_PID=""
+BASELINE_RESOURCES=""
 
 cleanup() {
+    if docker inspect "$RUSTISK_CONTAINER" >/dev/null 2>&1; then
+        local rustisk_host_pid
+        rustisk_host_pid="$(docker inspect -f '{{.State.Pid}}' "$RUSTISK_CONTAINER")"
+        kill -TERM "$rustisk_host_pid" 2>/dev/null || true
+        timeout 7 docker wait "$RUSTISK_CONTAINER" >/dev/null 2>&1 || true
+        if docker inspect -f '{{.State.Running}}' "$RUSTISK_CONTAINER" 2>/dev/null \
+            | grep -q true; then
+            kill -KILL "$rustisk_host_pid" 2>/dev/null || true
+            timeout 2 docker wait "$RUSTISK_CONTAINER" >/dev/null 2>&1 || true
+        fi
+        docker rm -f "$RUSTISK_CONTAINER" >/dev/null 2>&1 || true
+    fi
     if [[ -n "$RUSTISK_PID" ]]; then
-        kill "$RUSTISK_PID" 2>/dev/null || true
         wait "$RUSTISK_PID" 2>/dev/null || true
     fi
     if docker inspect "$FS_CONTAINER" >/dev/null 2>&1; then
         docker exec "$FS_CONTAINER" freeswitch -stop >/dev/null 2>&1 || true
-        for _ in {1..50}; do
-            docker inspect "$FS_CONTAINER" >/dev/null 2>&1 || break
-            sleep 0.1
-        done
+        timeout 7 docker wait "$FS_CONTAINER" >/dev/null 2>&1 || true
         docker rm -f "$FS_CONTAINER" >/dev/null 2>&1 || true
     fi
+    docker network rm "$FS_NETWORK" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -59,10 +76,12 @@ wait_for_freeswitch() {
 
 wait_for_ami() {
     for _ in {1..100}; do
-        if nc -z 127.0.0.1 15038 >/dev/null 2>&1; then
+        if printf 'Action: Login\r\nUsername: harness\r\nSecret: pin-gate-local-only\r\n\r\nAction: Logoff\r\n\r\n' \
+            | ami_socket | grep -q 'Authentication accepted'; then
             return
         fi
-        if ! kill -0 "$RUSTISK_PID" 2>/dev/null; then
+        if ! docker inspect -f '{{.State.Running}}' "$RUSTISK_CONTAINER" 2>/dev/null \
+            | grep -q true; then
             sed -n '1,240p' "$RUSTISK_LOG" >&2
             fail "rustisk exited before AMI became ready"
         fi
@@ -72,10 +91,50 @@ wait_for_ami() {
     fail "rustisk AMI did not become ready"
 }
 
+ami_socket() {
+    docker exec -i "$FS_CONTAINER" /bin/sh -c \
+        'exec 2>/dev/null; timeout 2 nc "$1" 15038 || true' sh "$AMI_HOST"
+}
+
 ami_rtp_stats() {
     local channel="$1"
     printf 'Action: Login\r\nUsername: harness\r\nSecret: pin-gate-local-only\r\n\r\nAction: RTPStats\r\nChannel: %s\r\n\r\nAction: Logoff\r\n\r\n' "$channel" \
-        | nc -w 2 127.0.0.1 15038
+        | ami_socket
+}
+
+ami_action() {
+    local action="$1"
+    printf 'Action: Login\r\nUsername: harness\r\nSecret: pin-gate-local-only\r\n\r\n%bAction: Logoff\r\n\r\n' "$action" \
+        | ami_socket
+}
+
+resource_snapshot() {
+    local response
+    local fields=(CoreCurrentCalls SIPDriverChannels SIPCallIdMappings SIPCallStates)
+    local values=()
+    response="$(ami_action $'Action: CoreStatus\r\n\r\n')"
+    for field in "${fields[@]}"; do
+        local value
+        value="$(stat_value "$field" "$response")"
+        [[ "$value" =~ ^[0-9]+$ ]] || fail "$field missing from CoreStatus: $response"
+        values+=("$value")
+    done
+    (IFS=/; printf '%s\n' "${values[*]}")
+}
+
+wait_for_resource_baseline() {
+    local label="$1"
+    local snapshot=""
+    for attempt in {0..20}; do
+        snapshot="$(resource_snapshot)"
+        if [[ "$snapshot" == "$BASELINE_RESOURCES" ]]; then
+            printf '%s: ResourceBaseline=%s RestoredInMs=%d\n' \
+                "$label" "$snapshot" "$((attempt * 100))"
+            return
+        fi
+        (( attempt < 20 )) && sleep 0.1
+    done
+    fail "$label resources did not return to exact baseline within 2s: baseline=$BASELINE_RESOURCES actual=$snapshot"
 }
 
 wait_for_completed_stats() {
@@ -168,6 +227,7 @@ run_case() {
         || fail "FreeSWITCH audio capture has no samples"
 
     printf '%s\n' "$stats" >"$RUNTIME_DIR/${expected,,}-rtp-stats.txt"
+    wait_for_resource_baseline "$expected"
     printf '%s: PASS (TX voice=%s, RX voice=%s, RX DTMF=%s)\n' \
         "$expected" \
         "$(stat_value RTPVoiceFramesTx "$stats")" \
@@ -175,46 +235,152 @@ run_case() {
         "$(stat_value RTPDTMFDigitsRx "$stats")"
 }
 
+run_outbound_listen_only_case() {
+    local destination="9100@$FS_CONTAINER_IP:5060"
+    local response
+    local action
+    # The two PIN calls consume the first two process-global channel suffixes.
+    # The harness is serial and starts a fresh rustisk process for every run.
+    local channel="PJSIP/$destination-00000003"
+    local stats
+    local capture="$RUNTIME_DIR/m1-listen-only.wav"
+
+    printf '\nRunning outbound listen-only receiver case...\n'
+    printf -v action 'Action: Originate\r\nActionID: m1-listen-only\r\nChannel: PJSIP/%s\r\nContext: outbound-proof\r\nExten: 9100\r\nPriority: 1\r\nTimeout: 5000\r\nAsync: true\r\n\r\n' \
+        "$destination"
+    response="$(ami_action "$action")"
+    grep -q 'Message: Originate successfully queued' <<<"$response" \
+        || fail "AMI outbound Originate was not queued: $response"
+
+    stats="$(wait_for_completed_stats "$channel")"
+    assert_counter_equals RTPVoiceFramesRx 0 "$stats"
+    assert_positive_counter RTPVoiceFramesTx "$stats"
+    printf '%s\n' "$stats" >"$RUNTIME_DIR/listen-only-rtp-stats.txt"
+
+    for _ in {1..20}; do
+        if docker cp "$FS_CONTAINER:/var/lib/freeswitch/recordings/m1-listen-only.wav" \
+            "$capture" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -f "$capture" ]] || fail "FreeSWITCH did not produce the far-side capture"
+    python3 "$HARNESS_DIR/assert_tone.py" "$capture" 660 \
+        | tee "$RUNTIME_DIR/listen-only-tone-proof.txt"
+
+    wait_for_resource_baseline "LISTEN_ONLY"
+    printf 'LISTEN_ONLY: PASS (RTPVoiceFramesRx=%s, RTPVoiceFramesTx=%s)\n' \
+        "$(stat_value RTPVoiceFramesRx "$stats")" \
+        "$(stat_value RTPVoiceFramesTx "$stats")"
+}
+
+run_dial_timeout_case() {
+    local before_cancel_count
+    local after_cancel_count
+    local originate_response
+    local uuid
+
+    printf '\nRunning Dial timeout CANCEL case...\n'
+    before_cancel_count="$(docker exec "$FS_CONTAINER" awk \
+        '/CANCEL sip:9199@/ { count++ } END { print count + 0 }' \
+        /var/log/freeswitch/freeswitch.log)"
+    if ! originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9001@$FS_HOST_IP:15060 &park()" 2>&1)"; then
+        fail "FreeSWITCH timeout-case originate failed: $originate_response"
+    fi
+    uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$uuid" ]] || fail "FreeSWITCH timeout-case originate failed: $originate_response"
+    wait_for_call_end "$uuid"
+
+    after_cancel_count="$(docker exec "$FS_CONTAINER" awk \
+        '/CANCEL sip:9199@/ { count++ } END { print count + 0 }' \
+        /var/log/freeswitch/freeswitch.log)"
+    (( after_cancel_count > before_cancel_count )) \
+        || fail "FreeSWITCH SIP trace did not observe CANCEL for the timed-out Dial leg"
+    docker exec "$FS_CONTAINER" grep 'CANCEL sip:9199@' \
+        /var/log/freeswitch/freeswitch.log \
+        >"$RUNTIME_DIR/dial-timeout-cancel-proof.txt"
+
+    wait_for_resource_baseline "DIAL_TIMEOUT"
+    printf 'DIAL_TIMEOUT: PASS (FreeSWITCH observed CANCEL, count delta=%d)\n' \
+        "$((after_cancel_count - before_cancel_count))"
+}
+
 require_command cargo
 require_command docker
-require_command nc
 require_command python3
 
 rm -rf "$RUNTIME_DIR"
 mkdir -p "$CONFIG_DIR" "$RUN_DIR" "$PROMPT_DIR"
 python3 "$HARNESS_DIR/generate_wavs.py" "$PROMPT_DIR"
+docker run --rm --entrypoint /bin/cat "$FS_IMAGE" \
+    /usr/share/freeswitch/conf/vanilla/vars.xml \
+    | sed \
+        -e 's|cmd="stun-set" data="external_rtp_ip=stun:stun.freeswitch.org"|cmd="set" data="external_rtp_ip=$${local_ip_v4}"|' \
+        -e 's|cmd="stun-set" data="external_sip_ip=stun:stun.freeswitch.org"|cmd="set" data="external_sip_ip=$${local_ip_v4}"|' \
+        >"$CONFIG_DIR/freeswitch-vars.xml"
+docker run --rm --entrypoint /bin/cat "$FS_IMAGE" \
+    /usr/share/freeswitch/conf/vanilla/sip_profiles/internal.xml \
+    | sed \
+        -e "s|\$\${local_ip_v4}|$FS_CONTAINER_IP|g" \
+        -e "s|\$\${external_rtp_ip}|$FS_CONTAINER_IP|g" \
+        -e "s|\$\${external_sip_ip}|$FS_CONTAINER_IP|g" \
+        -e 's|<param name="context" value="public"/>|<param name="context" value="default"/>|' \
+        -e 's|<param name="auth-calls" value="$${internal_auth_calls}"/>|<param name="auth-calls" value="false"/>|' \
+        -e '/<param name="apply-inbound-acl" value="domains"\/>/d' \
+        >"$CONFIG_DIR/freeswitch-internal.xml"
 
 sed \
     -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
     -e "s|@RUN_DIR@|$RUN_DIR|g" \
     "$HARNESS_DIR/config/asterisk.conf" >"$CONFIG_DIR/asterisk.conf"
-sed "s|@PROMPT_DIR@|$PROMPT_DIR|g" \
-    "$HARNESS_DIR/config/extensions.conf" >"$CONFIG_DIR/extensions.conf"
-cp "$HARNESS_DIR/config/manager.conf" "$CONFIG_DIR/manager.conf"
-cp "$HARNESS_DIR/config/pjsip.conf" "$CONFIG_DIR/pjsip.conf"
+sed 's/bindaddr = 127.0.0.1/bindaddr = 0.0.0.0/' \
+    "$HARNESS_DIR/config/manager.conf" >"$CONFIG_DIR/manager.conf"
+sed \
+    -e "s|@FS_CONTAINER_IP@|$FS_CONTAINER_IP|g" \
+    -e "s|bind = 0.0.0.0:15060|bind = $FS_HOST_IP:15060|" \
+    "$HARNESS_DIR/config/pjsip.conf" >"$CONFIG_DIR/pjsip.conf"
 cp "$HARNESS_DIR/config/rtp.conf" "$CONFIG_DIR/rtp.conf"
 
 printf 'Building rustisk with Rust 1.97.0...\n'
 (cd "$REPO_DIR" && cargo +1.97.0 build -p rustisk-cli)
 
-printf 'Starting isolated rustisk...\n'
-"$REPO_DIR/target/debug/rustisk" -f -vv -C "$CONFIG_DIR/asterisk.conf" \
-    >"$RUSTISK_LOG" 2>&1 &
-RUSTISK_PID=$!
-wait_for_ami
-
 printf 'Starting pinned FreeSWITCH carrier container...\n'
+docker network create --internal --subnet "$FS_SUBNET" "$FS_NETWORK" >/dev/null
 docker run --rm --name "$FS_CONTAINER" \
+    --network "$FS_NETWORK" \
+    --ip "$FS_CONTAINER_IP" \
     --add-host host.docker.internal:host-gateway \
+    --mount "type=bind,src=$CONFIG_DIR/freeswitch-vars.xml,dst=/usr/share/freeswitch/conf/vanilla/vars.xml,readonly" \
+    --mount "type=bind,src=$CONFIG_DIR/freeswitch-internal.xml,dst=/usr/share/freeswitch/conf/vanilla/sip_profiles/internal.xml,readonly" \
     --mount "type=bind,src=$HARNESS_DIR/config/event_socket.conf.xml,dst=/usr/share/freeswitch/conf/vanilla/autoload_configs/event_socket.conf.xml,readonly" \
+    --mount "type=bind,src=$HARNESS_DIR/config/m1-endpoints.xml,dst=/usr/share/freeswitch/conf/vanilla/dialplan/default/00-rustisk-m1.xml,readonly" \
     -d "$FS_IMAGE" >/dev/null
 wait_for_freeswitch
-FS_CONTAINER_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$FS_CONTAINER")"
-FS_HOST_IP="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$FS_CONTAINER")"
-[[ -n "$FS_CONTAINER_IP" && -n "$FS_HOST_IP" ]] || fail "could not resolve isolated Docker network addresses"
+fs_cli "sofia global siptrace on" >/dev/null
+
+sed \
+    -e "s|@PROMPT_DIR@|$PROMPT_DIR|g" \
+    -e "s|@FS_CONTAINER_IP@|$FS_CONTAINER_IP|g" \
+    "$HARNESS_DIR/config/extensions.conf" >"$CONFIG_DIR/extensions.conf"
+
+printf 'Starting isolated rustisk...\n'
+docker run --rm --name "$RUSTISK_CONTAINER" \
+    --network "$FS_NETWORK" \
+    --ip "$FS_HOST_IP" \
+    --user "$(id -u):$(id -g)" \
+    --entrypoint /rustisk \
+    --mount "type=bind,src=$REPO_DIR/target/debug/rustisk,dst=/rustisk,readonly" \
+    --mount "type=bind,src=$RUNTIME_DIR,dst=$RUNTIME_DIR" \
+    "$RUSTISK_IMAGE" -f -vv -C "$CONFIG_DIR/asterisk.conf" >"$RUSTISK_LOG" 2>&1 &
+RUSTISK_PID=$!
+wait_for_ami
+BASELINE_RESOURCES="$(resource_snapshot)"
+printf 'Exact resource baseline: %s (store/driver/call-id/state)\n' "$BASELINE_RESOURCES"
 
 run_case 1 123456 GRANTED
 run_case 2 123450 REJECTED
+run_outbound_listen_only_case
+run_dial_timeout_case
 
-printf '\nPASS: real FreeSWITCH SIP/RTP PIN gate completed both branches.\n'
+printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN and M1 outbound acceptance.\n'
 printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"

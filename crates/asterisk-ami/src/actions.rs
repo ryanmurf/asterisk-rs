@@ -387,6 +387,8 @@ fn handle_core_status(
 ) -> AmiResponse {
     let uptime_secs = STARTUP_TIME.elapsed().as_secs();
     let active_channels = asterisk_core::channel_store::count();
+    let sip_counts = asterisk_sip::get_global_event_handler()
+        .map(|handler| handler.resource_counts());
 
     // Format startup date/time from system time - epoch seconds of STARTUP_TIME
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -405,6 +407,18 @@ fn handle_core_status(
         .with_header("CoreReloadDate", &startup_date)
         .with_header("CoreReloadTime", &startup_time)
         .with_header("CoreCurrentCalls", active_channels.to_string())
+        .with_header(
+            "SIPDriverChannels",
+            sip_counts.map(|counts| counts.driver_channels).unwrap_or(0).to_string(),
+        )
+        .with_header(
+            "SIPCallIdMappings",
+            sip_counts.map(|counts| counts.call_id_mappings).unwrap_or(0).to_string(),
+        )
+        .with_header(
+            "SIPCallStates",
+            sip_counts.map(|counts| counts.call_states).unwrap_or(0).to_string(),
+        )
         .with_header("CoreStartupSecs", uptime_secs.to_string())
 }
 
@@ -581,6 +595,7 @@ fn handle_originate(
                     .with_header("Channel", &chan_name)
                     .with_header("Uniqueid", &chan_uid),
             );
+            let _ = driver.hangup(&mut call_channel).await;
             asterisk_core::channel_store::deregister(&chan_uid);
             return;
         }
@@ -596,6 +611,7 @@ fn handle_originate(
             let guard = store_chan.lock();
             let mut ch = asterisk_core::Channel::new(&guard.name);
             ch.unique_id = guard.unique_id.clone();
+            ch.state = guard.state;
             ch.context = guard.context.clone();
             ch.exten = guard.exten.clone();
             ch.priority = guard.priority;
@@ -626,13 +642,23 @@ fn handle_originate(
         } else {
             // Context/Exten mode: run through the dialplan
             info!("Originate: starting pbx_run for ;1 channel {}", chan_name);
-            let result = asterisk_core::pbx_run(pbx_channel, dialplan).await;
+            let result = asterisk_core::pbx_run(pbx_channel.clone(), dialplan).await;
             info!("Originate: pbx_run finished for channel {} result={:?}", chan_name, result);
             match result {
                 asterisk_core::PbxRunResult::Success => "Success",
                 _ => "Failure",
             }
         };
+
+        // PBX execution changes channel state, but technology teardown is the
+        // driver's responsibility. Without this call a direct PJSIP Originate
+        // leaves its dialog/RTP entry alive and never sends BYE.
+        {
+            let mut ch = pbx_channel.lock().await;
+            if let Err(error) = driver.hangup(&mut ch).await {
+                warn!("Originate: driver.hangup() failed for {}: {}", chan_name, error);
+            }
+        }
         crate::event_bus::publish_event(
             crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
                 .with_header("Response", response_str)
@@ -2453,6 +2479,29 @@ mod tests {
 
         assert!(resp.success);
         assert!(resp.headers.contains_key("Ping"));
+    }
+
+    #[test]
+    fn test_core_status_exposes_exact_sip_resource_counts() {
+        let (ctx, _reg) = make_context();
+        let (mut session, _rx) = make_authenticated_session();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+
+        let action = AmiAction::new("CoreStatus");
+        let resp = registry.dispatch(&action, &mut session, &ctx);
+
+        assert!(resp.success);
+        for field in [
+            "CoreCurrentCalls",
+            "SIPDriverChannels",
+            "SIPCallIdMappings",
+            "SIPCallStates",
+        ] {
+            assert!(
+                resp.headers.get(field).is_some_and(|value| value.parse::<usize>().is_ok()),
+                "{field} must be an exact numeric count"
+            );
+        }
     }
 
     #[test]
