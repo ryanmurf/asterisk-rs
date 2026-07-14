@@ -16,6 +16,7 @@ use tracing::{debug, info};
 
 use asterisk_codecs::{codecs, Codec};
 use asterisk_core::channel::{Channel, ChannelDriver};
+use asterisk_res::dns_srv::{CachingResolver, SipUriTarget, TransportType};
 use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
 
 use crate::media_stats::{complete_channel_media_stats, register_channel_media_stats};
@@ -40,6 +41,10 @@ struct SipChannelPrivate {
     rtp: Mutex<Option<Arc<RtpSession>>>,
     /// SIP transport to use.
     transport: Arc<dyn SipTransport>,
+    /// Canonical Request-URI selected while resolving the destination.
+    request_uri: String,
+    /// Every address returned for the destination, in resolver order.
+    remote_targets: Vec<SocketAddr>,
 }
 
 impl fmt::Debug for SipChannelPrivate {
@@ -78,6 +83,8 @@ pub struct SipChannelDriver {
     /// [`Self::request`] prefers a live dynamic contact binding over the
     /// static AoR contact so registered devices are reachable (issue #33).
     registrar: RwLock<Option<Arc<crate::registrar::Registrar>>>,
+    /// TTL-aware SIP destination resolver shared by outbound calls.
+    resolver: CachingResolver,
 }
 
 impl fmt::Debug for SipChannelDriver {
@@ -108,6 +115,7 @@ impl SipChannelDriver {
             ],
             rtp_allocator: Arc::new(RtpPortAllocator::new(range)),
             registrar: RwLock::new(None),
+            resolver: CachingResolver::new(),
         }
     }
 
@@ -210,11 +218,14 @@ impl SipChannelDriver {
         transport: Arc<dyn SipTransport>,
         rtp: RtpSession,
     ) {
+        let remote_addr = session.remote_addr;
         let stats = rtp.stats.clone();
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(session),
             rtp: Mutex::new(Some(Arc::new(rtp))),
             transport,
+            request_uri: String::new(),
+            remote_targets: vec![remote_addr],
         });
         self.channels.write().insert(channel_name.to_string(), priv_data);
         let unique_id = asterisk_core::channel_store::find_by_name(channel_name)
@@ -355,27 +366,13 @@ impl ChannelDriver for SipChannelDriver {
     async fn request(&self, dest: &str, _caller: Option<&Channel>) -> AsteriskResult<Channel> {
         let transport = self.get_transport()?;
 
-        // Parse destination to determine remote address and endpoint config.
+        // Select the canonical destination URI. Resolution happens once here;
+        // call() retains and tries the complete returned address set.
         let endpoint_config = crate::pjsip_config::get_global_pjsip_config();
-        let (_to_uri, remote_addr) = if dest.starts_with("sip:") || dest.starts_with("sips:") {
-            let uri = crate::parser::SipUri::parse(dest)
-                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid SIP URI: {}", e.0)))?;
-            let port = uri.port.unwrap_or(5060);
-            let addr: SocketAddr = format!("{}:{}", uri.host, port)
-                .parse()
-                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid address: {}", e)))?;
-            (dest.to_string(), addr)
+        let request_uri = if dest.starts_with("sip:") || dest.starts_with("sips:") {
+            dest.to_string()
         } else if dest.contains('@') || dest.contains(':') {
-            // Treat as user@host or host:port
-            let addr_str = if dest.contains(':') {
-                dest.to_string()
-            } else {
-                format!("{}:5060", dest)
-            };
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid dest: {}", e)))?;
-            (format!("sip:{}", dest), addr)
+            format!("sip:{}", dest)
         } else {
             // Treat as endpoint name -- resolve its AOR contact, preferring a
             // live registration over the static config contact (issue #33).
@@ -384,20 +381,43 @@ impl ChannelDriver for SipChannelDriver {
             if config.find_endpoint(dest).is_none() {
                 return Err(AsteriskError::NotFound(format!("Endpoint '{}' not found", dest)));
             }
-            let contact_uri = {
+            {
                 let reg_guard = self.registrar.read();
                 Self::resolve_endpoint_contact(config, reg_guard.as_deref(), dest)
             }
-            .unwrap_or_else(|| format!("sip:{}@127.0.0.1:5060", dest));
-            // Parse the contact URI to get the remote address
-            let uri = crate::parser::SipUri::parse(&contact_uri)
-                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid contact URI: {}", e.0)))?;
-            let port = uri.port.unwrap_or(5060);
-            let addr: SocketAddr = format!("{}:{}", uri.host, port)
-                .parse()
-                .map_err(|e| AsteriskError::InvalidArgument(format!("Invalid contact address: {}", e)))?;
-            (contact_uri, addr)
+            .unwrap_or_else(|| format!("sip:{}@127.0.0.1:5060", dest))
         };
+
+        let mut target = SipUriTarget::parse(&request_uri).ok_or_else(|| {
+            AsteriskError::InvalidArgument(format!("Invalid SIP URI: {request_uri}"))
+        })?;
+        if target.scheme == "sips"
+            || matches!(target.transport, Some(TransportType::Tcp | TransportType::Tls))
+        {
+            return Err(AsteriskError::InvalidArgument(
+                "SIP channel driver currently supports UDP destinations only".into(),
+            ));
+        }
+        target.port = Some(target.port.unwrap_or(TransportType::Udp.default_port()));
+        target.transport = Some(TransportType::Udp);
+        let resolved = self.resolver.resolve(&target).await.map_err(|error| {
+            AsteriskError::InvalidArgument(format!(
+                "Failed to resolve SIP destination {request_uri}: {error}"
+            ))
+        })?;
+        let mut remote_targets = Vec::with_capacity(resolved.len());
+        for resolved_target in resolved {
+            if resolved_target.transport == TransportType::Udp
+                && !remote_targets.contains(&resolved_target.address)
+            {
+                remote_targets.push(resolved_target.address);
+            }
+        }
+        let remote_addr = *remote_targets.first().ok_or_else(|| {
+            AsteriskError::InvalidArgument(format!(
+                "SIP destination {request_uri} resolved to no UDP addresses"
+            ))
+        })?;
 
         // Create RTP session
         let rtp_session = self.allocate_rtp_session(self.local_addr.ip()).await?;
@@ -441,6 +461,8 @@ impl ChannelDriver for SipChannelDriver {
             session: Mutex::new(sip_session),
             rtp: Mutex::new(Some(Arc::new(rtp_session))),
             transport,
+            request_uri,
+            remote_targets,
         });
 
         self.channels.write().insert(channel_name.clone(), priv_data);
@@ -469,33 +491,38 @@ impl ChannelDriver for SipChannelDriver {
         let mut session = priv_data.session.lock().await;
         // Build the Request-URI. Use the full contact address so the
         // inbound side can extract the user part as the dialed extension.
-        let request_uri = if dest.starts_with("sip:") || dest.starts_with("sips:") {
-            dest.to_string()
-        } else {
-            // Look up AOR contact for a proper Request-URI with user@host
-            let endpoint_config = crate::pjsip_config::get_global_pjsip_config();
-            let contact = endpoint_config.as_ref().and_then(|cfg| {
-                let ep = cfg.find_endpoint(dest)?;
-                let aor_name = ep.aors.as_deref().unwrap_or(dest);
-                let aor = cfg.find_aor(aor_name)?;
-                aor.contact.first().cloned()
-            });
-            contact.unwrap_or_else(|| format!("sip:{}@{}", dest, session.remote_addr))
-        };
+        let request_uri = &priv_data.request_uri;
         let to_uri = if dest.starts_with("sip:") {
             dest.to_string()
         } else {
             format!("sip:{}", dest)
         };
 
-        let invite = session.build_invite_with_uri(&request_uri, &to_uri);
+        let invite = session.build_invite_with_uri(request_uri, &to_uri);
 
-        // Send the INVITE
-        priv_data
-            .transport
-            .send(&invite, session.remote_addr)
-            .await
-            .map_err(|e| AsteriskError::Internal(format!("Failed to send INVITE: {}", e)))?;
+        // Preserve resolver ordering, but do not pin a call to one address if
+        // the transport rejects it. The selected address becomes the dialog's
+        // signalling peer for subsequent CANCEL/BYE requests.
+        let mut last_error = None;
+        for remote_addr in &priv_data.remote_targets {
+            match priv_data.transport.send(&invite, *remote_addr).await {
+                Ok(()) => {
+                    session.remote_addr = *remote_addr;
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    debug!(dest, %remote_addr, %error,
+                        "SIP destination address failed; trying next DNS result");
+                    last_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(AsteriskError::Internal(format!(
+                "Failed to send INVITE to every resolved address: {error}"
+            )));
+        }
 
         // Register Call-ID mapping and session so responses can be routed
         // and ACK/BYE can be sent later
@@ -711,8 +738,42 @@ mod tests {
     use super::*;
     use crate::parser::{header_names, SipHeader, SipMessage};
     use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct FailAddressTransport {
+        local_addr: SocketAddr,
+        failed_addr: SocketAddr,
+        attempts: StdMutex<Vec<SocketAddr>>,
+    }
+
+    #[async_trait]
+    impl SipTransport for FailAddressTransport {
+        async fn send(
+            &self,
+            _msg: &SipMessage,
+            addr: SocketAddr,
+        ) -> Result<(), crate::transport::TransportError> {
+            self.attempts.lock().unwrap().push(addr);
+            if addr == self.failed_addr {
+                Err(crate::transport::TransportError::Connection(
+                    "injected address failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr, crate::transport::TransportError> {
+            Ok(self.local_addr)
+        }
+
+        fn protocol(&self) -> &str {
+            "UDP"
+        }
+    }
 
     // --- issue #33: outbound routing consults the registrar ---------------
 
@@ -782,6 +843,36 @@ mod tests {
             SipChannelDriver::resolve_endpoint_contact(&cfg, None, "999"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn fqdn_request_retains_and_tries_the_resolved_address_set() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let first: SocketAddr = "127.0.0.2:5099".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+        let transport = Arc::new(FailAddressTransport {
+            local_addr: local,
+            failed_addr: first,
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport.clone());
+        driver.resolver.cache().put_addresses(
+            "multi.invalid",
+            vec![first.ip(), second.ip(), second.ip()],
+            Duration::from_secs(60),
+        );
+
+        let destination = "sip:listener@multi.invalid:5099";
+        let mut channel = driver.request(destination, None).await.unwrap();
+        let private = driver.get_private(&channel.name).unwrap();
+        assert_eq!(private.remote_targets, vec![first, second]);
+
+        driver.call(&mut channel, destination, 30).await.unwrap();
+
+        assert_eq!(*transport.attempts.lock().unwrap(), vec![first, second]);
+        assert_eq!(private.session.lock().await.remote_addr, second);
+        driver.remove_channel(&channel.name);
     }
 
     // --- issue #36: inbound channel stores the real session so indicate works -

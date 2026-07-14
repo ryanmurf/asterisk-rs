@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio::net;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -224,7 +223,7 @@ impl DnsCache {
     }
 
     /// Store address records.
-    fn put_addresses(&self, name: &str, addrs: Vec<IpAddr>, ttl: Duration) {
+    pub fn put_addresses(&self, name: &str, addrs: Vec<IpAddr>, ttl: Duration) {
         let entry = CacheEntry {
             data: CachedData::Addresses(addrs),
             expires_at: Instant::now() + ttl,
@@ -416,17 +415,33 @@ pub fn sort_srv_records(records: &mut Vec<SrvRecord>) {
 
 /// Look up A/AAAA records for a hostname.
 pub async fn lookup_host(name: &str) -> Result<Vec<IpAddr>, DnsError> {
-    let addrs = net::lookup_host(format!("{}:0", name))
-        .await
-        .map_err(|e| DnsError::ResolutionFailed(format!("{}: {}", name, e)))?
-        .map(|sa| sa.ip())
-        .collect::<Vec<_>>();
+    Ok(lookup_host_with_ttl(name).await?.addresses)
+}
+
+/// A complete A/AAAA answer and the remaining validity interval reported by
+/// DNS. Callers must not retain the address set beyond `valid_for`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLookup {
+    pub addresses: Vec<IpAddr>,
+    pub valid_for: Duration,
+}
+
+/// Look up the full A/AAAA set and preserve its DNS TTL boundary.
+pub async fn lookup_host_with_ttl(name: &str) -> Result<HostLookup, DnsError> {
+    let resolver = hickory_resolver::Resolver::builder_tokio()
+        .map_err(|e| DnsError::ResolutionFailed(format!("resolver config: {e}")))?
+        .build()
+        .map_err(|e| DnsError::ResolutionFailed(format!("resolver build: {e}")))?;
+    let lookup = resolver.lookup_ip(name).await
+        .map_err(|e| DnsError::ResolutionFailed(format!("{}: {}", name, e)))?;
+    let valid_for = lookup.valid_until().saturating_duration_since(Instant::now());
+    let addrs = lookup.iter().collect::<Vec<_>>();
 
     if addrs.is_empty() {
         return Err(DnsError::NxDomain(name.to_string()));
     }
 
-    Ok(addrs)
+    Ok(HostLookup { addresses: addrs, valid_for })
 }
 
 /// Look up SRV records for a name.
@@ -698,19 +713,20 @@ impl CachingResolver {
             if self.cache.is_nxdomain(&uri.host) {
                 return Err(DnsError::NxDomain(uri.host.clone()));
             }
-        }
 
-        // Fall through to full resolution.
-        let results = resolve_sip_uri(uri).await?;
-
-        // Cache the results.
-        if !results.is_empty() {
-            let addrs: Vec<IpAddr> = results.iter().map(|r| r.address.ip()).collect();
+            let lookup = lookup_host_with_ttl(&uri.host).await?;
             self.cache
-                .put_addresses(&uri.host, addrs, Duration::from_secs(300));
+                .put_addresses(&uri.host, lookup.addresses.clone(), lookup.valid_for);
+            return Ok(lookup.addresses.into_iter().map(|ip| ResolvedTarget {
+                address: SocketAddr::new(ip, port),
+                transport,
+            }).collect());
         }
 
-        Ok(results)
+        // The stub SRV/NAPTR path does not expose record TTLs, so do not cache
+        // its result rather than inventing a lifetime that could pin stale
+        // Voice Connector addresses.
+        resolve_sip_uri(uri).await
     }
 
     /// Get a reference to the underlying cache.
@@ -994,19 +1010,17 @@ mod tests {
     #[test]
     fn test_dns_cache_expiry() {
         let cache = DnsCache::new();
-        // Insert with 0 TTL -- should be expired immediately.
         cache.put_addresses(
             "expired.example.com",
             vec!["10.0.0.1".parse().unwrap()],
             Duration::from_secs(0),
         );
-        // The entry was just inserted with Duration::from_secs(0), so
-        // Instant::now() should be >= expires_at.
-        // However, this is a race -- in practice, it may or may not be expired yet.
-        // We test purge_expired instead.
+        assert!(
+            cache.get_addresses("expired.example.com").is_none(),
+            "a DNS address set must not be returned after its TTL boundary"
+        );
         cache.purge_expired();
-        // After purge, the entry should be gone if it expired.
-        // If not (race), that is fine too.
+        assert!(cache.is_empty());
     }
 
     #[test]
