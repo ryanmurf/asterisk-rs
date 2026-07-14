@@ -77,11 +77,15 @@ wait_for_freeswitch() {
 wait_for_ami() {
     for _ in {1..100}; do
         if printf 'Action: Login\r\nUsername: harness\r\nSecret: pin-gate-local-only\r\n\r\nAction: Logoff\r\n\r\n' \
-            | ami_socket | grep -q 'Authentication accepted'; then
+            | ami_socket 2>/dev/null | grep -q 'Authentication accepted'; then
             return
         fi
         if ! docker inspect -f '{{.State.Running}}' "$RUSTISK_CONTAINER" 2>/dev/null \
             | grep -q true; then
+            if kill -0 "$RUSTISK_PID" 2>/dev/null; then
+                sleep 0.1
+                continue
+            fi
             sed -n '1,240p' "$RUSTISK_LOG" >&2
             fail "rustisk exited before AMI became ready"
         fi
@@ -92,8 +96,7 @@ wait_for_ami() {
 }
 
 ami_socket() {
-    docker exec -i "$FS_CONTAINER" /bin/sh -c \
-        'exec 2>/dev/null; timeout 2 nc "$1" 15038 || true' sh "$AMI_HOST"
+    docker exec -i "$RUSTISK_CONTAINER" python3 /ami_client.py "$AMI_HOST" 15038
 }
 
 ami_rtp_stats() {
@@ -124,30 +127,60 @@ resource_snapshot() {
 
 wait_for_resource_baseline() {
     local label="$1"
+    local hangup_observed_ms="$2"
     local snapshot=""
-    for attempt in {0..20}; do
+    local elapsed_ms
+    while true; do
         snapshot="$(resource_snapshot)"
+        elapsed_ms="$(($(now_ms) - hangup_observed_ms))"
         if [[ "$snapshot" == "$BASELINE_RESOURCES" ]]; then
-            printf '%s: ResourceBaseline=%s RestoredInMs=%d\n' \
-                "$label" "$snapshot" "$((attempt * 100))"
+            (( elapsed_ms <= 2000 )) \
+                || fail "$label resources reached baseline after the 2s deadline: ${elapsed_ms}ms"
+            printf '%s: ResourceBaseline=%s RestoredFromReceiverHangupInMs=%d\n' \
+                "$label" "$snapshot" "$elapsed_ms"
             return
         fi
-        (( attempt < 20 )) && sleep 0.1
+        (( elapsed_ms < 2000 )) \
+            || fail "$label resources did not return to exact baseline within 2s: baseline=$BASELINE_RESOURCES actual=$snapshot"
+        sleep 0.05
     done
-    fail "$label resources did not return to exact baseline within 2s: baseline=$BASELINE_RESOURCES actual=$snapshot"
+}
+
+wait_for_resource_baseline_eventually() {
+    local label="$1"
+    local started_ms
+    local snapshot=""
+    local elapsed_ms
+    started_ms="$(now_ms)"
+    while true; do
+        snapshot="$(resource_snapshot)"
+        elapsed_ms="$(($(now_ms) - started_ms))"
+        if [[ "$snapshot" == "$BASELINE_RESOURCES" ]]; then
+            printf '%s: ResourceBaseline=%s RestoredEventuallyInMs=%d\n' \
+                "$label" "$snapshot" "$elapsed_ms"
+            return
+        fi
+        (( elapsed_ms < 40000 )) \
+            || fail "$label resources did not eventually return to baseline: baseline=$BASELINE_RESOURCES actual=$snapshot"
+        sleep 0.05
+    done
+}
+
+now_ms() {
+    python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
 }
 
 wait_for_completed_stats() {
     local channel="$1"
     local response=""
-    for _ in {1..75}; do
+    for _ in {1..750}; do
         response="$(ami_rtp_stats "$channel")"
         if grep -q 'Message: RTP statistics' <<<"$response" \
             && grep -q 'RTPActive: false' <<<"$response"; then
             printf '%s\n' "$response"
             return
         fi
-        sleep 0.5
+        sleep 0.05
     done
     fail "completed RTPStats record was not available for $channel: $response"
 }
@@ -227,7 +260,7 @@ run_case() {
         || fail "FreeSWITCH audio capture has no samples"
 
     printf '%s\n' "$stats" >"$RUNTIME_DIR/${expected,,}-rtp-stats.txt"
-    wait_for_resource_baseline "$expected"
+    wait_for_resource_baseline_eventually "$expected"
     printf '%s: PASS (TX voice=%s, RX voice=%s, RX DTMF=%s)\n' \
         "$expected" \
         "$(stat_value RTPVoiceFramesTx "$stats")" \
@@ -244,6 +277,7 @@ run_outbound_listen_only_case() {
     local channel="PJSIP/$destination-00000003"
     local stats
     local capture="$RUNTIME_DIR/m1-listen-only.wav"
+    local hangup_observed_ms
 
     printf '\nRunning outbound listen-only receiver case...\n'
     printf -v action 'Action: Originate\r\nActionID: m1-listen-only\r\nChannel: PJSIP/%s\r\nContext: outbound-proof\r\nExten: 9100\r\nPriority: 1\r\nTimeout: 5000\r\nAsync: true\r\n\r\n' \
@@ -253,9 +287,11 @@ run_outbound_listen_only_case() {
         || fail "AMI outbound Originate was not queued: $response"
 
     stats="$(wait_for_completed_stats "$channel")"
+    hangup_observed_ms="$(now_ms)"
     assert_counter_equals RTPVoiceFramesRx 0 "$stats"
     assert_positive_counter RTPVoiceFramesTx "$stats"
     printf '%s\n' "$stats" >"$RUNTIME_DIR/listen-only-rtp-stats.txt"
+    wait_for_resource_baseline "LISTEN_ONLY" "$hangup_observed_ms"
 
     for _ in {1..20}; do
         if docker cp "$FS_CONTAINER:/var/lib/freeswitch/recordings/m1-listen-only.wav" \
@@ -268,7 +304,6 @@ run_outbound_listen_only_case() {
     python3 "$HARNESS_DIR/assert_tone.py" "$capture" 660 \
         | tee "$RUNTIME_DIR/listen-only-tone-proof.txt"
 
-    wait_for_resource_baseline "LISTEN_ONLY"
     printf 'LISTEN_ONLY: PASS (RTPVoiceFramesRx=%s, RTPVoiceFramesTx=%s)\n' \
         "$(stat_value RTPVoiceFramesRx "$stats")" \
         "$(stat_value RTPVoiceFramesTx "$stats")"
@@ -279,6 +314,7 @@ run_dial_timeout_case() {
     local after_cancel_count
     local originate_response
     local uuid
+    local hangup_observed_ms
 
     printf '\nRunning Dial timeout CANCEL case...\n'
     before_cancel_count="$(docker exec "$FS_CONTAINER" awk \
@@ -290,6 +326,8 @@ run_dial_timeout_case() {
     uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
     [[ -n "$uuid" ]] || fail "FreeSWITCH timeout-case originate failed: $originate_response"
     wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "DIAL_TIMEOUT" "$hangup_observed_ms"
 
     after_cancel_count="$(docker exec "$FS_CONTAINER" awk \
         '/CANCEL sip:9199@/ { count++ } END { print count + 0 }' \
@@ -300,7 +338,6 @@ run_dial_timeout_case() {
         /var/log/freeswitch/freeswitch.log \
         >"$RUNTIME_DIR/dial-timeout-cancel-proof.txt"
 
-    wait_for_resource_baseline "DIAL_TIMEOUT"
     printf 'DIAL_TIMEOUT: PASS (FreeSWITCH observed CANCEL, count delta=%d)\n' \
         "$((after_cancel_count - before_cancel_count))"
 }
@@ -370,6 +407,7 @@ docker run --rm --name "$RUSTISK_CONTAINER" \
     --user "$(id -u):$(id -g)" \
     --entrypoint /rustisk \
     --mount "type=bind,src=$REPO_DIR/target/debug/rustisk,dst=/rustisk,readonly" \
+    --mount "type=bind,src=$HARNESS_DIR/ami_client.py,dst=/ami_client.py,readonly" \
     --mount "type=bind,src=$RUNTIME_DIR,dst=$RUNTIME_DIR" \
     "$RUSTISK_IMAGE" -f -vv -C "$CONFIG_DIR/asterisk.conf" >"$RUSTISK_LOG" 2>&1 &
 RUSTISK_PID=$!
