@@ -154,6 +154,7 @@ pub fn register_all_apps() {
     use crate::hangup::AppHangup;
     use crate::if_::{AppGotoIf, AppGotoIfTime, AppIf, AppElseIf, AppElse, AppEndIf};
     use crate::playback::AppPlayback;
+    use crate::read::AppRead;
     use crate::set::{AppMSet, AppSet};
     use crate::stack::{AppGoSub, AppGoSubIf, AppReturn, AppStackPop};
     use crate::verbose::{AppLog, AppNoOp, AppVerbose};
@@ -257,6 +258,13 @@ pub fn register_all_apps() {
         "Playback",
         "Play a file to the channel",
         |channel, args| Box::pin(AppPlayback::exec(channel, args)),
+    )));
+
+    // Read - async prompt and receiver-side DTMF collection
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "Read",
+        "Read DTMF digits from the caller",
+        |channel, args| Box::pin(AppRead::exec(channel, args)),
     )));
 
     // Echo - async exec (takes only channel, no args)
@@ -513,7 +521,6 @@ fn register_stub_apps() {
     register_stub!("Transfer", "Transfer caller to a new extension");
     register_stub!("SoftHangup", "Request a hangup on a given channel");
     register_stub!("Originate", "Originate a new outbound call");
-    register_stub!("Read", "Read DTMF digits from the caller");
     register_stub!("System", "Execute a system command");
     register_stub!("TrySystem", "Execute a system command (non-fatal)");
     register_stub!("SendText", "Send text to a channel");

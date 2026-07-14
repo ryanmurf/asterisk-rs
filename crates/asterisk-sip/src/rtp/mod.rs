@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::net::UdpSocket;
 use tracing::debug;
 
@@ -336,6 +336,9 @@ pub struct RtpSession {
     pub payload_type: u8,
     /// Negotiated telephone-event payload type (RFC 4733).
     dtmf_payload_type: AtomicU8,
+    /// Last emitted RFC 4733 end event. Senders repeat end packets for
+    /// reliability; only one logical digit may reach dialplan applications.
+    last_dtmf_end: Mutex<Option<(u32, u32, u8)>>,
     /// Samples per packet (for timestamp advancement).
     pub samples_per_packet: u32,
     /// Statistics.
@@ -368,6 +371,7 @@ impl RtpSession {
             timestamp: AtomicU32::new(0),
             payload_type: 0,
             dtmf_payload_type: AtomicU8::new(NO_DTMF_PAYLOAD_TYPE),
+            last_dtmf_end: Mutex::new(None),
             samples_per_packet: 160,
             stats: RtpStats::default(),
         }
@@ -504,6 +508,12 @@ impl RtpSession {
             if let Some(event) = DtmfEvent::from_bytes(payload) {
                 let digit = DtmfEvent::event_to_digit(event.event);
                 if event.end {
+                    let event_key = (header.ssrc, header.timestamp, event.event);
+                    let mut last_end = self.last_dtmf_end.lock();
+                    if *last_end == Some(event_key) {
+                        return Ok(Frame::Null);
+                    }
+                    *last_end = Some(event_key);
                     return Ok(Frame::dtmf_end(digit, event.duration as u32 / 8));
                 } else {
                     return Ok(Frame::dtmf_begin(digit));
@@ -1160,6 +1170,46 @@ mod tests {
         assert!(parsed.end);
         assert_eq!(parsed.volume, 10);
         assert_eq!(parsed.duration, 1600);
+    }
+
+    #[tokio::test]
+    async fn repeated_dtmf_end_packets_emit_one_logical_digit() {
+        let session = RtpSession::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        session.set_dtmf_payload_type(110);
+        let target = session.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let event = DtmfEvent {
+            event: 5,
+            end: true,
+            volume: 10,
+            duration: 800,
+        };
+
+        for sequence in 1..=3 {
+            let header = RtpHeader {
+                version: 2,
+                padding: false,
+                extension: false,
+                csrc_count: 0,
+                marker: false,
+                payload_type: 110,
+                sequence,
+                timestamp: 160,
+                ssrc: 0x12345678,
+            };
+            peer.send_to(&build_rtp_packet(&header, &event.to_bytes()), target)
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            session.recv_frame().await.unwrap(),
+            Frame::DtmfEnd { digit: '5', .. }
+        ));
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Null));
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Null));
     }
 
     #[test]
