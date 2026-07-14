@@ -159,6 +159,9 @@ impl ActionRegistry {
         // Status
         self.register("status", Box::new(handle_status));
 
+        // RTPStats
+        self.register("rtpstats", Box::new(handle_rtp_stats));
+
         // ShowDialPlan
         self.register("showdialplan", Box::new(handle_show_dialplan));
 
@@ -1140,6 +1143,50 @@ fn handle_status(
     resp
 }
 
+/// Handle RTPStats action for an active or recently completed SIP call.
+fn handle_rtp_stats(
+    action: &AmiAction,
+    _session: &mut AmiSession,
+    _context: &ActionContext,
+) -> AmiResponse {
+    let query = match action
+        .get_header("Channel")
+        .or_else(|| action.get_header("Uniqueid"))
+    {
+        Some(query) => query,
+        None => return AmiResponse::error("Channel or Uniqueid is required"),
+    };
+
+    let Some(stats) = asterisk_sip::lookup_call_media_stats(query) else {
+        return AmiResponse::error(format!("No RTP statistics for '{query}'"));
+    };
+
+    AmiResponse::success("RTP statistics")
+        .with_header("Channel", stats.channel)
+        .with_header("Uniqueid", stats.unique_id.unwrap_or_default())
+        .with_header("RTPActive", stats.active.to_string())
+        .with_header("RTPPacketsTx", stats.rtp.packets_sent.to_string())
+        .with_header("RTPPacketsRx", stats.rtp.packets_received.to_string())
+        .with_header("RTPOctetsTx", stats.rtp.octets_sent.to_string())
+        .with_header("RTPOctetsRx", stats.rtp.octets_received.to_string())
+        .with_header(
+            "RTPVoiceFramesTx",
+            stats.rtp.voice_frames_sent.to_string(),
+        )
+        .with_header(
+            "RTPVoiceFramesRx",
+            stats.rtp.voice_frames_received.to_string(),
+        )
+        .with_header(
+            "RTPDTMFDigitsTx",
+            stats.rtp.dtmf_digits_sent.to_string(),
+        )
+        .with_header(
+            "RTPDTMFDigitsRx",
+            stats.rtp.dtmf_digits_received.to_string(),
+        )
+}
+
 /// Handle ShowDialPlan action.
 fn handle_show_dialplan(
     action: &AmiAction,
@@ -1164,6 +1211,7 @@ fn handle_list_commands(
         .with_header("Ping", "Keepalive command (Privilege: <none>)")
         .with_header("Hangup", "Hangup channel (Privilege: system,call)")
         .with_header("Status", "Lists channel status (Privilege: system,call)")
+        .with_header("RTPStats", "Show per-call RTP proof counters (Privilege: call)")
         .with_header("Originate", "Originate a call (Privilege: originate)")
         .with_header("Redirect", "Redirect (transfer) a call (Privilege: call)")
         .with_header("Command", "Execute Asterisk CLI Command (Privilege: command)")
@@ -2511,6 +2559,7 @@ mod tests {
         assert!(resp.success);
         assert!(resp.headers.contains_key("Ping"));
         assert!(resp.headers.contains_key("Originate"));
+        assert!(resp.headers.contains_key("RTPStats"));
     }
 
     #[test]
@@ -2523,6 +2572,147 @@ mod tests {
         action.set_header("ActionID", "my-unique-id-42");
         let resp = registry.dispatch(&action, &mut session, &ctx);
         assert_eq!(resp.action_id.as_deref(), Some("my-unique-id-42"));
+    }
+
+    #[tokio::test]
+    async fn rtp_stats_reports_bidirectional_voice_and_detected_dtmf_after_hangup() {
+        use asterisk_core::channel::ChannelDriver;
+        use asterisk_sip::rtp::{build_rtp_packet, DtmfEvent, RtpHeader};
+        use asterisk_sip::transport::UdpTransport;
+        use asterisk_sip::{SipChannelDriver, SipTransport};
+
+        let local = "127.0.0.1:0".parse().unwrap();
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind(local).await.unwrap(),
+        );
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport);
+        let mut channel = driver
+            .request("sip:stats@127.0.0.1:9", None)
+            .await
+            .unwrap();
+        let unique_id = channel.unique_id.0.clone();
+        let rtp_port = driver
+            .channel_rtp_local_port(&channel.name)
+            .await
+            .unwrap();
+        let target: std::net::SocketAddr =
+            format!("127.0.0.1:{rtp_port}").parse().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver.channel_rtp_dtmf_payload_type(&channel.name).await,
+            Some(101)
+        );
+
+        let voice_header = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 0,
+            marker: false,
+            payload_type: 0,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 0x12345678,
+        };
+        peer.send_to(&build_rtp_packet(&voice_header, &[0x7f; 160]), target)
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            asterisk_types::Frame::Voice { .. }
+        ));
+        driver
+            .write_frame(
+                &mut channel,
+                &asterisk_types::Frame::voice(0, 160, vec![0x7f; 160].into()),
+            )
+            .await
+            .unwrap();
+
+        let digit = DtmfEvent {
+            event: 5,
+            end: true,
+            volume: 10,
+            duration: 800,
+        };
+        for sequence in 2..=4 {
+            let header = RtpHeader {
+                payload_type: 101,
+                sequence,
+                timestamp: 320,
+                ..voice_header
+            };
+            peer.send_to(&build_rtp_packet(&header, &digit.to_bytes()), target)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            asterisk_types::Frame::DtmfEnd { digit: '5', .. }
+        ));
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            asterisk_types::Frame::Null
+        ));
+        assert!(matches!(
+            driver.read_frame(&mut channel).await.unwrap(),
+            asterisk_types::Frame::Null
+        ));
+        driver.send_digit_end(&mut channel, '6', 100).await.unwrap();
+
+        let (ctx, _reg) = make_context();
+        let (mut session, _rx) = make_authenticated_session();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        let mut action = AmiAction::new("RTPStats");
+        action.set_header("Channel", &channel.name);
+        let active = registry.dispatch(&action, &mut session, &ctx);
+        assert!(active.success);
+        assert_eq!(
+            active.headers.get("RTPActive").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            active.headers.get("RTPVoiceFramesTx").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            active.headers.get("RTPVoiceFramesRx").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            active.headers.get("RTPDTMFDigitsTx").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            active.headers.get("RTPDTMFDigitsRx").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            active.headers.get("RTPPacketsTx").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            active.headers.get("RTPPacketsRx").map(String::as_str),
+            Some("4")
+        );
+
+        driver.hangup(&mut channel).await.unwrap();
+        let mut completed_action = AmiAction::new("RTPStats");
+        completed_action.set_header("Uniqueid", &unique_id);
+        let completed = registry.dispatch(&completed_action, &mut session, &ctx);
+        assert!(completed.success);
+        assert_eq!(
+            completed.headers.get("RTPActive").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            completed.headers.get("RTPDTMFDigitsRx").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test] 
