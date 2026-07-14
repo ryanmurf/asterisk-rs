@@ -254,42 +254,82 @@ impl SipChannelDriver {
             .map(|a| a.port())
     }
 
-    /// Install (or clear) the telephone-event payload type from negotiated
-    /// remote SDP on an existing call.
-    pub(crate) async fn install_negotiated_dtmf_payload(
-        &self,
-        channel_name: &str,
-        sdp: &SessionDescription,
-    ) -> AsteriskResult<()> {
-        let priv_data = self
-            .get_private(channel_name)
-            .ok_or_else(|| AsteriskError::NotFound(channel_name.to_string()))?;
-        let rtp = priv_data
-            .rtp
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
-
-        let negotiated = crate::sdp_rtp::negotiated_dtmf_payload_type(sdp, &self.codecs);
-        if let Some(payload_type) = negotiated {
-            rtp.set_dtmf_payload_type(payload_type);
-        } else {
-            rtp.clear_dtmf_payload_type();
-        }
-        debug!(
-            channel = channel_name,
-            payload_type = ?negotiated,
-            "Installed negotiated telephone-event payload type"
-        );
-        Ok(())
-    }
-
     /// Return the channel's negotiated telephone-event payload type.
     pub async fn channel_rtp_dtmf_payload_type(&self, channel_name: &str) -> Option<u8> {
         let priv_data = self.get_private(channel_name)?;
         let rtp = priv_data.rtp.lock().await.clone()?;
         rtp.dtmf_payload_type()
+    }
+
+    /// Apply an outbound INVITE answer to the driver-owned dialog and media
+    /// session used by `hangup`, `write_frame`, and RTP.
+    pub(crate) async fn apply_outbound_answer(
+        &self,
+        channel_name: &str,
+        response: &crate::parser::SipMessage,
+    ) -> AsteriskResult<()> {
+        let priv_data = self.get_private(channel_name)
+            .ok_or_else(|| AsteriskError::NotFound(channel_name.to_string()))?;
+
+        let remote_sdp = {
+            let mut session = priv_data.session.lock().await;
+            session.on_response(response);
+            session.remote_sdp.clone().ok_or_else(|| {
+                AsteriskError::InvalidArgument("200 OK has no valid SDP answer".into())
+            })?
+        };
+
+        let payload_type = crate::sdp_rtp::negotiated_audio_payload_type(
+            &remote_sdp, &self.codecs,
+        ).ok_or_else(|| {
+            AsteriskError::InvalidArgument("SDP answer has no common audio codec".into())
+        })?;
+        let remote_addr = crate::sdp_rtp::remote_rtp_endpoint(&remote_sdp)
+            .ok_or_else(|| {
+                AsteriskError::InvalidArgument(
+                    "SDP answer has no active IP audio endpoint".into(),
+                )
+            })?;
+
+        let rtp = priv_data.rtp.lock().await.clone()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+        rtp.set_remote_addr(remote_addr);
+        rtp.set_payload_type(payload_type);
+
+        let dtmf = crate::sdp_rtp::negotiated_dtmf_payload_type(
+            &remote_sdp, &self.codecs,
+        );
+        if let Some(dtmf_payload_type) = dtmf {
+            rtp.set_dtmf_payload_type(dtmf_payload_type);
+        } else {
+            rtp.clear_dtmf_payload_type();
+        }
+
+        debug!(channel = channel_name, %remote_addr, payload_type,
+            dtmf_payload_type = ?dtmf,
+            "Applied outbound SDP answer to driver media session");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn channel_rtp_remote_addr(&self, channel_name: &str) -> Option<SocketAddr> {
+        let priv_data = self.get_private(channel_name)?;
+        let remote_addr = priv_data.rtp.lock().await.clone()?.remote_addr();
+        remote_addr
+    }
+
+    #[cfg(test)]
+    async fn channel_rtp_payload_type(&self, channel_name: &str) -> Option<u8> {
+        let priv_data = self.get_private(channel_name)?;
+        let payload_type = priv_data.rtp.lock().await.clone()?.payload_type();
+        Some(payload_type)
+    }
+
+    #[cfg(test)]
+    async fn channel_session_state(&self, channel_name: &str) -> Option<SessionState> {
+        let priv_data = self.get_private(channel_name)?;
+        let state = priv_data.session.lock().await.state;
+        Some(state)
     }
 
     fn get_transport(&self) -> AsteriskResult<Arc<dyn SipTransport>> {
@@ -592,7 +632,7 @@ impl ChannelDriver for SipChannelDriver {
     async fn audio_format(&self, channel: &Channel) -> Option<u32> {
         let priv_data = self.get_private(&channel.name)?;
         let rtp_guard = priv_data.rtp.lock().await;
-        rtp_guard.as_ref().map(|rtp| rtp.payload_type as u32)
+        rtp_guard.as_ref().map(|rtp| rtp.payload_type() as u32)
     }
 
     /// Send DTMF via RFC 2833.
@@ -669,6 +709,7 @@ impl ChannelDriver for SipChannelDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{header_names, SipHeader, SipMessage};
     use std::collections::HashSet;
     use std::thread;
     use std::time::Instant;
@@ -918,10 +959,13 @@ mod tests {
              a=rtpmap:110 telephone-event/8000\r\n",
         )
         .unwrap();
-        driver
-            .install_negotiated_dtmf_payload(&channel.name, &negotiated)
-            .await
-            .unwrap();
+        let private = driver.get_private(&channel.name).unwrap();
+        let rtp = private.rtp.lock().await.clone().unwrap();
+        rtp.set_dtmf_payload_type(
+            crate::sdp_rtp::negotiated_dtmf_payload_type(
+                &negotiated, &driver.codecs,
+            ).unwrap(),
+        );
         assert_eq!(
             driver.channel_rtp_dtmf_payload_type(&channel.name).await,
             Some(110)
@@ -966,6 +1010,110 @@ mod tests {
                 duration_ms: 100
             }
         ));
+    }
+
+    fn answer_for_session(session: &mut SipSession, sdp: &SessionDescription) -> SipMessage {
+        let invite = session.build_invite_with_uri(
+            "sip:listener@127.0.0.1:5060",
+            "sip:listener@127.0.0.1:5060",
+        );
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        for header in &mut answer.headers {
+            if header.name.eq_ignore_ascii_case(header_names::TO) {
+                header.value.push_str(";tag=listener-tag");
+            }
+        }
+        answer.headers.push(SipHeader {
+            name: header_names::CONTACT.to_string(),
+            value: "<sip:listener@127.0.0.1:5060>".to_string(),
+        });
+        answer.body = sdp.to_string();
+        answer
+    }
+
+    #[tokio::test]
+    async fn outbound_answer_drives_listen_only_media_without_symmetric_latch() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let signaling_peer = tokio::net::UdpSocket::bind(local).await.unwrap();
+        let destination = format!("sip:listener@{}", signaling_peer.local_addr().unwrap());
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind(local).await.unwrap(),
+        );
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport);
+        let mut channel = driver.request(&destination, None).await.unwrap();
+
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answer_sdp = SessionDescription::create_offer(
+            "127.0.0.1", listener.local_addr().unwrap().port(), &[codecs::pcma()],
+        );
+        let answer = {
+            let private = driver.get_private(&channel.name).unwrap();
+            let mut session = private.session.lock().await;
+            answer_for_session(&mut session, &answer_sdp)
+        };
+        driver.apply_outbound_answer(&channel.name, &answer).await.unwrap();
+
+        assert_eq!(driver.channel_session_state(&channel.name).await,
+            Some(SessionState::Established));
+        assert_eq!(driver.channel_rtp_remote_addr(&channel.name).await,
+            listener.local_addr().ok());
+        assert_eq!(driver.channel_rtp_payload_type(&channel.name).await, Some(8));
+
+        driver.write_frame(
+            &mut channel,
+            &Frame::voice(8, 160, bytes::Bytes::from(vec![0x55; 160])),
+        ).await.expect("SDP-derived remote must permit the first outbound RTP packet");
+
+        let mut packet = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2), listener.recv_from(&mut packet),
+        ).await.expect("listen-only peer did not receive RTP").unwrap();
+        let (header, payload) = crate::rtp::parse_rtp_header(&packet[..len]).unwrap();
+        assert_eq!(header.payload_type, 8, "PCMA answer must select PT 8");
+        assert_eq!(payload, &[0x55; 160]);
+
+        let stats = {
+            let private = driver.get_private(&channel.name).unwrap();
+            let snapshot = private.rtp.lock().await.clone().unwrap().stats.snapshot();
+            snapshot
+        };
+        assert_eq!(stats.voice_frames_received, 0, "peer remained listen-only");
+        assert_eq!(stats.voice_frames_sent, 1, "one voice frame reached the peer");
+
+        driver.hangup(&mut channel).await.unwrap();
+        let mut message = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2), signaling_peer.recv_from(&mut message),
+        ).await.expect("established driver session did not send BYE").unwrap();
+        let bye = SipMessage::parse(&message[..len]).unwrap();
+        assert_eq!(bye.method(), Some(crate::parser::SipMethod::Bye));
+    }
+
+    #[tokio::test]
+    async fn outbound_answer_without_common_codec_is_rejected() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let transport: Arc<dyn SipTransport> = Arc::new(
+            UdpTransport::bind(local).await.unwrap(),
+        );
+        let driver = SipChannelDriver::new(local);
+        driver.set_transport(transport);
+        let channel = driver.request("sip:listener@127.0.0.1:5060", None)
+            .await.unwrap();
+        let unsupported = SessionDescription::create_offer(
+            "127.0.0.1", 40000, &[Codec::new("opus", 111, 48000)],
+        );
+        let answer = {
+            let private = driver.get_private(&channel.name).unwrap();
+            let mut session = private.session.lock().await;
+            answer_for_session(&mut session, &unsupported)
+        };
+
+        let error = driver.apply_outbound_answer(&channel.name, &answer)
+            .await.unwrap_err();
+        assert!(error.to_string().contains("no common audio codec"));
+        assert_eq!(driver.channel_rtp_remote_addr(&channel.name).await, None);
+        assert_eq!(driver.channel_rtp_payload_type(&channel.name).await, Some(0));
     }
 
     /// Regression for the channel-name collision bug: the inbound INVITE path

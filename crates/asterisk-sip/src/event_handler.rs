@@ -444,7 +444,8 @@ impl SipEventHandler {
             // source; they differ behind proxies/SBCs and with third-party
             // media. Signaling source is the fallback for an unresolvable
             // offer address.
-            let media_peer = remote_rtp_endpoint(&remote_sdp).unwrap_or(remote_addr);
+            let media_peer = crate::sdp_rtp::remote_rtp_endpoint(&remote_sdp)
+                .unwrap_or(remote_addr);
             let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
             let rtp_result = match self.channel_driver.get() {
                 Some(driver) => driver.allocate_rtp_session(session.local_addr.ip()).await,
@@ -458,12 +459,16 @@ impl SipEventHandler {
                 Ok((rtp, port))
             });
             match rtp_result {
-                Ok((mut rtp, answer_port)) => {
-                    if let Some(remote_rtp) = remote_rtp_endpoint(&remote_sdp) {
+                Ok((rtp, answer_port)) => {
+                    if let Some(remote_rtp) =
+                        crate::sdp_rtp::remote_rtp_endpoint(&remote_sdp)
+                    {
                         rtp.set_remote_addr(remote_rtp);
                     }
-                    if let Some(pt) = negotiated_payload_type(&remote_sdp, &self.supported_codecs) {
-                        rtp.payload_type = pt;
+                    if let Some(pt) = crate::sdp_rtp::negotiated_audio_payload_type(
+                        &remote_sdp, &self.supported_codecs,
+                    ) {
+                        rtp.set_payload_type(pt);
                     }
                     if let Some(pt) = crate::sdp_rtp::negotiated_dtmf_payload_type(
                         &remote_sdp,
@@ -901,9 +906,6 @@ impl SipEventHandler {
                     180 | 183 => {
                         ch.set_state(ChannelState::Ringing);
                     }
-                    200 => {
-                        ch.set_state(ChannelState::Up);
-                    }
                     486 => {
                         ch.set_state(ChannelState::Busy);
                         ch.hangup_cause = HangupCause::UserBusy;
@@ -931,35 +933,52 @@ impl SipEventHandler {
                     states.get(&call_id).cloned()
                 };
                 if let Some(cs_arc) = cs_arc {
-                    let mut cs = cs_arc.lock().await;
-                    let mut negotiated_sdp = None;
-                    if cs.session.is_outbound {
-                        cs.session.on_response(response);
-                        negotiated_sdp = cs.session.remote_sdp.clone();
-                        if let Some(ack) = cs.session.build_ack() {
-                            if let Err(e) = self.transport.send(&ack, remote_addr).await {
-                                warn!(call_id = %call_id, "Failed to send ACK: {}", e);
-                            } else {
-                                eprintln!("[DEBUG] Sent ACK for 200 OK call_id={}", call_id);
-                            }
-                        } else {
-                            eprintln!("[DEBUG] Failed to build ACK for call_id={}", call_id);
+                    let ack = {
+                        let mut cs = cs_arc.lock().await;
+                        if !cs.session.is_outbound {
+                            return;
                         }
+                        cs.session.on_response(response);
+                        cs.session.build_ack()
+                    };
+                    if let Some(ack) = ack {
+                        if let Err(e) = self.transport.send(&ack, remote_addr).await {
+                            warn!(call_id = %call_id, "Failed to send ACK: {}", e);
+                        } else {
+                            debug!(call_id = %call_id, "Sent ACK for 200 OK");
+                        }
+                    } else {
+                        warn!(call_id = %call_id, "Failed to build ACK for 200 OK");
                     }
-                    drop(cs);
 
-                    if let (Some(driver), Some(sdp)) =
-                        (self.channel_driver.get(), negotiated_sdp.as_ref())
-                    {
-                        if let Err(e) = driver
-                            .install_negotiated_dtmf_payload(&channel_name, sdp)
-                            .await
-                        {
-                            warn!(
-                                call_id = %call_id,
-                                "Failed to install negotiated telephone-event payload type: {}",
-                                e
-                            );
+                    let answer_result = match self.channel_driver.get() {
+                        Some(driver) => driver.apply_outbound_answer(
+                            &channel_name, response,
+                        ).await.map_err(|error| error.to_string()),
+                        None => Err("SIP channel driver is not attached".to_string()),
+                    };
+
+                    match answer_result {
+                        Ok(()) => channel.lock().set_state(ChannelState::Up),
+                        Err(error) => {
+                            warn!(call_id = %call_id, channel = %channel_name, %error,
+                                "Rejecting unusable outbound SDP answer");
+                            let bye = {
+                                let mut cs = cs_arc.lock().await;
+                                cs.session.build_bye()
+                            };
+                            if let Some(bye) = bye {
+                                if let Err(send_error) =
+                                    self.transport.send(&bye, remote_addr).await
+                                {
+                                    warn!(call_id = %call_id,
+                                        "Failed to send BYE after rejecting answer: {}",
+                                        send_error);
+                                }
+                            }
+                            let mut ch = channel.lock();
+                            ch.hangup_cause = HangupCause::BearerCapNotAvail;
+                            ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
                         }
                     }
                 }
@@ -1281,7 +1300,8 @@ impl SipEventHandler {
         // issue #56). Route/NAT selection targets the re-INVITE's media
         // endpoint, falling back to the signaling source.
         let answer_sdp = if let Some(ref offer) = remote_sdp {
-            let media_peer = remote_rtp_endpoint(offer).unwrap_or(remote_addr);
+            let media_peer = crate::sdp_rtp::remote_rtp_endpoint(offer)
+                .unwrap_or(remote_addr);
             let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
             let answer = SessionDescription::create_answer(
                 offer,
@@ -1529,50 +1549,6 @@ fn source_acl_endpoint(
         .ok_or(SourceAclDenied)
 }
 
-/// Extract the caller's advertised RTP endpoint (IP + port) from an offer SDP.
-///
-/// Prefers a media-level `c=` line, falling back to the session-level `c=`.
-/// Returns `None` when there is no active audio stream (port 0) or the address
-/// cannot be parsed — in which case we still bind a socket but leave the remote
-/// unset until the first packet teaches us the source.
-fn remote_rtp_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
-    let media = sdp
-        .media_descriptions
-        .iter()
-        .find(|m| m.media_type == "audio")?;
-    if media.port == 0 {
-        return None;
-    }
-    let addr_str = media
-        .connection
-        .as_ref()
-        .map(|c| c.addr.as_str())
-        .or_else(|| sdp.connection.as_ref().map(|c| c.addr.as_str()))?;
-    let ip: std::net::IpAddr = addr_str.parse().ok()?;
-    Some(SocketAddr::new(ip, media.port))
-}
-
-/// Determine the outbound RTP payload type for the answer: the first codec the
-/// offer and our supported list share (so we echo/transmit with a PT the caller
-/// understands). Falls back to the offer's first advertised format.
-fn negotiated_payload_type(sdp: &SessionDescription, supported: &[Codec]) -> Option<u8> {
-    let media = sdp
-        .media_descriptions
-        .iter()
-        .find(|m| m.media_type == "audio")?;
-    for oc in media.codecs() {
-        if oc.name.eq_ignore_ascii_case("telephone-event") {
-            continue;
-        }
-        for sc in supported {
-            if oc.name.eq_ignore_ascii_case(&sc.name) && oc.sample_rate == sc.sample_rate {
-                return Some(oc.payload_type);
-            }
-        }
-    }
-    media.formats.first().copied()
-}
-
 /// Authorize a REGISTER: is `username` (a digest identity that has already
 /// authenticated) permitted to bind the Address-of-Record `aor`?
 ///
@@ -1718,6 +1694,11 @@ mod tests {
                 .iter()
                 .filter_map(SipMessage::status_code)
                 .collect()
+        }
+
+        fn methods(&self) -> Vec<crate::parser::SipMethod> {
+            self.sent.lock().unwrap().iter()
+                .filter_map(SipMessage::method).collect()
         }
     }
 
@@ -1946,7 +1927,8 @@ mod tests {
             40000,
             &[codecs::pcmu()],
         );
-        let ep = remote_rtp_endpoint(&offer).expect("offer has an audio endpoint");
+        let ep = crate::sdp_rtp::remote_rtp_endpoint(&offer)
+            .expect("offer has an audio endpoint");
         assert_eq!(ep.ip().to_string(), "203.0.113.7");
         assert_eq!(ep.port(), 40000);
     }
@@ -1956,7 +1938,7 @@ mod tests {
         // A media stream with port 0 (rejected/held) has no live endpoint.
         let mut offer = SessionDescription::create_offer("203.0.113.7", 0, &[codecs::pcmu()]);
         offer.media_descriptions[0].port = 0;
-        assert!(remote_rtp_endpoint(&offer).is_none());
+        assert!(crate::sdp_rtp::remote_rtp_endpoint(&offer).is_none());
     }
 
     // --- issue #33: REGISTER AoR authorization scoping ---------------------
@@ -2223,7 +2205,75 @@ mod tests {
         // Offer PCMA (8); our supported list includes it -> PT 8.
         let offer = SessionDescription::create_offer("203.0.113.7", 40000, &[codecs::pcma()]);
         let supported = vec![codecs::pcmu(), codecs::pcma()];
-        assert_eq!(negotiated_payload_type(&offer, &supported), Some(8));
+        assert_eq!(
+            crate::sdp_rtp::negotiated_audio_payload_type(&offer, &supported),
+            Some(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_common_codec_answer_is_acked_then_failed_with_bye() {
+        use asterisk_core::channel::ChannelDriver;
+
+        let transport = Arc::new(RecordingTransport::new());
+        let driver = Arc::new(SipChannelDriver::new(
+            "127.0.0.1:0".parse().unwrap(),
+        ));
+        driver.set_transport(transport.clone());
+        let handler = SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        );
+        handler.set_channel_driver(driver.clone());
+
+        let channel = driver.request("sip:listener@127.0.0.1:5060", None)
+            .await.unwrap();
+        let channel_name = channel.name.clone();
+        let registered = store::register_existing_channel(channel);
+        let unique_id = registered.lock().unique_id.0.clone();
+
+        let remote = "127.0.0.1:5060".parse().unwrap();
+        let mut signaling = SipSession::new_outbound(
+            "127.0.0.1:5060".parse().unwrap(), remote,
+        );
+        let invite = signaling.build_invite_with_uri(
+            "sip:listener@127.0.0.1:5060",
+            "sip:listener@127.0.0.1:5060",
+        );
+        let call_id = signaling.call_id.clone();
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        for header in &mut answer.headers {
+            if header.name.eq_ignore_ascii_case(crate::parser::header_names::TO) {
+                header.value.push_str(";tag=listener");
+            }
+        }
+        answer.headers.push(crate::parser::SipHeader {
+            name: crate::parser::header_names::CONTACT.to_string(),
+            value: "<sip:listener@127.0.0.1:5060>".to_string(),
+        });
+        answer.body = SessionDescription::create_offer(
+            "127.0.0.1", 40000,
+            &[Codec::new("opus", 111, 48000)],
+        ).to_string();
+
+        handler.register_outbound_callid(&call_id, &channel_name);
+        handler.register_outbound_session(
+            &call_id, &channel_name, signaling, remote,
+        );
+        handler.handle_response(&answer, remote).await;
+
+        assert_eq!(transport.methods(), vec![
+            crate::parser::SipMethod::Ack,
+            crate::parser::SipMethod::Bye,
+        ]);
+        let stored = store::find_by_name(&channel_name).unwrap();
+        let stored = stored.lock();
+        assert_ne!(stored.state, ChannelState::Up);
+        assert!(stored.check_hangup());
+        assert_eq!(stored.hangup_cause, HangupCause::BearerCapNotAvail);
+        drop(stored);
+
+        handler.release_outbound_leg(&channel_name);
+        store::deregister(&unique_id);
     }
 
     #[test]

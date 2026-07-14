@@ -110,7 +110,7 @@ pub async fn create_rtp_from_sdp(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Set primary payload type.
-    session.payload_type = params.primary_payload_type;
+    session.set_payload_type(params.primary_payload_type);
 
     // Set DTMF payload type.
     if let Some(dtmf_pt) = params.dtmf_payload_type {
@@ -202,9 +202,44 @@ pub fn negotiated_dtmf_payload_type(
     })
 }
 
+/// Select the first active audio codec in remote SDP that is supported
+/// locally. This is deliberately strict: an answer with no common codec must
+/// not label locally encoded bytes with the remote's first payload type.
+pub fn negotiated_audio_payload_type(
+    sdp: &SessionDescription,
+    supported_codecs: &[Codec],
+) -> Option<u8> {
+    let audio = sdp.media_descriptions.iter().find(|media| {
+        media.media_type.eq_ignore_ascii_case("audio") && media.port != 0
+    })?;
+
+    audio.codecs().into_iter().find_map(|remote| {
+        if remote.name.eq_ignore_ascii_case("telephone-event") {
+            return None;
+        }
+        supported_codecs.iter().any(|local| {
+            local.name.eq_ignore_ascii_case(&remote.name)
+                && local.sample_rate == remote.sample_rate
+        }).then_some(remote.payload_type)
+    })
+}
+
+/// Extract the active audio endpoint advertised by SDP. A media-level
+/// connection overrides the session-level connection.
+pub fn remote_rtp_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
+    let media = sdp.media_descriptions.iter()
+        .find(|media| media.media_type.eq_ignore_ascii_case("audio"))?;
+    if media.port == 0 {
+        return None;
+    }
+    let addr = media.connection.as_ref().map(|connection| connection.addr.as_str())
+        .or_else(|| sdp.connection.as_ref().map(|connection| connection.addr.as_str()))?;
+    Some(SocketAddr::new(addr.parse().ok()?, media.port))
+}
+
 /// Apply negotiated RTP parameters to an existing RTP session.
 pub fn apply_sdp_to_rtp(session: &mut RtpSession, params: &RtpParameters) {
-    session.payload_type = params.primary_payload_type;
+    session.set_payload_type(params.primary_payload_type);
 
     if let Some(dtmf_pt) = params.dtmf_payload_type {
         session.set_dtmf_payload_type(dtmf_pt);
