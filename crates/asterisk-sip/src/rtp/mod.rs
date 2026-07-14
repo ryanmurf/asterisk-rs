@@ -332,8 +332,9 @@ pub struct RtpSession {
     sequence: AtomicU16,
     /// Outgoing timestamp.
     timestamp: AtomicU32,
-    /// Payload type for outgoing packets.
-    pub payload_type: u8,
+    /// Payload type for outgoing packets. Outbound sessions are shared behind
+    /// an `Arc` before the SDP answer selects this value.
+    payload_type: AtomicU8,
     /// Negotiated telephone-event payload type (RFC 4733).
     dtmf_payload_type: AtomicU8,
     /// Last emitted RFC 4733 end event. Senders repeat end packets for
@@ -406,7 +407,7 @@ impl RtpSession {
             ssrc,
             sequence: AtomicU16::new(0),
             timestamp: AtomicU32::new(0),
-            payload_type: 0,
+            payload_type: AtomicU8::new(0),
             dtmf_payload_type: AtomicU8::new(NO_DTMF_PAYLOAD_TYPE),
             last_dtmf_end: Mutex::new(None),
             samples_per_packet: 160,
@@ -430,6 +431,16 @@ impl RtpSession {
     /// still works via auto-ref.
     pub fn set_remote_addr(&self, addr: SocketAddr) {
         *self.remote_addr.write() = Some(addr);
+    }
+
+    /// Return the payload type used for outbound voice packets.
+    pub fn payload_type(&self) -> u8 {
+        self.payload_type.load(Ordering::Relaxed)
+    }
+
+    /// Install the voice payload type selected by SDP negotiation.
+    pub fn set_payload_type(&self, payload_type: u8) {
+        self.payload_type.store(payload_type & 0x7f, Ordering::Relaxed);
     }
 
     /// Return the negotiated RFC 4733 telephone-event payload type.
@@ -478,7 +489,7 @@ impl RtpSession {
             extension: false,
             csrc_count: 0,
             marker: false,
-            payload_type: self.payload_type,
+            payload_type: self.payload_type(),
             sequence: seq,
             timestamp: ts,
             ssrc: self.ssrc,
