@@ -18,6 +18,7 @@ use asterisk_codecs::{codecs, Codec};
 use asterisk_core::channel::{Channel, ChannelDriver};
 use asterisk_types::{AsteriskError, AsteriskResult, ChannelState, ControlFrame, Frame};
 
+use crate::media_stats::{complete_channel_media_stats, register_channel_media_stats};
 use crate::rtp::{RtpPortAllocator, RtpPortRange, RtpSession};
 use crate::sdp::SessionDescription;
 use crate::session::{SessionState, SipSession};
@@ -176,7 +177,11 @@ impl SipChannelDriver {
     }
 
     fn remove_private(&self, name: &str) -> Option<Arc<SipChannelPrivate>> {
-        self.channels.write().remove(name)
+        let removed = self.channels.write().remove(name);
+        if removed.is_some() {
+            complete_channel_media_stats(name);
+        }
+        removed
     }
 
     /// Attach a pre-bound [`RtpSession`] to an **inbound** channel so the media
@@ -205,12 +210,16 @@ impl SipChannelDriver {
         transport: Arc<dyn SipTransport>,
         rtp: RtpSession,
     ) {
+        let stats = rtp.stats.clone();
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(session),
             rtp: Mutex::new(Some(Arc::new(rtp))),
             transport,
         });
         self.channels.write().insert(channel_name.to_string(), priv_data);
+        let unique_id = asterisk_core::channel_store::find_by_name(channel_name)
+            .map(|channel| channel.lock().unique_id.0.clone());
+        register_channel_media_stats(channel_name, unique_id.as_deref(), stats);
     }
 
     /// Remove a channel's private data (and its RTP socket) from the driver.
@@ -386,6 +395,7 @@ impl ChannelDriver for SipChannelDriver {
         }
 
         let channel_name = channel.name.clone();
+        let stats = rtp_session.stats.clone();
 
         let priv_data = Arc::new(SipChannelPrivate {
             session: Mutex::new(sip_session),
@@ -393,7 +403,12 @@ impl ChannelDriver for SipChannelDriver {
             transport,
         });
 
-        self.channels.write().insert(channel_name, priv_data);
+        self.channels.write().insert(channel_name.clone(), priv_data);
+        register_channel_media_stats(
+            &channel_name,
+            Some(&channel.unique_id.0),
+            stats,
+        );
         Ok(channel)
     }
 
@@ -402,6 +417,14 @@ impl ChannelDriver for SipChannelDriver {
         let priv_data = self
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        if let Some(rtp) = priv_data.rtp.lock().await.clone() {
+            register_channel_media_stats(
+                &channel.name,
+                Some(&channel.unique_id.0),
+                rtp.stats.clone(),
+            );
+        }
 
         let mut session = priv_data.session.lock().await;
         // Build the Request-URI. Use the full contact address so the

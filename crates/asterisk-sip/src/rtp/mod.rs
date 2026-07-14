@@ -19,7 +19,7 @@ pub mod mos;
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -342,7 +342,7 @@ pub struct RtpSession {
     /// Samples per packet (for timestamp advancement).
     pub samples_per_packet: u32,
     /// Statistics.
-    pub stats: RtpStats,
+    pub stats: Arc<RtpStats>,
 }
 
 /// RTP session statistics.
@@ -352,6 +352,43 @@ pub struct RtpStats {
     pub packets_received: AtomicU32,
     pub octets_sent: AtomicU32,
     pub octets_received: AtomicU32,
+    /// Successfully transmitted non-empty voice frames.
+    pub voice_frames_sent: AtomicU64,
+    /// Successfully received non-empty voice frames.
+    pub voice_frames_received: AtomicU64,
+    /// Logical RFC 4733 digits successfully transmitted.
+    pub dtmf_digits_sent: AtomicU64,
+    /// Logical RFC 4733 digits detected after repeated-end deduplication.
+    pub dtmf_digits_received: AtomicU64,
+}
+
+/// Point-in-time, copyable RTP statistics for AMI and teardown history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtpStatsSnapshot {
+    pub packets_sent: u32,
+    pub packets_received: u32,
+    pub octets_sent: u32,
+    pub octets_received: u32,
+    pub voice_frames_sent: u64,
+    pub voice_frames_received: u64,
+    pub dtmf_digits_sent: u64,
+    pub dtmf_digits_received: u64,
+}
+
+impl RtpStats {
+    /// Read all counters without blocking the media path.
+    pub fn snapshot(&self) -> RtpStatsSnapshot {
+        RtpStatsSnapshot {
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            octets_sent: self.octets_sent.load(Ordering::Relaxed),
+            octets_received: self.octets_received.load(Ordering::Relaxed),
+            voice_frames_sent: self.voice_frames_sent.load(Ordering::Relaxed),
+            voice_frames_received: self.voice_frames_received.load(Ordering::Relaxed),
+            dtmf_digits_sent: self.dtmf_digits_sent.load(Ordering::Relaxed),
+            dtmf_digits_received: self.dtmf_digits_received.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl RtpSession {
@@ -373,7 +410,7 @@ impl RtpSession {
             dtmf_payload_type: AtomicU8::new(NO_DTMF_PAYLOAD_TYPE),
             last_dtmf_end: Mutex::new(None),
             samples_per_packet: 160,
-            stats: RtpStats::default(),
+            stats: Arc::new(RtpStats::default()),
         }
     }
 
@@ -454,6 +491,11 @@ impl RtpSession {
         self.stats
             .octets_sent
             .fetch_add(data.len() as u32, Ordering::Relaxed);
+        if !data.is_empty() {
+            self.stats
+                .voice_frames_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -514,6 +556,9 @@ impl RtpSession {
                         return Ok(Frame::Null);
                     }
                     *last_end = Some(event_key);
+                    self.stats
+                        .dtmf_digits_received
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(Frame::dtmf_end(digit, event.duration as u32 / 8));
                 } else {
                     return Ok(Frame::dtmf_begin(digit));
@@ -525,6 +570,11 @@ impl RtpSession {
             0 | 8 => payload.len() as u32,
             _ => (payload.len() as u32) / 2,
         };
+        if !payload.is_empty() {
+            self.stats
+                .voice_frames_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(Frame::voice(
             header.payload_type as u32,
@@ -571,6 +621,8 @@ impl RtpSession {
             };
             let packet = build_rtp_packet(&header, &event.to_bytes());
             self.socket.send_to(&packet, remote).await?;
+            self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            self.stats.octets_sent.fetch_add(4, Ordering::Relaxed);
         }
 
         // Send end event (3 times for reliability)
@@ -594,10 +646,15 @@ impl RtpSession {
             };
             let packet = build_rtp_packet(&header, &event.to_bytes());
             self.socket.send_to(&packet, remote).await?;
+            self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            self.stats.octets_sent.fetch_add(4, Ordering::Relaxed);
         }
 
         // Advance sequence past the DTMF events
         self.sequence.store(start_seq.wrapping_add(6), Ordering::Relaxed);
+        self.stats
+            .dtmf_digits_sent
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -1210,6 +1267,69 @@ mod tests {
         ));
         assert!(matches!(session.recv_frame().await.unwrap(), Frame::Null));
         assert!(matches!(session.recv_frame().await.unwrap(), Frame::Null));
+        assert_eq!(session.stats.snapshot().dtmf_digits_received, 1);
+    }
+
+    #[tokio::test]
+    async fn proof_counters_require_nonempty_voice_and_logical_dtmf() {
+        let session = RtpSession::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        session.set_dtmf_payload_type(110);
+        let target = session.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        session.set_remote_addr(peer.local_addr().unwrap());
+
+        session
+            .send_frame(&Frame::voice(0, 160, Bytes::from(vec![0x7f; 160])))
+            .await
+            .unwrap();
+        let mut received = [0u8; 256];
+        peer.recv_from(&mut received).await.unwrap();
+
+        let inbound_voice = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 0,
+            marker: false,
+            payload_type: 0,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 0x12345678,
+        };
+        peer.send_to(
+            &build_rtp_packet(&inbound_voice, &[0x7f; 160]),
+            target,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
+
+        session.send_dtmf('6', 800).await.unwrap();
+
+        // Empty RTP payloads still count as packets, but cannot prove audio.
+        session
+            .send_frame(&Frame::voice(0, 0, Bytes::new()))
+            .await
+            .unwrap();
+        let empty_voice = RtpHeader {
+            sequence: 2,
+            timestamp: 320,
+            ..inbound_voice
+        };
+        peer.send_to(&build_rtp_packet(&empty_voice, &[]), target)
+            .await
+            .unwrap();
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
+
+        let stats = session.stats.snapshot();
+        assert_eq!(stats.voice_frames_sent, 1);
+        assert_eq!(stats.voice_frames_received, 1);
+        assert_eq!(stats.dtmf_digits_sent, 1);
+        assert_eq!(stats.dtmf_digits_received, 0);
+        assert_eq!(stats.packets_sent, 8);
+        assert_eq!(stats.packets_received, 2);
     }
 
     #[test]
