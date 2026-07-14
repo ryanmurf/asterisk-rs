@@ -126,6 +126,7 @@ dependencies = [
  "asterisk-ami",
  "asterisk-codecs",
  "asterisk-core",
+ "asterisk-formats",
  "asterisk-res",
  "asterisk-sip",
  "asterisk-types",
