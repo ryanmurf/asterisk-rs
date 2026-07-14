@@ -1027,20 +1027,32 @@ impl SipEventHandler {
                 let map = self.callid_map.read();
                 map.get(&call_id).cloned()
             };
+            let is_outbound = {
+                let cs_arc = {
+                    let states = self.call_states.read();
+                    states.get(&call_id).cloned()
+                };
+                match cs_arc {
+                    Some(cs_arc) => cs_arc.lock().await.session.is_outbound,
+                    None => false,
+                }
+            };
 
             if let Some(name) = channel_name {
-                crate::notify_service::global_notify_service().unregister_channel(&name);
                 if let Some(channel) = store::find_by_name(&name) {
                     let mut ch = channel.lock();
                     ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
                 }
-                // Release the driver media plane so a remote-initiated BYE on
-                // an OUTBOUND leg does not leak its RTP socket / channel-map
-                // entry (issue #28). Idempotent, so the inbound path — whose
-                // media plane is finalized by the spawned cleanup task — is
-                // unaffected (the later finalize call is a no-op).
-                if let Some(driver) = self.channel_driver.get() {
-                    driver.remove_channel(&name);
+                if is_outbound {
+                    // Outbound legs are registered in the global store by
+                    // Dial(), so use the complete outbound release path.
+                    self.release_outbound_leg(&name);
+                } else {
+                    crate::notify_service::global_notify_service()
+                        .unregister_channel(&name);
+                    if let Some(driver) = self.channel_driver.get() {
+                        driver.remove_channel(&name);
+                    }
                 }
             }
 
@@ -1466,9 +1478,9 @@ impl SipEventHandler {
         self.release_outbound_leg(channel_name);
     }
 
-    /// Release an outbound leg's local resources — its driver channel-map
-    /// entry (and thus the bound RTP socket), NOTIFY registration, and
-    /// Call-ID/state bookkeeping — WITHOUT sending any SIP.
+    /// Release an outbound leg's local resources — its global store channel,
+    /// driver channel-map entry (and thus the bound RTP socket), NOTIFY
+    /// registration, and Call-ID/state bookkeeping — WITHOUT sending SIP.
     ///
     /// Used to reclaim abandoned Dial legs (losing legs in a parallel dial,
     /// and every leg of a failed dial) so their sockets are not leaked
@@ -1488,6 +1500,10 @@ impl SipEventHandler {
         crate::notify_service::global_notify_service().unregister_channel(channel_name);
         if let Some(driver) = self.channel_driver.get() {
             driver.remove_channel(channel_name);
+        }
+        if let Some(channel) = store::find_by_name(channel_name) {
+            let unique_id = channel.lock().unique_id.0.clone();
+            store::deregister(&unique_id);
         }
     }
 
@@ -2262,15 +2278,20 @@ mod tests {
             .request("sip:carol@127.0.0.1:5060", None)
             .await
             .expect("outbound request");
+        let channel_name = ch.name.clone();
+        store::register_existing_channel(ch);
         assert_eq!(driver.active_channel_count(), 1);
+        assert!(store::find_by_name(&channel_name).is_some());
 
-        handler.release_outbound_leg(&ch.name);
+        handler.release_outbound_leg(&channel_name);
 
         assert_eq!(
             driver.active_channel_count(),
             0,
             "abandoned leg's RTP socket / driver entry must be released"
         );
+        assert!(store::find_by_name(&channel_name).is_none(),
+            "abandoned leg's global store channel must be deregistered");
     }
 
     #[tokio::test]
@@ -2281,8 +2302,18 @@ mod tests {
             .request("sip:dave@127.0.0.1:5060", None)
             .await
             .expect("outbound request");
-        handler.register_outbound_callid("bye-call-1", &ch.name);
+        let channel_name = ch.name.clone();
+        store::register_existing_channel(ch);
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        handler.register_outbound_callid("bye-call-1", &channel_name);
+        handler.register_outbound_session(
+            "bye-call-1",
+            &channel_name,
+            SipSession::new_outbound("127.0.0.1:0".parse().unwrap(), remote),
+            remote,
+        );
         assert_eq!(driver.active_channel_count(), 1);
+        assert!(store::find_by_name(&channel_name).is_some());
 
         // Remote sends a BYE for this call.
         let bye_raw = "BYE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
@@ -2293,7 +2324,6 @@ mod tests {
              CSeq: 2 BYE\r\n\
              Content-Length: 0\r\n\r\n";
         let bye = SipMessage::parse(bye_raw.as_bytes()).unwrap();
-        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
         handler.handle_bye(&bye, remote).await;
 
         assert_eq!(
@@ -2301,6 +2331,8 @@ mod tests {
             0,
             "remote BYE on an outbound leg must release its RTP socket / driver entry"
         );
+        assert!(store::find_by_name(&channel_name).is_none(),
+            "remote BYE must deregister the outbound global store channel");
     }
 
     #[tokio::test]
