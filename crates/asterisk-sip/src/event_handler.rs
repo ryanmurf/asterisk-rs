@@ -913,6 +913,13 @@ impl SipEventHandler {
         if let Some(channel) = store::find_by_name(&channel_name) {
             // Handle channel state update only for INVITE responses
             if cseq_method == "INVITE" {
+                let cs_arc = {
+                    let states = self.call_states.read();
+                    states.get(&call_id).cloned()
+                };
+                if let Some(cs_arc) = cs_arc {
+                    cs_arc.lock().await.session.on_response(response);
+                }
                 let mut ch = channel.lock();
                 match status_code {
                     180 | 183 => {
@@ -946,11 +953,10 @@ impl SipEventHandler {
                 };
                 if let Some(cs_arc) = cs_arc {
                     let ack = {
-                        let mut cs = cs_arc.lock().await;
+                        let cs = cs_arc.lock().await;
                         if !cs.session.is_outbound {
                             return;
                         }
-                        cs.session.on_response(response);
                         cs.session.build_ack()
                     };
                     if let Some(ack) = ack {
@@ -1413,6 +1419,50 @@ impl SipEventHandler {
         // and Call-ID/state bookkeeping. Before this, only the two maps were
         // cleared and the driver channel entry + its bound socket leaked for
         // the lifetime of the process (issue #28).
+        self.release_outbound_leg(channel_name);
+    }
+
+    /// Put the correct SIP request on the wire for an abandoned outbound Dial
+    /// leg, then release its local resources.
+    ///
+    /// A pending or early INVITE is cancelled in-transaction. An established
+    /// dialog is terminated with BYE. A leg that already received a final
+    /// failure needs no additional request.
+    pub async fn cancel_or_bye_outbound_leg(&self, channel_name: &str) {
+        let call_id = {
+            let map = self.callid_map.read();
+            map.iter().find(|(_, name)| name.as_str() == channel_name)
+                .map(|(call_id, _)| call_id.clone())
+        };
+        if let Some(ref call_id) = call_id {
+            let cs_arc = {
+                let states = self.call_states.read();
+                states.get(call_id).cloned()
+            };
+            if let Some(cs_arc) = cs_arc {
+                let (request, remote_addr) = {
+                    let mut cs = cs_arc.lock().await;
+                    let request = match cs.session.state {
+                        crate::session::SessionState::Initiated
+                        | crate::session::SessionState::Early => cs.session.build_cancel(),
+                        crate::session::SessionState::Established => cs.session.build_bye(),
+                        crate::session::SessionState::Terminating
+                        | crate::session::SessionState::Terminated => None,
+                    };
+                    (request, cs.remote_addr)
+                };
+                if let Some(request) = request {
+                    let method = request.method();
+                    if let Err(error) = self.transport.send(&request, remote_addr).await {
+                        warn!(call_id = %call_id, channel = channel_name,
+                            ?method, %error, "Failed to signal abandoned Dial leg");
+                    } else {
+                        info!(call_id = %call_id, channel = channel_name,
+                            ?method, "Signaled abandoned Dial leg");
+                    }
+                }
+            }
+        }
         self.release_outbound_leg(channel_name);
     }
 
@@ -2116,6 +2166,90 @@ mod tests {
         assert_eq!(handler.active_calls(), 0, "Call-ID map must clear immediately");
         assert_eq!(handler.call_states.read().len(), 0,
             "per-call state must clear immediately");
+    }
+
+    fn outbound_session_ready_for_cancel(
+        local: SocketAddr,
+        remote: SocketAddr,
+        state: crate::session::SessionState,
+    ) -> SipSession {
+        let mut session = SipSession::new_outbound(local, remote);
+        session.build_invite_with_uri(
+            "sip:peer@127.0.0.1:5060",
+            "sip:peer@127.0.0.1:5060",
+        );
+        session.state = state;
+        session
+    }
+
+    #[tokio::test]
+    async fn abandoned_pending_and_early_legs_send_cancel_before_release() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        );
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+
+        for (index, state) in [
+            crate::session::SessionState::Initiated,
+            crate::session::SessionState::Early,
+        ].into_iter().enumerate() {
+            let session = outbound_session_ready_for_cancel(
+                transport.local_addr, remote, state,
+            );
+            let call_id = session.call_id.clone();
+            let channel_name = format!("PJSIP/cancel-{index}");
+            handler.register_outbound_callid(&call_id, &channel_name);
+            handler.register_outbound_session(
+                &call_id, &channel_name, session, remote,
+            );
+            handler.cancel_or_bye_outbound_leg(&channel_name).await;
+        }
+
+        assert_eq!(transport.methods(), vec![
+            crate::parser::SipMethod::Cancel,
+            crate::parser::SipMethod::Cancel,
+        ]);
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(handler.call_states.read().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_established_leg_sends_bye_before_release() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        );
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut session = outbound_session_ready_for_cancel(
+            transport.local_addr,
+            remote,
+            crate::session::SessionState::Initiated,
+        );
+        let invite = session.invite.clone().unwrap();
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        for header in &mut answer.headers {
+            if header.name.eq_ignore_ascii_case(crate::parser::header_names::TO) {
+                header.value.push_str(";tag=peer-tag");
+            }
+        }
+        answer.headers.push(crate::parser::SipHeader {
+            name: crate::parser::header_names::CONTACT.to_string(),
+            value: "<sip:peer@127.0.0.1:5060>".to_string(),
+        });
+        session.on_response(&answer);
+
+        let call_id = session.call_id.clone();
+        let channel_name = "PJSIP/bye-established";
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(
+            &call_id, channel_name, session, remote,
+        );
+        handler.cancel_or_bye_outbound_leg(channel_name).await;
+
+        assert_eq!(transport.methods(), vec![crate::parser::SipMethod::Bye]);
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(handler.call_states.read().len(), 0);
     }
 
     #[tokio::test]
