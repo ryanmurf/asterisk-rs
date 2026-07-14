@@ -20,3 +20,4 @@ bitflags = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
+hickory-resolver = "0.26.1"

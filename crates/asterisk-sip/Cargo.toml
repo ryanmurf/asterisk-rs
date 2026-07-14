@@ -15,6 +15,7 @@ asterisk-config = { workspace = true }
 asterisk-core = { workspace = true }
 asterisk-channels = { workspace = true }
 asterisk-codecs = { workspace = true }
+asterisk-res = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
