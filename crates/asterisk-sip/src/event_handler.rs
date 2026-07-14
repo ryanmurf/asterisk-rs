@@ -893,12 +893,24 @@ impl SipEventHandler {
             }
         };
 
+        let status_code = response.status_code().unwrap_or(0);
+        let cseq_method = response.get_header("CSeq")
+            .and_then(|c| c.split_whitespace().last())
+            .map(|m| m.to_uppercase())
+            .unwrap_or_default();
+
+        // A final response to our BYE completes the dialog immediately. The
+        // per-call cleanup task observes the removed state and releases its
+        // store channel, driver entry, and RTP reservation on its next poll
+        // instead of idling for the full 32-second stale-dialog deadline.
+        if (200..300).contains(&status_code) && cseq_method == "BYE" {
+            self.call_states.write().remove(&call_id);
+            self.callid_map.write().remove(&call_id);
+            debug!(call_id = %call_id, status_code, "BYE transaction completed");
+            return;
+        }
+
         if let Some(channel) = store::find_by_name(&channel_name) {
-            let status_code = response.status_code().unwrap_or(0);
-            let cseq_method = response.get_header("CSeq")
-                .and_then(|c| c.split_whitespace().last())
-                .map(|m| m.to_uppercase())
-                .unwrap_or_default();
             // Handle channel state update only for INVITE responses
             if cseq_method == "INVITE" {
                 let mut ch = channel.lock();
@@ -2072,6 +2084,38 @@ mod tests {
             "outbound leg's RTP socket / driver entry must be released on hangup"
         );
         assert_eq!(handler.active_calls(), 0, "Call-ID bookkeeping must be cleared");
+    }
+
+    #[tokio::test]
+    async fn bye_2xx_removes_call_maps_without_waiting_for_dialog_timeout() {
+        let (_driver, handler) = driver_and_handler().await;
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let call_id = "bye-final-1";
+        let channel_name = "PJSIP/bye-final-00000001";
+        handler.register_outbound_callid(call_id, channel_name);
+        handler.register_outbound_session(
+            call_id,
+            channel_name,
+            SipSession::new_outbound("127.0.0.1:5061".parse().unwrap(), remote),
+            remote,
+        );
+        assert_eq!(handler.active_calls(), 1);
+        assert_eq!(handler.call_states.read().len(), 1);
+
+        let response = SipMessage::parse(
+            b"SIP/2.0 200 OK\r\n\
+              Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bKbye\r\n\
+              From: <sip:asterisk@127.0.0.1>;tag=local\r\n\
+              To: <sip:peer@127.0.0.1>;tag=remote\r\n\
+              Call-ID: bye-final-1\r\n\
+              CSeq: 2 BYE\r\n\
+              Content-Length: 0\r\n\r\n",
+        ).unwrap();
+        handler.handle_response(&response, remote).await;
+
+        assert_eq!(handler.active_calls(), 0, "Call-ID map must clear immediately");
+        assert_eq!(handler.call_states.read().len(), 0,
+            "per-call state must clear immediately");
     }
 
     #[tokio::test]
