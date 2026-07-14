@@ -1330,11 +1330,10 @@ impl AppDial {
                             chan.name.clone()
                         };
                         leg.state = DialLegState::HungUp;
-                        // Release the losing leg's RTP socket / driver-map
-                        // entry so a parallel dial (N legs, 1 answers) does not
-                        // leak N-1 sockets per call (issue #28).
+                        // Cancel a still-ringing fork (or BYE an answer-race
+                        // winner), then release its local media resources.
                         if let Some(handler) = asterisk_sip::get_global_event_handler() {
-                            handler.release_outbound_leg(&leg_name);
+                            handler.cancel_or_bye_outbound_leg(&leg_name).await;
                         }
                         debug!(
                             "Dial: hanging up non-answered leg {} ({}) cause={:?}",
@@ -1983,11 +1982,10 @@ impl AppDial {
                     chan.name.clone()
                 };
                 leg.state = DialLegState::HungUp;
-                // Release each leg's RTP socket / driver-map entry so a failed
-                // dial (busy/congestion/timeout/caller-hangup) does not leak
-                // the sockets bound by driver.request() (issue #28).
+                // Put CANCEL/BYE on the wire before releasing the leg's RTP
+                // socket and driver-map entry.
                 if let Some(handler) = asterisk_sip::get_global_event_handler() {
-                    handler.release_outbound_leg(&leg_name);
+                    handler.cancel_or_bye_outbound_leg(&leg_name).await;
                 }
             }
         }
