@@ -8,6 +8,7 @@ edition.workspace = true
 asterisk-types = { workspace = true }
 asterisk-core = { workspace = true }
 asterisk-codecs = { workspace = true }
+asterisk-formats = { workspace = true }
 asterisk-ami = { workspace = true }
 asterisk-res = { workspace = true }
 tokio = { workspace = true }
