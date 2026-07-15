@@ -252,12 +252,13 @@ impl SipEventHandler {
 
         // 4. Authenticate the request against configured endpoints.
         //    Build credentials from all endpoints that have auth configured.
-        let mut endpoint_context = matched_endpoint_name
+        let mut identified_endpoint_name = matched_endpoint_name.clone();
+        let mut endpoint_context = identified_endpoint_name
             .as_deref()
             .and_then(|name| pjsip_config.as_ref()?.find_endpoint(name))
             .map(|endpoint| endpoint.context.clone())
             .unwrap_or_else(|| "default".to_string());
-        let mut allow_overlap = matched_endpoint_name
+        let mut allow_overlap = identified_endpoint_name
             .as_deref()
             .and_then(|name| pjsip_config.as_ref()?.find_endpoint(name))
             .map(|endpoint| endpoint.allow_overlap)
@@ -290,6 +291,7 @@ impl SipEventHandler {
                                 for (ep_name, cred) in &all_creds {
                                     if cred.username == parsed.username {
                                         if let Some(ep) = cfg.find_endpoint(ep_name) {
+                                            identified_endpoint_name = Some(ep_name.clone());
                                             endpoint_context = ep.context.clone();
                                             allow_overlap = ep.allow_overlap;
                                         }
@@ -367,29 +369,29 @@ impl SipEventHandler {
             return None;
         }
 
-        // 5b. If the INVITE carries an SDP offer we cannot answer (no codec in
-        //     common on any stream), reject with 488 Not Acceptable Here rather
-        //     than sending a 200 OK whose media is entirely rejected — the
-        //     latter brings the call "up" with guaranteed silence and a leaked
-        //     RTP socket (RFC 3264 §6 / RFC 3261 §21.4.26). We probe by building
-        //     a trial answer with a dummy non-zero port so accepted streams
-        //     (port != 0) are distinguishable from rejected ones (port 0).
+        let endpoint_codecs = identified_endpoint_name
+            .as_deref()
+            .and_then(|name| pjsip_config.as_ref()?.find_endpoint(name))
+            .map(|endpoint| endpoint.media_codecs(&self.supported_codecs))
+            .unwrap_or_else(|| self.supported_codecs.clone());
+
+        // 5b. M2 bridges raw G.711 bytes without transcoding. Reject any offer
+        //     that does not negotiate the endpoint-pinned static PCMU or PCMA
+        //     payload before allocating a channel or RTP socket.
         if let Some(ref offer) = session.remote_sdp {
-            let trial = SessionDescription::create_answer(
+            let negotiated = crate::sdp_rtp::negotiated_audio_payload_type(
                 offer,
-                &session.local_addr.ip().to_string(),
-                1,
-                &self.supported_codecs,
+                &endpoint_codecs,
             );
-            let any_accepted = trial
-                .media_descriptions
-                .iter()
-                .any(|m| m.port != 0);
-            if !any_accepted {
+            if !matches!(negotiated, Some(0 | 8)) {
                 if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
                     if self.may_send_invite_final(request, &resp) {
                         let _ = self.transport.send(&resp, remote_addr).await;
-                        debug!(call_id = %call_id, "Sent 488 Not Acceptable Here (no common codec)");
+                        warn!(
+                            call_id = %call_id,
+                            ?negotiated,
+                            "Sent 488 Not Acceptable Here (no endpoint-pinned G.711 codec)"
+                        );
                     }
                 }
                 return None;
@@ -415,7 +417,7 @@ impl SipEventHandler {
         //    accountcode) are set before the Newchannel AMI event is emitted.
         //    In real Asterisk, the inbound PJSIP channel is named after the
         //    matched endpoint (e.g. PJSIP/alice-00000001), not the caller.
-        let chan_label = matched_endpoint_name.as_deref().unwrap_or(&caller_num);
+        let chan_label = identified_endpoint_name.as_deref().unwrap_or(&caller_num);
         let channel_name = format!(
             "PJSIP/{}-{:08}",
             chan_label,
@@ -430,7 +432,7 @@ impl SipEventHandler {
 
         // Look up accountcode from the matched endpoint
         if let Some(ref cfg) = pjsip_config {
-            if let Some(ref ep_name) = matched_endpoint_name {
+            if let Some(ref ep_name) = identified_endpoint_name {
                 if let Some(ep) = cfg.find_endpoint(ep_name) {
                     new_ch.accountcode = ep.accountcode.clone();
                 }
@@ -492,13 +494,13 @@ impl SipEventHandler {
                         rtp.set_remote_addr(remote_rtp);
                     }
                     if let Some(pt) = crate::sdp_rtp::negotiated_audio_payload_type(
-                        &remote_sdp, &self.supported_codecs,
+                        &remote_sdp, &endpoint_codecs,
                     ) {
                         rtp.set_payload_type(pt);
                     }
                     if let Some(pt) = crate::sdp_rtp::negotiated_dtmf_payload_type(
                         &remote_sdp,
-                        &self.supported_codecs,
+                        &endpoint_codecs,
                     ) {
                         rtp.set_dtmf_payload_type(pt);
                     }
@@ -520,11 +522,12 @@ impl SipEventHandler {
                                 s
                             });
                     if let Some(driver) = self.channel_driver.get() {
-                        driver.attach_inbound_media(
+                        driver.attach_inbound_media_with_codecs(
                             &channel_name,
                             driver_session,
                             self.transport.clone(),
                             rtp,
+                            endpoint_codecs.clone(),
                         );
                     } else {
                         warn!(
@@ -544,7 +547,7 @@ impl SipEventHandler {
                         &remote_sdp,
                         &local_ip,
                         answer_port,
-                        &self.supported_codecs,
+                        &endpoint_codecs,
                     );
                     session.local_sdp = Some(answer_sdp.clone());
                     session.initial_local_sdp = Some(answer_sdp);
@@ -1359,6 +1362,31 @@ impl SipEventHandler {
         // for peers that honor the answer SDP -- the same defect #8 fixed for
         // the initial INVITE, which had been left unfixed on this path.
         let channel_name = { cs_arc.lock().await.channel_name.clone() };
+        let channel_codecs = self
+            .channel_driver
+            .get()
+            .and_then(|driver| driver.channel_codecs(&channel_name))
+            .unwrap_or_else(|| self.supported_codecs.clone());
+        if let Some(ref offer) = remote_sdp {
+            let negotiated = crate::sdp_rtp::negotiated_audio_payload_type(
+                offer,
+                &channel_codecs,
+            );
+            if !matches!(negotiated, Some(0 | 8)) {
+                let response = request
+                    .create_response(488, "Not Acceptable Here")
+                    .ok()?;
+                if self.may_send_invite_final(request, &response) {
+                    let _ = self.transport.send(&response, remote_addr).await;
+                    warn!(
+                        call_id = %call_id,
+                        ?negotiated,
+                        "Rejected re-INVITE outside the channel's pinned G.711 policy"
+                    );
+                }
+                return None;
+            }
+        }
         let media_port = match self.channel_driver.get() {
             Some(driver) => driver
                 .channel_rtp_local_port(&channel_name)
@@ -1379,7 +1407,7 @@ impl SipEventHandler {
                 offer,
                 &local_ip,
                 media_port,
-                &self.supported_codecs,
+                &channel_codecs,
             );
             Some(answer)
         } else {

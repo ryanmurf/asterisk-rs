@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 
+use asterisk_codecs::Codec;
 use asterisk_config::AsteriskConfig;
 use tracing::{debug, info, warn};
 
@@ -133,6 +134,80 @@ impl Default for EndpointConfig {
             accountcode: String::new(),
         }
     }
+}
+
+impl EndpointConfig {
+    /// Apply this endpoint's Asterisk-style `disallow=` / `allow=` policy to
+    /// the codecs available in the SIP stack. `telephone-event` is an RFC
+    /// 4733 auxiliary format, so `disallow=all` does not remove it when the
+    /// endpoint's DTMF mode requests RFC 4733; an explicit named disallow does.
+    pub fn media_codecs(&self, available: &[Codec]) -> Vec<Codec> {
+        if self.disallow.is_empty() && self.allow.is_empty() {
+            return available.to_vec();
+        }
+
+        let disallow_all = self
+            .disallow
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("all"));
+        let explicitly_disallows_telephone_event = self
+            .disallow
+            .iter()
+            .any(|name| codec_name_matches(name, "telephone-event"));
+        let mut selected = if disallow_all {
+            Vec::new()
+        } else {
+            available
+                .iter()
+                .filter(|codec| {
+                    !self
+                        .disallow
+                        .iter()
+                        .any(|name| codec_name_matches(name, &codec.name))
+                })
+                .cloned()
+                .collect()
+        };
+
+        for allowed_name in &self.allow {
+            if allowed_name.eq_ignore_ascii_case("all") {
+                for codec in available {
+                    if !selected.iter().any(|item| item == codec) {
+                        selected.push(codec.clone());
+                    }
+                }
+                continue;
+            }
+            for codec in available
+                .iter()
+                .filter(|codec| codec_name_matches(allowed_name, &codec.name))
+            {
+                if !selected.iter().any(|item| item == codec) {
+                    selected.push(codec.clone());
+                }
+            }
+        }
+
+        let wants_rfc4733 = matches!(self.dtmf_mode.as_str(), "rfc4733" | "auto");
+        if wants_rfc4733 && !explicitly_disallows_telephone_event {
+            if let Some(codec) = available
+                .iter()
+                .find(|codec| codec.name.eq_ignore_ascii_case("telephone-event"))
+            {
+                if !selected.iter().any(|item| item == codec) {
+                    selected.push(codec.clone());
+                }
+            }
+        }
+
+        selected
+    }
+}
+
+fn codec_name_matches(configured: &str, sdp_name: &str) -> bool {
+    configured.eq_ignore_ascii_case(sdp_name)
+        || (configured.eq_ignore_ascii_case("ulaw") && sdp_name.eq_ignore_ascii_case("PCMU"))
+        || (configured.eq_ignore_ascii_case("alaw") && sdp_name.eq_ignore_ascii_case("PCMA"))
 }
 
 /// Address of Record configuration.
@@ -1234,5 +1309,32 @@ client_uri=sip:me@example.com
         assert_eq!(reg.expiration, 3600);
         assert!(reg.transport.is_none());
         assert!(reg.outbound_auth.is_none());
+    }
+
+    #[test]
+    fn endpoint_codec_policy_pins_g711_and_keeps_rfc4733() {
+        let endpoint = EndpointConfig {
+            disallow: vec!["all".into()],
+            allow: vec!["ulaw".into()],
+            dtmf_mode: "rfc4733".into(),
+            ..EndpointConfig::default()
+        };
+        let available = vec![
+            asterisk_codecs::codecs::pcmu(),
+            asterisk_codecs::codecs::pcma(),
+            asterisk_codecs::codecs::telephone_event(),
+            asterisk_codecs::codecs::vp8(),
+        ];
+
+        let selected = endpoint.media_codecs(&available);
+        let names: Vec<&str> = selected.iter().map(|codec| codec.name.as_str()).collect();
+        assert_eq!(names, vec!["PCMU", "telephone-event"]);
+
+        let no_rfc4733 = EndpointConfig {
+            dtmf_mode: "info".into(),
+            ..endpoint
+        };
+        let selected = no_rfc4733.media_codecs(&available);
+        assert_eq!(selected, vec![asterisk_codecs::codecs::pcmu()]);
     }
 }

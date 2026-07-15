@@ -21,7 +21,7 @@ use asterisk_types::{ChannelState, HangupCause};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // DialStatus
@@ -1025,6 +1025,15 @@ const MAX_FORWARDS: u32 = 20;
 /// 8. Publishes Stasis DialBegin/DialEnd events
 /// 9. Sets channel variables: DIALSTATUS, DIALEDPEERNAME, DIALEDPEERNUMBER,
 ///    ANSWEREDTIME, DIALEDTIME
+fn common_g711_payload(caller: Option<u32>, callee: Option<u32>) -> Option<u32> {
+    match (caller, callee) {
+        (Some(caller), Some(callee)) if caller == callee && matches!(caller, 0 | 8) => {
+            Some(caller)
+        }
+        _ => None,
+    }
+}
+
 pub struct AppDial;
 
 impl DialplanApp for AppDial {
@@ -1779,22 +1788,55 @@ impl AppDial {
             asterisk_core::channel::tech_registry::TECH_REGISTRY.find(caller_technology);
         let callee_driver = asterisk_core::channel::tech_registry::TECH_REGISTRY
             .find(&leg.destination.technology);
-        let media_pumps = match (caller_driver, callee_driver) {
-            (Some(caller_driver), Some(callee_driver)) => Some(
-                crate::media_pump::start_media_pumps(
-                    caller.name.clone(),
-                    caller_driver,
-                    callee_name.clone(),
-                    callee_driver,
-                    lifetime.clone(),
-                ),
-            ),
-            _ => {
-                warn!(caller = %caller.name, callee = %callee_name,
-                    "Dial bridge has no channel driver for one or both media legs");
-                None
+        let (media_pumps, codec_failure) = match (caller_driver, callee_driver) {
+            (Some(caller_driver), Some(callee_driver)) => {
+                let caller_codec = caller_driver.audio_format(caller).await;
+                let callee_channel = Channel::new(&callee_name);
+                let callee_codec = callee_driver.audio_format(&callee_channel).await;
+                if common_g711_payload(caller_codec, callee_codec).is_some() {
+                    (
+                        Some(crate::media_pump::start_media_pumps(
+                            caller.name.clone(),
+                            caller_driver,
+                            callee_name.clone(),
+                            callee_driver,
+                            lifetime.clone(),
+                        )),
+                        None,
+                    )
+                } else {
+                    (None, Some((caller_codec, callee_codec)))
+                }
             }
+            _ => (None, Some((None, None))),
         };
+        if let Some((caller_codec, callee_codec)) = codec_failure {
+            error!(
+                caller = %caller.name,
+                callee = %callee_name,
+                ?caller_codec,
+                ?callee_codec,
+                hangup_cause = %HangupCause::BearerCapNotAvail,
+                "Dial bridge rejected incompatible or unpinned G.711 media"
+            );
+            caller.hangup_cause = HangupCause::BearerCapNotAvail;
+            caller.softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_DEV);
+            if let Some(store_caller) =
+                asterisk_core::channel_store::find_by_name(&caller.name)
+            {
+                let mut channel = store_caller.lock();
+                channel.hangup_cause = HangupCause::BearerCapNotAvail;
+                channel.softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_DEV);
+            }
+            if let Some(store_callee) =
+                asterisk_core::channel_store::find_by_name(&callee_name)
+            {
+                let mut channel = store_callee.lock();
+                channel.hangup_cause = HangupCause::BearerCapNotAvail;
+                channel.softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_DEV);
+            }
+            lifetime.cancel();
+        }
         let bridge_started = Instant::now();
         let bridge_deadline = [
             options.duration_stop,
@@ -2069,6 +2111,15 @@ impl AppDial {
 mod tests {
     use super::*;
     use asterisk_core::stasis::StasisMessage;
+
+    #[test]
+    fn bridge_requires_identical_g711_payloads() {
+        assert_eq!(common_g711_payload(Some(0), Some(0)), Some(0));
+        assert_eq!(common_g711_payload(Some(8), Some(8)), Some(8));
+        assert_eq!(common_g711_payload(Some(0), Some(8)), None);
+        assert_eq!(common_g711_payload(Some(111), Some(111)), None);
+        assert_eq!(common_g711_payload(Some(0), None), None);
+    }
 
     // -----------------------------------------------------------------------
     // DialDestination tests
