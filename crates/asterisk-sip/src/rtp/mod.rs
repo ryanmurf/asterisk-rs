@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
 use tokio::net::UdpSocket;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use asterisk_types::{AsteriskError, AsteriskResult, Frame};
 
@@ -249,11 +249,39 @@ pub fn build_rtp_packet(header: &RtpHeader, payload: &[u8]) -> Bytes {
 #[inline]
 pub fn parse_rtp_header(data: &[u8]) -> Result<(RtpHeader, &[u8]), AsteriskError> {
     let header = RtpHeader::parse(data)?;
-    let offset = header.header_size();
+    let mut offset = header.header_size();
     if data.len() < offset {
         return Err(AsteriskError::Parse("RTP packet truncated".into()));
     }
-    Ok((header, &data[offset..]))
+
+    if header.extension {
+        if data.len() < offset + 4 {
+            return Err(AsteriskError::Parse("RTP extension header truncated".into()));
+        }
+        let extension_words =
+            u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        offset = offset
+            .checked_add(4 + extension_words * 4)
+            .ok_or_else(|| AsteriskError::Parse("RTP extension length overflow".into()))?;
+        if data.len() < offset {
+            return Err(AsteriskError::Parse("RTP extension truncated".into()));
+        }
+    }
+
+    let mut payload_end = data.len();
+    if header.padding {
+        let padding_len = data
+            .last()
+            .copied()
+            .map(usize::from)
+            .ok_or_else(|| AsteriskError::Parse("RTP padding missing".into()))?;
+        if padding_len == 0 || padding_len > payload_end.saturating_sub(offset) {
+            return Err(AsteriskError::Parse("Invalid RTP padding length".into()));
+        }
+        payload_end -= padding_len;
+    }
+
+    Ok((header, &data[offset..payload_end]))
 }
 
 /// RFC 4733 DTMF event payload.
@@ -325,9 +353,11 @@ pub struct RtpSession {
     /// Remote media address. Interior-mutable so `recv_frame` (which takes
     /// `&self`, as the session is shared via `Arc`) can latch it from the
     /// first inbound packet under symmetric RTP (issue #34).
-    remote_addr: RwLock<Option<SocketAddr>>,
     /// Our SSRC.
     pub ssrc: u32,
+    /// The first accepted inbound SSRC. A change is rejected rather than
+    /// silently switching media sources mid-session.
+    inbound_ssrc: Mutex<Option<u32>>,
     /// Outgoing sequence number.
     sequence: AtomicU16,
     /// Outgoing timestamp.
@@ -349,6 +379,8 @@ pub struct RtpSession {
 /// RTP session statistics.
 #[derive(Debug, Default)]
 pub struct RtpStats {
+    /// Current negotiated or symmetrically learned remote RTP address.
+    remote_addr: RwLock<Option<SocketAddr>>,
     pub packets_sent: AtomicU32,
     pub packets_received: AtomicU32,
     pub octets_sent: AtomicU32,
@@ -361,11 +393,20 @@ pub struct RtpStats {
     pub dtmf_digits_sent: AtomicU64,
     /// Logical RFC 4733 digits detected after repeated-end deduplication.
     pub dtmf_digits_received: AtomicU64,
+    /// Datagrams rejected because their source address or port did not match.
+    pub discarded_wrong_source: AtomicU64,
+    /// Datagrams rejected because their payload type was not negotiated.
+    pub discarded_wrong_payload_type: AtomicU64,
+    /// Datagrams rejected because RTP or RFC 4733 framing was malformed.
+    pub discarded_malformed: AtomicU64,
+    /// Datagrams rejected because their SSRC changed during the session.
+    pub discarded_unstable_ssrc: AtomicU64,
 }
 
 /// Point-in-time, copyable RTP statistics for AMI and teardown history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtpStatsSnapshot {
+    pub remote_addr: Option<SocketAddr>,
     pub packets_sent: u32,
     pub packets_received: u32,
     pub octets_sent: u32,
@@ -374,12 +415,17 @@ pub struct RtpStatsSnapshot {
     pub voice_frames_received: u64,
     pub dtmf_digits_sent: u64,
     pub dtmf_digits_received: u64,
+    pub discarded_wrong_source: u64,
+    pub discarded_wrong_payload_type: u64,
+    pub discarded_malformed: u64,
+    pub discarded_unstable_ssrc: u64,
 }
 
 impl RtpStats {
     /// Read all counters without blocking the media path.
     pub fn snapshot(&self) -> RtpStatsSnapshot {
         RtpStatsSnapshot {
+            remote_addr: *self.remote_addr.read(),
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
             octets_sent: self.octets_sent.load(Ordering::Relaxed),
@@ -388,6 +434,12 @@ impl RtpStats {
             voice_frames_received: self.voice_frames_received.load(Ordering::Relaxed),
             dtmf_digits_sent: self.dtmf_digits_sent.load(Ordering::Relaxed),
             dtmf_digits_received: self.dtmf_digits_received.load(Ordering::Relaxed),
+            discarded_wrong_source: self.discarded_wrong_source.load(Ordering::Relaxed),
+            discarded_wrong_payload_type: self
+                .discarded_wrong_payload_type
+                .load(Ordering::Relaxed),
+            discarded_malformed: self.discarded_malformed.load(Ordering::Relaxed),
+            discarded_unstable_ssrc: self.discarded_unstable_ssrc.load(Ordering::Relaxed),
         }
     }
 }
@@ -403,8 +455,8 @@ impl RtpSession {
         let ssrc = generate_ssrc();
         Self {
             socket: Arc::new(socket),
-            remote_addr: RwLock::new(None),
             ssrc,
+            inbound_ssrc: Mutex::new(None),
             sequence: AtomicU16::new(0),
             timestamp: AtomicU32::new(0),
             payload_type: AtomicU8::new(0),
@@ -423,14 +475,14 @@ impl RtpSession {
     /// The current remote media address (from SDP or latched from the first
     /// inbound packet), if known.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
-        *self.remote_addr.read()
+        *self.stats.remote_addr.read()
     }
 
     /// Set the remote address (e.g. from an SDP `c=`/`m=` line). Takes
     /// `&self` because the address is interior-mutable; a `&mut` binding
     /// still works via auto-ref.
     pub fn set_remote_addr(&self, addr: SocketAddr) {
-        *self.remote_addr.write() = Some(addr);
+        *self.stats.remote_addr.write() = Some(addr);
     }
 
     /// Return the payload type used for outbound voice packets.
@@ -524,10 +576,10 @@ impl RtpSession {
     /// hear nothing (issue #34; RFC 4961 symmetric RTP, RFC 3581 rport).
     fn latch_remote(&self, src: SocketAddr) -> bool {
         // Fast path: already known — no write lock, no move.
-        if self.remote_addr.read().is_some() {
+        if self.stats.remote_addr.read().is_some() {
             return false;
         }
-        let mut guard = self.remote_addr.write();
+        let mut guard = self.stats.remote_addr.write();
         // Re-check under the write lock in case another packet raced us.
         if guard.is_none() {
             *guard = Some(src);
@@ -541,24 +593,75 @@ impl RtpSession {
     /// Receive an RTP packet and convert to a Frame.
     pub async fn recv_frame(&self) -> AsteriskResult<Frame> {
         let mut buf = vec![0u8; RTP_MAX_MTU];
-        let (len, src) = self.socket.recv_from(&mut buf).await?;
-        buf.truncate(len);
+        loop {
+            let (len, src) = self.socket.recv_from(&mut buf).await?;
+            let packet = &buf[..len];
 
-        let (header, payload) = parse_rtp_header(&buf)?;
+            if self.remote_addr().is_some_and(|remote| remote != src) {
+                self.stats.discarded_wrong_source.fetch_add(1, Ordering::Relaxed);
+                trace!(source = %src, expected = ?self.remote_addr(),
+                    "Discarding RTP from unexpected source");
+                continue;
+            }
 
-        // Latch the remote from the first valid RTP packet if SDP left us
-        // without one (symmetric RTP). Done after a successful parse so
-        // non-RTP junk on the port cannot capture the endpoint (issue #34).
-        self.latch_remote(src);
+            let (header, payload) = match parse_rtp_header(packet) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.stats.discarded_malformed.fetch_add(1, Ordering::Relaxed);
+                    trace!(source = %src, %error, "Discarding malformed RTP datagram");
+                    continue;
+                }
+            };
 
-        self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .octets_received
-            .fetch_add(payload.len() as u32, Ordering::Relaxed);
+            let is_dtmf = self.dtmf_payload_type() == Some(header.payload_type);
+            if header.payload_type != self.payload_type() && !is_dtmf {
+                self.stats
+                    .discarded_wrong_payload_type
+                    .fetch_add(1, Ordering::Relaxed);
+                trace!(source = %src, payload_type = header.payload_type,
+                    "Discarding RTP with non-negotiated payload type");
+                continue;
+            }
 
-        // Check for DTMF (RFC 4733)
-        if self.dtmf_payload_type() == Some(header.payload_type) {
-            if let Some(event) = DtmfEvent::from_bytes(payload) {
+            let dtmf_event = if is_dtmf {
+                match DtmfEvent::from_bytes(payload).filter(|event| event.event <= 15) {
+                    Some(event) => Some(event),
+                    None => {
+                        self.stats.discarded_malformed.fetch_add(1, Ordering::Relaxed);
+                        trace!(source = %src, "Discarding malformed RFC 4733 event");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            {
+                let mut inbound_ssrc = self.inbound_ssrc.lock();
+                match *inbound_ssrc {
+                    Some(expected) if expected != header.ssrc => {
+                        self.stats
+                            .discarded_unstable_ssrc
+                            .fetch_add(1, Ordering::Relaxed);
+                        trace!(source = %src, expected, actual = header.ssrc,
+                            "Discarding RTP with unstable SSRC");
+                        continue;
+                    }
+                    None => *inbound_ssrc = Some(header.ssrc),
+                    Some(_) => {}
+                }
+            }
+
+            // Symmetric RTP may learn a source only after every ingress check
+            // above succeeds. A rejected datagram can neither latch nor move it.
+            self.latch_remote(src);
+
+            self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .octets_received
+                .fetch_add(payload.len() as u32, Ordering::Relaxed);
+
+            if let Some(event) = dtmf_event {
                 let digit = DtmfEvent::event_to_digit(event.event);
                 if event.end {
                     let event_key = (header.ssrc, header.timestamp, event.event);
@@ -571,27 +674,26 @@ impl RtpSession {
                         .dtmf_digits_received
                         .fetch_add(1, Ordering::Relaxed);
                     return Ok(Frame::dtmf_end(digit, event.duration as u32 / 8));
-                } else {
-                    return Ok(Frame::dtmf_begin(digit));
                 }
+                return Ok(Frame::dtmf_begin(digit));
             }
-        }
 
-        let samples = match header.payload_type {
-            0 | 8 => payload.len() as u32,
-            _ => (payload.len() as u32) / 2,
-        };
-        if !payload.is_empty() {
-            self.stats
-                .voice_frames_received
-                .fetch_add(1, Ordering::Relaxed);
-        }
+            let samples = match header.payload_type {
+                0 | 8 => payload.len() as u32,
+                _ => (payload.len() as u32) / 2,
+            };
+            if !payload.is_empty() {
+                self.stats
+                    .voice_frames_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
-        Ok(Frame::voice(
-            header.payload_type as u32,
-            samples,
-            Bytes::copy_from_slice(payload),
-        ))
+            return Ok(Frame::voice(
+                header.payload_type as u32,
+                samples,
+                Bytes::copy_from_slice(payload),
+            ));
+        }
     }
 
     /// Send a DTMF digit via RFC 4733.
@@ -1207,6 +1309,111 @@ mod tests {
         assert_eq!(from, server_addr);
         let (_h, pl) = parse_rtp_header(&buf[..n]).unwrap();
         assert_eq!(pl, &[0x7F; 160], "peer must receive the echoed audio");
+    }
+
+    #[tokio::test]
+    async fn ingress_discards_are_counted_without_accepting_or_repointing_media() {
+        let session = RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        session.set_payload_type(0);
+        let target = session.local_addr().unwrap();
+        let negotiated_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let negotiated_remote = negotiated_peer.local_addr().unwrap();
+        session.set_remote_addr(negotiated_remote);
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let accepted = RtpHeader {
+            version: 2, padding: false, extension: false, csrc_count: 0,
+            marker: false, payload_type: 0, sequence: 1, timestamp: 160,
+            ssrc: 0x12345678,
+        };
+
+        attacker.send_to(&build_rtp_packet(&accepted, &[0x7f; 160]), target).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), session.recv_frame()
+        ).await.is_err());
+        let after_source = session.stats.snapshot();
+        assert_eq!(after_source.discarded_wrong_source, 1);
+        assert_eq!(after_source.packets_received, 0);
+        assert_eq!(after_source.voice_frames_received, 0);
+        assert_eq!(after_source.remote_addr, Some(negotiated_remote));
+
+        let wrong_payload = RtpHeader { payload_type: 8, ..accepted.clone() };
+        negotiated_peer.send_to(
+            &build_rtp_packet(&wrong_payload, &[0x7f; 160]), target
+        ).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), session.recv_frame()
+        ).await.is_err());
+        let after_payload = session.stats.snapshot();
+        assert_eq!(after_payload.discarded_wrong_payload_type, 1);
+        assert_eq!(after_payload.packets_received, 0);
+        assert_eq!(after_payload.voice_frames_received, 0);
+
+        negotiated_peer.send_to(&[0x80], target).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), session.recv_frame()
+        ).await.is_err());
+        let after_malformed = session.stats.snapshot();
+        assert_eq!(after_malformed.discarded_malformed, 1);
+        assert_eq!(after_malformed.packets_received, 0);
+        assert_eq!(after_malformed.voice_frames_received, 0);
+
+        negotiated_peer.send_to(
+            &build_rtp_packet(&accepted, &[0x7f; 160]), target
+        ).await.unwrap();
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
+        let after_accepted = session.stats.snapshot();
+        assert_eq!(after_accepted.packets_received, 1);
+        assert_eq!(after_accepted.voice_frames_received, 1);
+
+        let unstable = RtpHeader {
+            sequence: 2, timestamp: 320, ssrc: 0x87654321, ..accepted.clone()
+        };
+        negotiated_peer.send_to(
+            &build_rtp_packet(&unstable, &[0x7f; 160]), target
+        ).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100), session.recv_frame()
+        ).await.is_err());
+        let after_ssrc = session.stats.snapshot();
+        assert_eq!(after_ssrc.discarded_unstable_ssrc, 1);
+        assert_eq!(after_ssrc.packets_received, 1);
+        assert_eq!(after_ssrc.voice_frames_received, 1);
+        assert_eq!(after_ssrc.remote_addr, Some(negotiated_remote));
+
+        let resumed = RtpHeader { sequence: 3, timestamp: 480, ..accepted };
+        negotiated_peer.send_to(
+            &build_rtp_packet(&resumed, &[0x7f; 160]), target
+        ).await.unwrap();
+        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
+        assert_eq!(session.stats.snapshot().packets_received, 2);
+    }
+
+    #[test]
+    fn parser_removes_valid_extension_and_padding() {
+        let mut packet = vec![0xB0, 0, 0, 1, 0, 0, 0, 160, 0, 0, 0, 1];
+        packet.extend_from_slice(&[0xBE, 0xDE, 0, 1]);
+        packet.extend_from_slice(&[1, 2, 3, 4]);
+        packet.extend_from_slice(&[0x7f; 4]);
+        packet.extend_from_slice(&[0, 0, 0, 4]);
+
+        let (header, payload) = parse_rtp_header(&packet).unwrap();
+        assert!(header.extension);
+        assert!(header.padding);
+        assert_eq!(payload, &[0x7f; 4]);
+    }
+
+    #[test]
+    fn parser_rejects_truncated_extension_and_invalid_padding() {
+        let truncated_extension = [
+            0x90, 0, 0, 1, 0, 0, 0, 160, 0, 0, 0, 1, 0xBE, 0xDE, 0, 2, 1, 2, 3, 4,
+        ];
+        assert!(parse_rtp_header(&truncated_extension).is_err());
+
+        let invalid_padding = [
+            0xA0, 0, 0, 1, 0, 0, 0, 160, 0, 0, 0, 1, 0x7f, 0,
+        ];
+        assert!(parse_rtp_header(&invalid_padding).is_err());
     }
 
     #[test]

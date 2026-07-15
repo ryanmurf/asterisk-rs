@@ -1088,10 +1088,12 @@ mod tests {
         };
 
         peer.send_to(&packet(101), target).await.unwrap();
-        assert!(matches!(
-            driver.read_frame(&mut channel).await.unwrap(),
-            Frame::Voice { .. }
-        ));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            driver.read_frame(&mut channel),
+        ).await.is_err(), "non-negotiated DTMF payload must be discarded");
+        assert_eq!(rtp.stats.snapshot().discarded_wrong_payload_type, 1);
+        assert_eq!(rtp.stats.snapshot().packets_received, 0);
 
         peer.send_to(&packet(110), target).await.unwrap();
         assert!(matches!(
