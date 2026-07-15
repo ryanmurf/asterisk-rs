@@ -44,6 +44,7 @@ pub struct SipResourceCounts {
     pub driver_channels: usize,
     pub call_id_mappings: usize,
     pub call_states: usize,
+    pub notify_channels: usize,
 }
 
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
@@ -1591,6 +1592,7 @@ impl SipEventHandler {
                 .unwrap_or(0),
             call_id_mappings: self.callid_map.read().len(),
             call_states: self.call_states.read().len(),
+            notify_channels: crate::notify_service::global_notify_service().active_channel_count(),
         }
     }
 }

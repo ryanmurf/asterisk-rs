@@ -70,6 +70,11 @@ impl NotifyService {
         self.channel_states.write().remove(channel_name);
     }
 
+    /// Return the exact number of channels registered for in-dialog NOTIFY.
+    pub fn active_channel_count(&self) -> usize {
+        self.channel_states.read().len()
+    }
+
     /// Whether a channel is currently registered for NOTIFY. Used by teardown
     /// paths and tests to confirm cleanup.
     pub fn is_registered(&self, channel_name: &str) -> bool {
