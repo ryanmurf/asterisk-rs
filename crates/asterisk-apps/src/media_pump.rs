@@ -181,17 +181,28 @@ async fn pump_direction(
             result = source_driver.read_frame(&mut source) => result?,
         };
 
-        let Frame::Voice { .. } = frame else {
-            // DTMF is deliberately wired in the following M2 checkpoint.
-            continue;
-        };
-
-        for ready in reorder.push(frame) {
-            tokio::select! {
-                biased;
-                _ = lifetime.cancelled() => return Ok(()),
-                result = destination_driver.write_frame(&mut destination, &ready) => result?,
+        match frame {
+            voice @ Frame::Voice { .. } => {
+                for ready in reorder.push(voice) {
+                    tokio::select! {
+                        biased;
+                        _ = lifetime.cancelled() => return Ok(()),
+                        result = destination_driver.write_frame(&mut destination, &ready) => result?,
+                    }
+                }
             }
+            Frame::DtmfEnd { digit, duration_ms } => {
+                tokio::select! {
+                    biased;
+                    _ = lifetime.cancelled() => return Ok(()),
+                    result = destination_driver.send_digit_end(
+                        &mut destination,
+                        digit,
+                        duration_ms,
+                    ) => result?,
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -269,6 +280,7 @@ mod tests {
         name: &'static str,
         incoming: Mutex<mpsc::Receiver<AsteriskResult<Frame>>>,
         written: ParkingMutex<Vec<Frame>>,
+        sent_digits: ParkingMutex<Vec<(char, u32)>>,
     }
 
     impl MockDriver {
@@ -279,6 +291,7 @@ mod tests {
                     name,
                     incoming: Mutex::new(receiver),
                     written: ParkingMutex::new(Vec::new()),
+                    sent_digits: ParkingMutex::new(Vec::new()),
                 }),
                 sender,
             )
@@ -327,6 +340,16 @@ mod tests {
 
         async fn write_frame(&self, _channel: &mut Channel, frame: &Frame) -> AsteriskResult<()> {
             self.written.lock().push(frame.clone());
+            Ok(())
+        }
+
+        async fn send_digit_end(
+            &self,
+            _channel: &mut Channel,
+            digit: char,
+            duration: u32,
+        ) -> AsteriskResult<()> {
+            self.sent_digits.lock().push((digit, duration));
             Ok(())
         }
     }
@@ -391,6 +414,39 @@ mod tests {
         assert_eq!(first_payload_bytes(&first.written.lock()), vec![0x22]);
         assert_eq!(first_payload_bytes(&second.written.lock()), vec![0x11]);
 
+        lifetime.cancel();
+        pumps.wait().await;
+    }
+
+    #[tokio::test]
+    async fn dtmf_end_crosses_as_a_destination_driver_event() {
+        let (first, first_sender) = MockDriver::new("FIRST");
+        let (second, _second_sender) = MockDriver::new("SECOND");
+        let lifetime = BridgeLifetime::new();
+        let pumps = start_media_pumps(
+            "FIRST/a".into(),
+            first,
+            "SECOND/b".into(),
+            second.clone(),
+            lifetime.clone(),
+        );
+
+        first_sender
+            .send(Ok(Frame::dtmf_end('5', 240)))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if second.sent_digits.lock().as_slice() == [('5', 240)] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DTMF event did not reach the receiving driver");
+
+        assert!(second.written.lock().is_empty());
         lifetime.cancel();
         pumps.wait().await;
     }
