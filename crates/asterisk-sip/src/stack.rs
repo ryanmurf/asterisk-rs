@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::dialog::Dialog;
-use crate::parser::{SipMessage, SipMethod, header_names, extract_tag};
+use crate::parser::{
+    RequestLine, SipHeader, SipMessage, SipMethod, StartLine, extract_tag, header_names,
+};
 use crate::session::SipSession;
 use crate::transaction::{
     ClientTransaction, NonInviteClientTransaction, NonInviteServerTransaction, ServerTransaction,
@@ -31,6 +33,47 @@ fn request_identity_matches(original: &SipMessage, retransmission: &SipMessage) 
         && cseq_number(original) == cseq_number(retransmission)
         && original.from_header().and_then(extract_tag)
             == retransmission.from_header().and_then(extract_tag)
+}
+
+/// Build the transaction ACK for a 300-699 INVITE response. It reuses the
+/// INVITE branch and Request-URI, unlike the new-branch dialog ACK for 2xx.
+fn build_non_2xx_ack(invite: &SipMessage, response: &SipMessage) -> Option<SipMessage> {
+    let request_line = match &invite.start_line {
+        StartLine::Request(line) => RequestLine {
+            method: SipMethod::Ack,
+            uri: line.uri.clone(),
+            version: line.version.clone(),
+        },
+        _ => return None,
+    };
+    let cseq = cseq_number(invite)?;
+    let mut headers: Vec<SipHeader> = invite.headers.iter()
+        .filter(|header| {
+            header.name.eq_ignore_ascii_case(header_names::VIA)
+                || header.name.eq_ignore_ascii_case(header_names::MAX_FORWARDS)
+                || header.name.eq_ignore_ascii_case(header_names::FROM)
+                || header.name.eq_ignore_ascii_case(header_names::CALL_ID)
+                || header.name.eq_ignore_ascii_case(header_names::ROUTE)
+        })
+        .cloned()
+        .collect();
+    headers.push(SipHeader {
+        name: header_names::TO.to_string(),
+        value: response.to_header()?.to_string(),
+    });
+    headers.push(SipHeader {
+        name: header_names::CSEQ.to_string(),
+        value: format!("{} ACK", cseq),
+    });
+    headers.push(SipHeader {
+        name: header_names::CONTENT_LENGTH.to_string(),
+        value: "0".to_string(),
+    });
+    Some(SipMessage {
+        start_line: StartLine::Request(request_line),
+        headers,
+        body: String::new(),
+    })
 }
 
 /// Events emitted by the SIP stack for the application layer.
@@ -92,6 +135,16 @@ struct CachedInviteFinal {
     expires_at: Instant,
 }
 
+struct TransactionTimeoutEvent {
+    branch: String,
+    invite_ack_call_id: Option<String>,
+}
+
+struct MatchedResponse {
+    branch: String,
+    transaction_ack: Option<(SipMessage, SocketAddr)>,
+}
+
 struct TransactionLayer {
     invite_client_txns: HashMap<String, ClientTransaction>,
     invite_server_txns: HashMap<String, ServerTransaction>,
@@ -129,17 +182,32 @@ impl TransactionLayer {
     fn process_response(
         &mut self,
         response: &SipMessage,
-    ) -> Option<String> {
+        src: SocketAddr,
+    ) -> Option<MatchedResponse> {
         let branch = Self::extract_branch(response)?;
 
         if let Some(txn) = self.invite_client_txns.get_mut(&branch) {
+            if txn.remote_addr != src {
+                return None;
+            }
+            let status = response.status_code().unwrap_or_default();
+            let transaction_ack = (300..700).contains(&status)
+                .then(|| build_non_2xx_ack(&txn.request, response))
+                .flatten()
+                .map(|ack| (ack, txn.remote_addr));
             txn.on_response(response.clone());
-            return Some(branch);
+            return Some(MatchedResponse { branch, transaction_ack });
         }
 
         if let Some(txn) = self.non_invite_client_txns.get_mut(&branch) {
+            if txn.remote_addr != src {
+                return None;
+            }
             txn.on_response(response.clone());
-            return Some(branch);
+            return Some(MatchedResponse {
+                branch,
+                transaction_ack: None,
+            });
         }
 
         None
@@ -233,25 +301,58 @@ impl TransactionLayer {
         result
     }
 
-    /// Collect timed-out transaction branches.
-    fn timed_out_transactions(&self) -> Vec<String> {
-        let mut result = Vec::new();
-        for (branch, txn) in &self.invite_client_txns {
-            if txn.is_timed_out() {
-                result.push(branch.clone());
+    /// Advance every terminal timer and return only abnormal timeouts that
+    /// must be reported to the TU. D/I/J/K are normal absorption lifetimes;
+    /// they terminate silently and are reaped in the same timer pass.
+    fn expire_timers(&mut self) -> Vec<TransactionTimeoutEvent> {
+        let mut events = Vec::new();
+        for (branch, txn) in &mut self.invite_client_txns {
+            if txn.timer_b_expired() {
+                txn.terminate();
+                events.push(TransactionTimeoutEvent {
+                    branch: branch.clone(),
+                    invite_ack_call_id: None,
+                });
+            } else if txn.timer_d_expired() {
+                txn.terminate();
+                debug!(branch = %branch, "Timer D expired");
             }
         }
-        for (branch, txn) in &self.non_invite_client_txns {
-            if txn.is_timed_out() {
-                result.push(branch.clone());
+        for (branch, txn) in &mut self.non_invite_client_txns {
+            if txn.timer_f_expired() {
+                txn.terminate();
+                events.push(TransactionTimeoutEvent {
+                    branch: branch.clone(),
+                    invite_ack_call_id: None,
+                });
+            } else if txn.timer_k_expired() {
+                txn.terminate();
+                debug!(branch = %branch, "Timer K expired");
             }
         }
-        for (branch, txn) in &self.invite_server_txns {
-            if txn.is_timed_out() {
-                result.push(branch.clone());
+        for (branch, txn) in &mut self.invite_server_txns {
+            if txn.timer_h_expired() {
+                let invite_ack_call_id =
+                    (txn.state == crate::transaction::InviteServerState::Accepted)
+                        .then(|| txn.request.call_id().map(str::to_string))
+                        .flatten();
+                txn.terminate();
+                events.push(TransactionTimeoutEvent {
+                    branch: branch.clone(),
+                    invite_ack_call_id,
+                });
+            } else if txn.timer_i_expired() {
+                txn.terminate();
+                debug!(branch = %branch, "Timer I expired");
             }
         }
-        result
+        for (branch, txn) in &mut self.non_invite_server_txns {
+            if txn.timer_j_expired() {
+                txn.terminate();
+                debug!(branch = %branch, "Timer J expired");
+            }
+        }
+        events
     }
 }
 
@@ -538,13 +639,20 @@ impl SipStack {
     /// Handle an incoming response.
     async fn handle_response(&self, response: SipMessage, src: SocketAddr) {
         // Route through transaction layer
-        let branch = {
+        let matched = {
             let mut txn_layer = self.transaction_layer.write();
-            txn_layer.process_response(&response)
+            txn_layer.process_response(&response, src)
         };
 
-        if branch.is_some() {
+        if let Some(ref matched) = matched {
             debug!(src = %src, "Response matched transaction");
+            if let Some((ack, remote_addr)) = &matched.transaction_ack {
+                if let Err(error) = self.transport.send(ack, *remote_addr).await {
+                    warn!(branch = %matched.branch, %error, "Failed to send non-2xx ACK");
+                } else {
+                    debug!(branch = %matched.branch, "Sent non-2xx transaction ACK");
+                }
+            }
         } else {
             debug!(src = %src, "Response did not match any transaction (stray)");
         }
@@ -852,37 +960,17 @@ impl SipStack {
             }
         }
 
-        // Collect timed-out transactions
-        let timed_out: Vec<String> = {
-            let txn_layer = self.transaction_layer.read();
-            txn_layer.timed_out_transactions()
-        };
+        // Advance B/D/F/H/I/J/K. Only B/F/H are abnormal timeouts delivered
+        // to the TU; D/I/J/K simply end their retransmission-absorption wait.
+        let timed_out = self.transaction_layer.write().expire_timers();
 
-        for branch in timed_out {
-            warn!(branch = %branch, "Transaction timed out");
-            let ack_timeout_call_id = self.transaction_layer.read()
-                .invite_server_txns.get(&branch)
-                .and_then(|txn| (txn.state == crate::transaction::InviteServerState::Accepted)
-                    .then(|| txn.request.call_id().map(str::to_string)).flatten());
-            // Terminate inside a scope so the lock is not held across the
-            // (potentially blocking) event emission below.
-            {
-                let mut txn_layer = self.transaction_layer.write();
-                if let Some(txn) = txn_layer.invite_client_txns.get_mut(&branch) {
-                    txn.terminate();
-                }
-                if let Some(txn) = txn_layer.non_invite_client_txns.get_mut(&branch) {
-                    txn.terminate();
-                }
-                if let Some(txn) = txn_layer.invite_server_txns.get_mut(&branch) {
-                    txn.terminate();
-                }
-            }
+        for timeout in timed_out {
+            warn!(branch = %timeout.branch, "Transaction timed out");
             self.emit_event(SipEvent::TransactionTimeout {
-                branch,
+                branch: timeout.branch,
             })
             .await;
-            if let Some(call_id) = ack_timeout_call_id {
+            if let Some(call_id) = timeout.invite_ack_call_id {
                 self.emit_event(SipEvent::InviteAckTimeout { call_id }).await;
             }
         }
@@ -1575,6 +1663,114 @@ mod tests {
         }
         assert_eq!(observed, vec![ok.to_string(); 3]);
         assert!(rx.try_recv().is_err(), "exactly one call may reach the TU");
+    }
+
+    #[test]
+    fn test_full_b_d_f_h_i_j_k_timer_matrix() {
+        use crate::transaction::{
+            InviteClientState, InviteServerState, NonInviteClientState,
+            NonInviteServerState,
+        };
+
+        let remote: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let invite = build_invite_request("timer-matrix", "z9hG4bKmatrix");
+        let options = build_options_request("timer-matrix-options", "z9hG4bKoptions");
+
+        let mut layer = TransactionLayer::new();
+
+        // B remains armed after a provisional response moves Calling -> Proceeding.
+        let mut b = ClientTransaction::new(invite.clone(), remote, "timer-b".to_string());
+        b.on_response(invite.create_response(180, "Ringing").unwrap());
+        assert_eq!(b.state, InviteClientState::Proceeding);
+        b.expire_timer_b();
+        layer.invite_client_txns.insert("timer-b".to_string(), b);
+
+        // D retains the client transaction after it generated a non-2xx ACK.
+        let mut d = ClientTransaction::new(invite.clone(), remote, "timer-d".to_string());
+        d.on_response(invite.create_response(486, "Busy Here").unwrap());
+        d.expire_timer_d();
+        layer.invite_client_txns.insert("timer-d".to_string(), d);
+
+        // F remains armed in Proceeding, just like B.
+        let mut f = NonInviteClientTransaction::new(
+            options.clone(), remote, "timer-f".to_string());
+        f.on_response(options.create_response(100, "Trying").unwrap());
+        assert_eq!(f.state, NonInviteClientState::Proceeding);
+        f.expire_timer_f();
+        layer.non_invite_client_txns.insert("timer-f".to_string(), f);
+
+        // H ends a non-2xx server transaction that never receives ACK.
+        let mut h = ServerTransaction::new(invite.clone(), remote, "timer-h".to_string());
+        h.send_final(invite.create_response(486, "Busy Here").unwrap());
+        h.expire_final_response_timer();
+        layer.invite_server_txns.insert("timer-h".to_string(), h);
+
+        // I absorbs ACK retransmissions from Confirmed before reaping.
+        let mut i = ServerTransaction::new(invite.clone(), remote, "timer-i".to_string());
+        i.send_final(invite.create_response(486, "Busy Here").unwrap());
+        i.on_ack();
+        i.expire_timer_i();
+        layer.invite_server_txns.insert("timer-i".to_string(), i);
+
+        // J and K retain their respective UDP transactions for absorption.
+        let mut j = NonInviteServerTransaction::new(
+            options.clone(), remote, "timer-j".to_string());
+        j.send_final(options.create_response(200, "OK").unwrap());
+        j.expire_timer_j();
+        layer.non_invite_server_txns.insert("timer-j".to_string(), j);
+
+        let mut k = NonInviteClientTransaction::new(
+            options.clone(), remote, "timer-k".to_string());
+        k.on_response(options.create_response(200, "OK").unwrap());
+        k.expire_timer_k();
+        layer.non_invite_client_txns.insert("timer-k".to_string(), k);
+
+        let events = layer.expire_timers();
+        let mut timeout_branches: Vec<&str> = events.iter()
+            .map(|event| event.branch.as_str()).collect();
+        timeout_branches.sort_unstable();
+        assert_eq!(timeout_branches, vec!["timer-b", "timer-f", "timer-h"]);
+        assert_eq!(layer.invite_client_txns["timer-b"].state,
+            InviteClientState::Terminated);
+        assert_eq!(layer.invite_client_txns["timer-d"].state,
+            InviteClientState::Terminated);
+        assert_eq!(layer.invite_server_txns["timer-h"].state,
+            InviteServerState::Terminated);
+        assert_eq!(layer.invite_server_txns["timer-i"].state,
+            InviteServerState::Terminated);
+        assert_eq!(layer.non_invite_client_txns["timer-f"].state,
+            NonInviteClientState::Terminated);
+        assert_eq!(layer.non_invite_client_txns["timer-k"].state,
+            NonInviteClientState::Terminated);
+        assert_eq!(layer.non_invite_server_txns["timer-j"].state,
+            NonInviteServerState::Terminated);
+    }
+
+    #[tokio::test]
+    async fn test_non_2xx_invite_response_generates_transaction_ack() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let branch = "z9hG4bKclient-non2xx";
+        let invite = build_invite_request("client-non2xx", branch);
+
+        stack.send_invite(invite.clone(), peer_addr).await.unwrap();
+        let wire_invite = recv_peer(&peer).await;
+        assert_eq!(wire_invite.method(), Some(SipMethod::Invite));
+        let mut busy = invite.create_response(486, "Busy Here").unwrap();
+        busy.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::TO))
+            .unwrap().value.push_str(";tag=busy-peer");
+        stack.handle_response(busy.clone(), peer_addr).await;
+
+        let ack = recv_peer(&peer).await;
+        assert_eq!(ack.method(), Some(SipMethod::Ack));
+        assert_eq!(TransactionLayer::extract_branch(&ack).as_deref(), Some(branch));
+        assert_eq!(ack.get_header(header_names::CSEQ), Some("1 ACK"));
+        assert_eq!(ack.to_header(), busy.to_header());
+        assert!(matches!(rx.recv().await, Some(SipEvent::Response { .. })));
     }
 
     /// A CANCEL matching no INVITE transaction gets 481 Call/Transaction

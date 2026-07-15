@@ -71,9 +71,9 @@ pub enum InviteClientState {
     Calling,
     /// 1xx received, waiting for final response.
     Proceeding,
-    /// 2xx received (success) or non-2xx received.
+    /// Non-2xx received and ACK sent; Timer D is running.
     Completed,
-    /// ACK sent for non-2xx, waiting to absorb retransmissions.
+    /// Transaction done (2xx was passed to TU, or Timer D expired).
     Terminated,
 }
 
@@ -127,6 +127,7 @@ pub struct ClientTransaction {
     pub remote_addr: SocketAddr,
     timer_a_interval: Duration,
     started_at: Instant,
+    completed_at: Option<Instant>,
     last_retransmit: Instant,
     pub last_response: Option<SipMessage>,
 }
@@ -142,6 +143,7 @@ impl ClientTransaction {
             remote_addr,
             timer_a_interval: timers::TIMER_A_INITIAL,
             started_at: now,
+            completed_at: None,
             last_retransmit: now,
             last_response: None,
         }
@@ -162,6 +164,7 @@ impl ClientTransaction {
                     debug!(branch = %self.branch, status, "INVITE client -> Terminated (2xx)");
                 } else if (300..700).contains(&status) {
                     self.state = InviteClientState::Completed;
+                    self.completed_at = Some(Instant::now());
                     debug!(branch = %self.branch, status, "INVITE client -> Completed");
                 }
             }
@@ -171,6 +174,7 @@ impl ClientTransaction {
                     debug!(branch = %self.branch, status, "INVITE client -> Terminated (2xx)");
                 } else if (300..700).contains(&status) {
                     self.state = InviteClientState::Completed;
+                    self.completed_at = Some(Instant::now());
                     debug!(branch = %self.branch, status, "INVITE client -> Completed");
                 }
             }
@@ -193,14 +197,30 @@ impl ClientTransaction {
     }
 
     /// Check if Timer B (transaction timeout) has expired.
-    pub fn is_timed_out(&self) -> bool {
-        self.state == InviteClientState::Calling
+    pub fn timer_b_expired(&self) -> bool {
+        matches!(self.state, InviteClientState::Calling | InviteClientState::Proceeding)
             && self.started_at.elapsed() >= timers::TIMER_B
+    }
+
+    /// Timer D absorbs retransmitted non-2xx finals after the ACK was sent.
+    pub fn timer_d_expired(&self) -> bool {
+        self.state == InviteClientState::Completed
+            && self.completed_at.is_some_and(|at| at.elapsed() >= timers::TIMER_D_UDP)
     }
 
     /// Mark as terminated.
     pub fn terminate(&mut self) {
         self.state = InviteClientState::Terminated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_b(&mut self) {
+        self.started_at = Instant::now() - timers::TIMER_B;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_d(&mut self) {
+        self.completed_at = Some(Instant::now() - timers::TIMER_D_UDP);
     }
 
     /// Start the INVITE client transaction timers.
@@ -257,6 +277,7 @@ pub struct ServerTransaction {
     pub remote_addr: SocketAddr,
     pub last_response: Option<SipMessage>,
     final_response_at: Option<Instant>,
+    confirmed_at: Option<Instant>,
     timer_g_interval: Duration,
     last_retransmit: Instant,
 }
@@ -271,6 +292,7 @@ impl ServerTransaction {
             remote_addr,
             last_response: None,
             final_response_at: None,
+            confirmed_at: None,
             timer_g_interval: timers::T1,
             last_retransmit: now,
         }
@@ -319,6 +341,7 @@ impl ServerTransaction {
     pub fn on_ack(&mut self) {
         if self.state == InviteServerState::Completed {
             self.state = InviteServerState::Confirmed;
+            self.confirmed_at = Some(Instant::now());
             debug!(branch = %self.branch, "INVITE server -> Confirmed");
         } else if self.state == InviteServerState::Accepted {
             self.state = InviteServerState::Terminated;
@@ -327,10 +350,16 @@ impl ServerTransaction {
     }
 
     /// Check if Timer H has expired (waiting for ACK).
-    pub fn is_timed_out(&self) -> bool {
+    pub fn timer_h_expired(&self) -> bool {
         matches!(self.state, InviteServerState::Completed | InviteServerState::Accepted)
             && self.final_response_at
                 .is_some_and(|sent_at| sent_at.elapsed() >= timers::TIMER_H)
+    }
+
+    /// Timer I absorbs retransmitted ACKs after a non-2xx final.
+    pub fn timer_i_expired(&self) -> bool {
+        self.state == InviteServerState::Confirmed
+            && self.confirmed_at.is_some_and(|at| at.elapsed() >= timers::TIMER_I_UDP)
     }
 
     pub fn terminate(&mut self) {
@@ -340,6 +369,11 @@ impl ServerTransaction {
     #[cfg(test)]
     pub(crate) fn expire_final_response_timer(&mut self) {
         self.final_response_at = Some(Instant::now() - timers::TIMER_H);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_i(&mut self) {
+        self.confirmed_at = Some(Instant::now() - timers::TIMER_I_UDP);
     }
 
     /// Start the INVITE server transaction timers.
@@ -395,6 +429,7 @@ pub struct NonInviteClientTransaction {
     pub remote_addr: SocketAddr,
     timer_e_interval: Duration,
     started_at: Instant,
+    completed_at: Option<Instant>,
     last_retransmit: Instant,
     pub last_response: Option<SipMessage>,
 }
@@ -409,6 +444,7 @@ impl NonInviteClientTransaction {
             remote_addr,
             timer_e_interval: timers::TIMER_E_INITIAL,
             started_at: now,
+            completed_at: None,
             last_retransmit: now,
             last_response: None,
         }
@@ -421,12 +457,14 @@ impl NonInviteClientTransaction {
         match (self.state, status) {
             (NonInviteClientState::Trying, 100..=199) => {
                 self.state = NonInviteClientState::Proceeding;
+                self.timer_e_interval = timers::T2;
             }
             (
                 NonInviteClientState::Trying | NonInviteClientState::Proceeding,
                 200..=699,
             ) => {
                 self.state = NonInviteClientState::Completed;
+                self.completed_at = Some(Instant::now());
             }
             _ => {}
         }
@@ -445,15 +483,31 @@ impl NonInviteClientTransaction {
         self.last_retransmit = Instant::now();
     }
 
-    pub fn is_timed_out(&self) -> bool {
+    pub fn timer_f_expired(&self) -> bool {
         matches!(
             self.state,
             NonInviteClientState::Trying | NonInviteClientState::Proceeding
         ) && self.started_at.elapsed() >= timers::TIMER_F
     }
 
+    /// Timer K absorbs retransmitted final responses on UDP.
+    pub fn timer_k_expired(&self) -> bool {
+        self.state == NonInviteClientState::Completed
+            && self.completed_at.is_some_and(|at| at.elapsed() >= timers::TIMER_K_UDP)
+    }
+
     pub fn terminate(&mut self) {
         self.state = NonInviteClientState::Terminated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_f(&mut self) {
+        self.started_at = Instant::now() - timers::TIMER_F;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_k(&mut self) {
+        self.completed_at = Some(Instant::now() - timers::TIMER_K_UDP);
     }
 }
 
@@ -465,8 +519,7 @@ pub struct NonInviteServerTransaction {
     pub request: SipMessage,
     pub remote_addr: SocketAddr,
     pub last_response: Option<SipMessage>,
-    #[allow(dead_code)]
-    started_at: Instant,
+    completed_at: Option<Instant>,
 }
 
 impl NonInviteServerTransaction {
@@ -477,7 +530,7 @@ impl NonInviteServerTransaction {
             request,
             remote_addr,
             last_response: None,
-            started_at: Instant::now(),
+            completed_at: None,
         }
     }
 
@@ -489,9 +542,21 @@ impl NonInviteServerTransaction {
     pub fn send_final(&mut self, response: SipMessage) {
         self.last_response = Some(response);
         self.state = NonInviteServerState::Completed;
+        self.completed_at = Some(Instant::now());
+    }
+
+    /// Timer J absorbs retransmitted non-INVITE requests on UDP.
+    pub fn timer_j_expired(&self) -> bool {
+        self.state == NonInviteServerState::Completed
+            && self.completed_at.is_some_and(|at| at.elapsed() >= timers::TIMER_J_UDP)
     }
 
     pub fn terminate(&mut self) {
         self.state = NonInviteServerState::Terminated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_timer_j(&mut self) {
+        self.completed_at = Some(Instant::now() - timers::TIMER_J_UDP);
     }
 }
