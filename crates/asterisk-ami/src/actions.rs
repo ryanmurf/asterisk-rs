@@ -1212,6 +1212,10 @@ fn handle_rtp_stats(
         .with_header("Channel", stats.channel)
         .with_header("Uniqueid", stats.unique_id.unwrap_or_default())
         .with_header("RTPActive", stats.active.to_string())
+        .with_header(
+            "RTPRemoteAddress",
+            stats.rtp.remote_addr.map(|addr| addr.to_string()).unwrap_or_default(),
+        )
         .with_header("RTPPacketsTx", stats.rtp.packets_sent.to_string())
         .with_header("RTPPacketsRx", stats.rtp.packets_received.to_string())
         .with_header("RTPOctetsTx", stats.rtp.octets_sent.to_string())
@@ -1231,6 +1235,22 @@ fn handle_rtp_stats(
         .with_header(
             "RTPDTMFDigitsRx",
             stats.rtp.dtmf_digits_received.to_string(),
+        )
+        .with_header(
+            "RTPDiscardWrongSource",
+            stats.rtp.discarded_wrong_source.to_string(),
+        )
+        .with_header(
+            "RTPDiscardWrongPayloadType",
+            stats.rtp.discarded_wrong_payload_type.to_string(),
+        )
+        .with_header(
+            "RTPDiscardMalformed",
+            stats.rtp.discarded_malformed.to_string(),
+        )
+        .with_header(
+            "RTPDiscardUnstableSSRC",
+            stats.rtp.discarded_unstable_ssrc.to_string(),
         )
 }
 
@@ -2769,6 +2789,27 @@ mod tests {
         assert_eq!(
             active.headers.get("RTPPacketsRx").map(String::as_str),
             Some("4")
+        );
+        let expected_remote = peer.local_addr().unwrap().to_string();
+        assert_eq!(
+            active.headers.get("RTPRemoteAddress").map(String::as_str),
+            Some(expected_remote.as_str())
+        );
+        assert_eq!(
+            active.headers.get("RTPDiscardWrongSource").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            active.headers.get("RTPDiscardWrongPayloadType").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            active.headers.get("RTPDiscardMalformed").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            active.headers.get("RTPDiscardUnstableSSRC").map(String::as_str),
+            Some("0")
         );
 
         driver.hangup(&mut channel).await.unwrap();
