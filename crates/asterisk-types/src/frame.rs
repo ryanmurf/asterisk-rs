@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::control::ControlFrame;
 use crate::frame_type::FrameType;
 
+/// Source RTP clock metadata retained while a voice frame crosses a bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RtpTiming {
+    pub sequence: u16,
+    pub timestamp: u32,
+}
+
 /// A media or signalling frame -- the fundamental unit of data transport in Asterisk.
 ///
 /// This is a Rust enum representation that captures the different frame variants
@@ -19,6 +26,8 @@ pub enum Frame {
         timestamp_ms: u64,
         seqno: i32,
         stream_num: i32,
+        #[serde(default)]
+        rtp_timing: Option<RtpTiming>,
     },
     /// Video frame with codec ID and video payload
     Video {
@@ -113,6 +122,26 @@ impl Frame {
             timestamp_ms: 0,
             seqno: -1,
             stream_num: 0,
+            rtp_timing: None,
+        }
+    }
+
+    /// Create a voice frame that retains its source RTP clock relationship.
+    pub fn voice_with_rtp_timing(
+        codec_id: u32,
+        samples: u32,
+        data: Bytes,
+        sequence: u16,
+        timestamp: u32,
+    ) -> Self {
+        Frame::Voice {
+            codec_id,
+            samples,
+            data,
+            timestamp_ms: 0,
+            seqno: sequence as i32,
+            stream_num: 0,
+            rtp_timing: Some(RtpTiming { sequence, timestamp }),
         }
     }
 

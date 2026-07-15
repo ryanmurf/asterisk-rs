@@ -385,6 +385,7 @@ pub async fn get_mixed_output(
             timestamp_ms: 0,
             seqno: -1,
             stream_num: 0,
+            rtp_timing: None,
         })
     } else {
         None

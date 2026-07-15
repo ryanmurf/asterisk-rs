@@ -69,6 +69,7 @@ pub mod answer;
 pub mod ringing;
 pub mod hangup;
 pub mod dial;
+pub(crate) mod media_pump;
 pub mod playback;
 pub mod echo;
 pub mod record;

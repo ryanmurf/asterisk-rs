@@ -15,6 +15,7 @@
 
 use crate::{DialplanApp, PbxExecResult};
 use asterisk_core::bridge::basic::{AfterBridgeAction, BasicBridge, SideFeatures};
+use asterisk_core::bridge::lifetime::BridgeLifetime;
 use asterisk_core::channel::Channel;
 use asterisk_types::{ChannelState, HangupCause};
 use std::sync::Arc;
@@ -1768,13 +1769,67 @@ impl AppDial {
             caller.name, callee_name
         );
 
+        let lifetime = BridgeLifetime::new();
+        let lifetime_registration = lifetime.register_channels([
+            caller.name.clone(),
+            callee_name.clone(),
+        ]);
+        let caller_technology = caller.name.split('/').next().unwrap_or_default();
+        let caller_driver =
+            asterisk_core::channel::tech_registry::TECH_REGISTRY.find(caller_technology);
+        let callee_driver = asterisk_core::channel::tech_registry::TECH_REGISTRY
+            .find(&leg.destination.technology);
+        let media_pumps = match (caller_driver, callee_driver) {
+            (Some(caller_driver), Some(callee_driver)) => Some(
+                crate::media_pump::start_media_pumps(
+                    caller.name.clone(),
+                    caller_driver,
+                    callee_name.clone(),
+                    callee_driver,
+                    lifetime.clone(),
+                ),
+            ),
+            _ => {
+                warn!(caller = %caller.name, callee = %callee_name,
+                    "Dial bridge has no channel driver for one or both media legs");
+                None
+            }
+        };
+        let bridge_started = Instant::now();
+        let bridge_deadline = [
+            options.duration_stop,
+            options
+                .call_limit
+                .as_ref()
+                .map(|limit| Duration::from_millis(limit.max_ms)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+
         // The bridge loop: wait until either channel hangs up or is redirected.
         // Poll the channel store for state changes.
         eprintln!("[DEBUG] bridge_channels: entering bridge loop for {} <-> {}", caller.name, leg.destination.resource);
         loop {
+            if bridge_deadline.is_some_and(|deadline| bridge_started.elapsed() >= deadline) {
+                caller.softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_TIMEOUT);
+                if let Some(store_callee) =
+                    asterisk_core::channel_store::find_by_name(&callee_name)
+                {
+                    store_callee
+                        .lock()
+                        .softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_TIMEOUT);
+                }
+                lifetime.cancel();
+                debug!(caller = %caller.name, callee = %callee_name,
+                    "Dial bridge reached its absolute media deadline");
+                break;
+            }
+
             // Check if caller hung up
             if caller.state == ChannelState::Down || caller.check_hangup() {
                 eprintln!("[DEBUG] bridge: caller hung up (state={:?}, hangup={})", caller.state, caller.check_hangup());
+                lifetime.cancel();
                 break;
             }
 
@@ -1787,15 +1842,18 @@ impl AppDial {
                     let ch = store_chan.lock();
                     if ch.state == ChannelState::Down || ch.check_hangup() {
                         eprintln!("[DEBUG] bridge: callee hung up (state={:?}, hangup={})", ch.state, ch.check_hangup());
+                        lifetime.cancel();
                         break;
                     }
                     // Check for async goto (redirect)
                     if ch.softhangup_flags & asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO != 0 {
                         debug!("Dial: bridge ended - callee redirected (async goto)");
+                        lifetime.cancel();
                         break;
                     }
                 } else {
                     eprintln!("[DEBUG] bridge: callee channel '{}' not found in store", callee_name);
+                    lifetime.cancel();
                     break;
                 }
             }
@@ -1805,16 +1863,27 @@ impl AppDial {
                 let ch = store_caller.lock();
                 if ch.check_hangup() || ch.state == ChannelState::Down {
                     debug!("Dial: bridge ended - caller hung up (store)");
+                    lifetime.cancel();
                     break;
                 }
                 if ch.softhangup_flags & asterisk_core::softhangup::AST_SOFTHANGUP_ASYNCGOTO != 0 {
                     debug!("Dial: bridge ended - caller redirected (async goto)");
+                    lifetime.cancel();
                     break;
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::select! {
+                _ = lifetime.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
         }
+
+        lifetime.cancel();
+        if let Some(media_pumps) = media_pumps {
+            media_pumps.wait().await;
+        }
+        drop(lifetime_registration);
 
         // Check if the callee was redirected (ASYNCGOTO) - if so, spawn PBX execution
         // for the callee at its new dialplan location.

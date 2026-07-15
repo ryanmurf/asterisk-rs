@@ -388,6 +388,7 @@ impl Channel {
             cause = format_args!("{:#06x}", cause),
             "softhangup requested"
         );
+        crate::bridge::lifetime::cancel_for_channel(&self.name);
         self.softhangup_flags |= cause;
         // Queue a null frame to wake up the reader (matches C behavior)
         self.frame_queue.push_back(Frame::Null);
