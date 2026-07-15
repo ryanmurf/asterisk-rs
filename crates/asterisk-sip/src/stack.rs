@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -24,6 +24,13 @@ use crate::transport::{SipTransport, TransportError, UdpTransport};
 
 fn cseq_number(msg: &SipMessage) -> Option<&str> {
     msg.get_header(header_names::CSEQ)?.split_whitespace().next()
+}
+
+fn request_identity_matches(original: &SipMessage, retransmission: &SipMessage) -> bool {
+    original.call_id() == retransmission.call_id()
+        && cseq_number(original) == cseq_number(retransmission)
+        && original.from_header().and_then(extract_tag)
+            == retransmission.from_header().and_then(extract_tag)
 }
 
 /// Events emitted by the SIP stack for the application layer.
@@ -78,11 +85,21 @@ pub enum SipEvent {
 }
 
 /// Manages active client (INVITE) transactions keyed by branch.
+struct CachedInviteFinal {
+    request: SipMessage,
+    remote_addr: SocketAddr,
+    response: SipMessage,
+    expires_at: Instant,
+}
+
 struct TransactionLayer {
     invite_client_txns: HashMap<String, ClientTransaction>,
     invite_server_txns: HashMap<String, ServerTransaction>,
     non_invite_client_txns: HashMap<String, NonInviteClientTransaction>,
     non_invite_server_txns: HashMap<String, NonInviteServerTransaction>,
+    /// TU response cache retained after the server transaction is reaped, so
+    /// a late UDP retransmission cannot create a second call.
+    invite_final_cache: HashMap<String, CachedInviteFinal>,
 }
 
 impl TransactionLayer {
@@ -92,6 +109,7 @@ impl TransactionLayer {
             invite_server_txns: HashMap::new(),
             non_invite_client_txns: HashMap::new(),
             non_invite_server_txns: HashMap::new(),
+            invite_final_cache: HashMap::new(),
         }
     }
 
@@ -138,17 +156,37 @@ impl TransactionLayer {
     /// branch alone silently swallowed CANCELs — a CANCEL reuses the
     /// cancelled INVITE's branch (§9.1) and was absorbed here as an "INVITE
     /// retransmission" with nothing to replay (issue #55).
-    fn matched_retransmission(&self, request: &SipMessage) -> Option<Option<SipMessage>> {
+    fn matched_retransmission(
+        &self,
+        request: &SipMessage,
+        src: SocketAddr,
+    ) -> Option<Option<SipMessage>> {
         let branch = Self::extract_branch(request)?;
         let method = request.method()?;
         if let Some(txn) = self.invite_server_txns.get(&branch) {
-            if txn.request.method() == Some(method) {
+            if txn.request.method() == Some(method)
+                && request_identity_matches(&txn.request, request)
+                && txn.remote_addr == src
+            {
                 return Some(txn.last_response.clone());
             }
         }
         if let Some(txn) = self.non_invite_server_txns.get(&branch) {
-            if txn.request.method() == Some(method) {
+            if txn.request.method() == Some(method)
+                && request_identity_matches(&txn.request, request)
+                && txn.remote_addr == src
+            {
                 return Some(txn.last_response.clone());
+            }
+        }
+        if method == SipMethod::Invite {
+            if let Some(cached) = self.invite_final_cache.get(&branch) {
+                if cached.expires_at > Instant::now()
+                    && cached.remote_addr == src
+                    && request_identity_matches(&cached.request, request)
+                {
+                    return Some(Some(cached.response.clone()));
+                }
             }
         }
         None
@@ -407,7 +445,15 @@ impl SipStack {
         match txn_layer.invite_server_txns.get_mut(&branch) {
             Some(txn) => {
                 if txn.state == crate::transaction::InviteServerState::Proceeding {
+                    let cached_request = txn.request.clone();
+                    let remote_addr = txn.remote_addr;
                     txn.send_final(response.clone());
+                    txn_layer.invite_final_cache.insert(branch, CachedInviteFinal {
+                        request: cached_request,
+                        remote_addr,
+                        response: response.clone(),
+                        expires_at: Instant::now() + crate::transaction::timers::TIMER_H,
+                    });
                     true
                 } else {
                     debug!(
@@ -531,7 +577,7 @@ impl SipStack {
         // replay (if any) without holding the lock across await.
         let retransmit_response = {
             let txn_layer = self.transaction_layer.read();
-            txn_layer.matched_retransmission(&request)
+            txn_layer.matched_retransmission(&request, src)
         };
 
         if let Some(maybe_resp) = retransmit_response {
@@ -855,6 +901,8 @@ impl SipStack {
         txn_layer.non_invite_server_txns.retain(|_, t| {
             t.state != crate::transaction::NonInviteServerState::Terminated
         });
+        let now = Instant::now();
+        txn_layer.invite_final_cache.retain(|_, cached| cached.expires_at > now);
     }
 }
 
@@ -1489,6 +1537,44 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(SipEvent::TransactionTimeout { .. })));
         assert!(matches!(rx.recv().await,
             Some(SipEvent::InviteAckTimeout { ref call_id }) if call_id == "ack-timeout-call"));
+    }
+
+    /// Even after the successful transaction is reaped on ACK, repeated
+    /// copies of the original INVITE replay the cached final and never mint a
+    /// second IncomingInvite/application call.
+    #[tokio::test]
+    async fn test_late_invite_retransmissions_replay_final_without_second_call() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let branch = "z9hG4bKlate-final";
+        let invite = build_invite_request("one-call-only", branch);
+
+        stack.handle_request(invite.clone(), peer_addr).await;
+        assert!(matches!(rx.recv().await, Some(SipEvent::IncomingInvite { .. })));
+        let mut ok = invite.create_response(200, "OK").unwrap();
+        ok.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::TO))
+            .unwrap().value.push_str(";tag=one-server-dialog");
+        assert!(stack.record_invite_final(&invite, &ok));
+        stack.send_response(ok.clone(), peer_addr).await.unwrap();
+
+        let ack = build_2xx_ack(
+            "one-call-only", "z9hG4bKone-call-ack", "one-server-dialog");
+        stack.handle_request(ack, peer_addr).await;
+        assert!(matches!(rx.recv().await, Some(SipEvent::IncomingAck { .. })));
+        stack.handle_timers().await;
+        assert!(!stack.transaction_layer.read().invite_server_txns.contains_key(branch));
+
+        let mut observed = vec![recv_peer(&peer).await.to_string()];
+        for _ in 0..2 {
+            stack.handle_request(invite.clone(), peer_addr).await;
+            observed.push(recv_peer(&peer).await.to_string());
+        }
+        assert_eq!(observed, vec![ok.to_string(); 3]);
+        assert!(rx.try_recv().is_err(), "exactly one call may reach the TU");
     }
 
     /// A CANCEL matching no INVITE transaction gets 481 Call/Transaction
