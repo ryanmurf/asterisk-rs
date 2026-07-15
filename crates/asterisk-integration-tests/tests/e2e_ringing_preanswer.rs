@@ -121,6 +121,19 @@ fn ack(call_id: &str, branch: &str, exten: &str, target: SocketAddr) -> String {
     )
 }
 
+fn ack_2xx(call_id: &str, exten: &str, target: SocketAddr, response: &SipMessage) -> String {
+    let to = response.get_header(header_names::TO).expect("2xx To header");
+    format!(
+        "ACK sip:{exten}@{target} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK571-ack\r\n\
+         From: \"Caller\" <sip:caller@127.0.0.1>;tag=c57\r\n\
+         To: {to}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: 1 ACK\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+}
+
 #[tokio::test]
 async fn ringing_indicates_180_and_preanswer_abort_sends_final_response() {
     register_all_apps();
@@ -193,7 +206,9 @@ async fn ringing_indicates_180_and_preanswer_abort_sends_final_response() {
     // Before the fix: "WARN No such application app=Ringing" and no 180 ever.
     expect_status(&caller, 180, Duration::from_secs(3), "scenario A").await;
     println!("[E2E] Ringing() -> 180 Ringing received");
-    expect_status(&caller, 200, Duration::from_secs(5), "scenario A").await;
+    let ok = expect_status(&caller, 200, Duration::from_secs(5), "scenario A").await;
+    let a = ack_2xx("ring-57-1", "200", sip_local, &ok);
+    caller.send_to(a.as_bytes(), sip_local).await.unwrap();
     println!("[E2E] Answer() -> 200 OK received after 180");
 
     // ---- B. unknown-app abort -> 480 --------------------------------------

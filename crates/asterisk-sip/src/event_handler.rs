@@ -1132,6 +1132,22 @@ impl SipEventHandler {
         crate::notify_sip_hangup(&call_id);
     }
 
+    /// Tear down a UAS call whose successful INVITE response was never ACKed.
+    /// The per-call cleanup task observes the removed state and releases the
+    /// store, driver/RTP, and NOTIFY registrations.
+    pub fn handle_invite_ack_timeout(&self, call_id: &str) {
+        let channel_name = self.callid_map.read().get(call_id).cloned();
+        if let Some(name) = channel_name {
+            if let Some(channel) = store::find_by_name(&name) {
+                channel.lock().softhangup(softhangup::AST_SOFTHANGUP_DEV);
+            }
+            info!(call_id, channel = %name, "INVITE 2xx ACK timeout tore down call");
+        }
+        self.callid_map.write().remove(call_id);
+        self.call_states.write().remove(call_id);
+        crate::notify_sip_hangup(call_id);
+    }
+
     /// Handle an incoming SIP REGISTER request.
     ///
     /// Routes the request to the registrar (contact binding + expiry) and sends
