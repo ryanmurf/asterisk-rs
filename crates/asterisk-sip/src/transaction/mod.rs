@@ -84,6 +84,8 @@ pub enum InviteServerState {
     Proceeding,
     /// Final response sent (non-2xx), waiting for ACK.
     Completed,
+    /// Successful final sent; the TU retransmits it until dialog ACK.
+    Accepted,
     /// ACK received for non-2xx response.
     Confirmed,
     /// Transaction done.
@@ -254,7 +256,7 @@ pub struct ServerTransaction {
     pub request: SipMessage,
     pub remote_addr: SocketAddr,
     pub last_response: Option<SipMessage>,
-    started_at: Instant,
+    final_response_at: Option<Instant>,
     timer_g_interval: Duration,
     last_retransmit: Instant,
 }
@@ -268,7 +270,7 @@ impl ServerTransaction {
             request,
             remote_addr,
             last_response: None,
-            started_at: now,
+            final_response_at: None,
             timer_g_interval: timers::T1,
             last_retransmit: now,
         }
@@ -284,12 +286,16 @@ impl ServerTransaction {
     pub fn send_final(&mut self, response: SipMessage) {
         let status = response.status_code().unwrap_or(0);
         self.last_response = Some(response);
-        self.last_retransmit = Instant::now();
+        let now = Instant::now();
+        self.last_retransmit = now;
+        self.final_response_at = Some(now);
 
         if (200..300).contains(&status) {
-            // For 2xx, the TU handles retransmission, not the transaction layer.
-            self.state = InviteServerState::Terminated;
-            debug!(branch = %self.branch, status, "INVITE server -> Terminated (2xx)");
+            // RFC 3261 assigns 2xx retransmission to the TU. Keep that TU
+            // lifecycle beside the cached transaction response so it cannot
+            // disappear before the dialog ACK arrives.
+            self.state = InviteServerState::Accepted;
+            debug!(branch = %self.branch, status, "INVITE server -> Accepted (2xx)");
         } else if (300..700).contains(&status) {
             self.state = InviteServerState::Completed;
             debug!(branch = %self.branch, status, "INVITE server -> Completed");
@@ -299,7 +305,7 @@ impl ServerTransaction {
     /// Timer G: while a non-2xx final response awaits its ACK (Completed),
     /// it must be retransmitted at T1, doubling up to T2 (RFC 3261 §17.2.1).
     pub fn needs_retransmit(&self) -> bool {
-        self.state == InviteServerState::Completed
+        matches!(self.state, InviteServerState::Completed | InviteServerState::Accepted)
             && self.last_retransmit.elapsed() >= self.timer_g_interval
     }
 
@@ -314,17 +320,26 @@ impl ServerTransaction {
         if self.state == InviteServerState::Completed {
             self.state = InviteServerState::Confirmed;
             debug!(branch = %self.branch, "INVITE server -> Confirmed");
+        } else if self.state == InviteServerState::Accepted {
+            self.state = InviteServerState::Terminated;
+            debug!(branch = %self.branch, "INVITE server 2xx ACK received");
         }
     }
 
     /// Check if Timer H has expired (waiting for ACK).
     pub fn is_timed_out(&self) -> bool {
-        self.state == InviteServerState::Completed
-            && self.started_at.elapsed() >= timers::TIMER_H
+        matches!(self.state, InviteServerState::Completed | InviteServerState::Accepted)
+            && self.final_response_at
+                .is_some_and(|sent_at| sent_at.elapsed() >= timers::TIMER_H)
     }
 
     pub fn terminate(&mut self) {
         self.state = InviteServerState::Terminated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_final_response_timer(&mut self) {
+        self.final_response_at = Some(Instant::now() - timers::TIMER_H);
     }
 
     /// Start the INVITE server transaction timers.

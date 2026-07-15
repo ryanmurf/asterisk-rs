@@ -22,6 +22,10 @@ use crate::transaction::{
 };
 use crate::transport::{SipTransport, TransportError, UdpTransport};
 
+fn cseq_number(msg: &SipMessage) -> Option<&str> {
+    msg.get_header(header_names::CSEQ)?.split_whitespace().next()
+}
+
 /// Events emitted by the SIP stack for the application layer.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -51,6 +55,16 @@ pub enum SipEvent {
         call_id: String,
         request: SipMessage,
         remote_addr: SocketAddr,
+    },
+    /// A 2xx ACK matched as a new-branch dialog request and delivered to TU.
+    IncomingAck {
+        call_id: String,
+        request: SipMessage,
+        remote_addr: SocketAddr,
+    },
+    /// A successful INVITE response exhausted its ACK-wait lifetime.
+    InviteAckTimeout {
+        call_id: String,
     },
     /// A non-INVITE request was received (OPTIONS, REGISTER, etc.).
     IncomingRequest {
@@ -138,6 +152,30 @@ impl TransactionLayer {
             }
         }
         None
+    }
+
+    /// A 2xx ACK has a new Via branch. Match it by the dialog identity,
+    /// source tuple, and INVITE CSeq instead (RFC 3261 Section 13.2.2.4).
+    fn accepted_ack_branch(&self, ack: &SipMessage, src: SocketAddr) -> Option<String> {
+        let call_id = ack.call_id()?;
+        let from_tag = ack.from_header().and_then(extract_tag)?;
+        let to_tag = ack.to_header().and_then(extract_tag)?;
+        let ack_cseq = cseq_number(ack)?;
+
+        self.invite_server_txns.iter().find_map(|(branch, txn)| {
+            if txn.state != crate::transaction::InviteServerState::Accepted
+                || txn.remote_addr != src
+                || txn.request.call_id() != Some(call_id)
+                || txn.request.from_header().and_then(extract_tag).as_deref()
+                    != Some(from_tag.as_str())
+                || cseq_number(&txn.request) != Some(ack_cseq)
+            {
+                return None;
+            }
+            let response_to_tag = txn.last_response.as_ref()?
+                .to_header().and_then(extract_tag)?;
+            (response_to_tag == to_tag).then(|| branch.clone())
+        })
     }
 
     /// Collect branches that need retransmission for INVITE client transactions.
@@ -526,12 +564,32 @@ impl SipStack {
                 }
             }
             SipMethod::Ack => {
-                // Route ACK to the matching INVITE server transaction
-                if let Some(branch) = TransactionLayer::extract_branch(&request) {
+                // Non-2xx ACK is transaction-scoped and reuses the branch.
+                // A 2xx ACK is a new-branch dialog request and reaches TU.
+                let accepted_branch = self.transaction_layer.read()
+                    .accepted_ack_branch(&request, src);
+                if let Some(branch) = accepted_branch {
+                    if let Some(txn) = self.transaction_layer.write()
+                        .invite_server_txns.get_mut(&branch)
+                    {
+                        txn.on_ack();
+                    }
+                    let call_id = request.call_id().unwrap_or_default().to_string();
+                    self.emit_event(SipEvent::IncomingAck {
+                        call_id,
+                        request,
+                        remote_addr: src,
+                    }).await;
+                } else if let Some(branch) = TransactionLayer::extract_branch(&request) {
                     let mut txn_layer = self.transaction_layer.write();
                     if let Some(txn) = txn_layer.invite_server_txns.get_mut(&branch) {
-                        txn.on_ack();
-                        debug!(branch = %branch, "ACK received for INVITE server transaction");
+                        if txn.remote_addr == src
+                            && txn.request.call_id() == request.call_id()
+                            && cseq_number(&txn.request) == cseq_number(&request)
+                        {
+                            txn.on_ack();
+                            debug!(branch = %branch, "ACK received for INVITE server transaction");
+                        }
                     }
                 }
             }
@@ -594,9 +652,6 @@ impl SipStack {
         // beyond the shared branch it must carry the same Call-ID, From tag,
         // and CSeq number. Guard against a colliding/forged branch
         // terminating an unrelated INVITE.
-        fn cseq_number(msg: &SipMessage) -> Option<&str> {
-            msg.get_header(header_names::CSEQ)?.split_whitespace().next()
-        }
         let identity_matches = |invite: &SipMessage, cancel: &SipMessage| {
             invite.call_id() == cancel.call_id()
                 && cseq_number(invite) == cseq_number(cancel)
@@ -759,6 +814,10 @@ impl SipStack {
 
         for branch in timed_out {
             warn!(branch = %branch, "Transaction timed out");
+            let ack_timeout_call_id = self.transaction_layer.read()
+                .invite_server_txns.get(&branch)
+                .and_then(|txn| (txn.state == crate::transaction::InviteServerState::Accepted)
+                    .then(|| txn.request.call_id().map(str::to_string)).flatten());
             // Terminate inside a scope so the lock is not held across the
             // (potentially blocking) event emission below.
             {
@@ -777,6 +836,9 @@ impl SipStack {
                 branch,
             })
             .await;
+            if let Some(call_id) = ack_timeout_call_id {
+                self.emit_event(SipEvent::InviteAckTimeout { call_id }).await;
+            }
         }
 
         // Clean up terminated transactions
@@ -1348,6 +1410,85 @@ mod tests {
             recv_peer_opt(&peer, 300).await.is_none(),
             "no further retransmissions after the ACK confirms the transaction"
         );
+    }
+
+    fn build_2xx_ack(call_id: &str, branch: &str, to_tag: &str) -> SipMessage {
+        let raw = format!(
+            "ACK sip:100@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1;branch={branch}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=c55\r\n\
+             To: <sip:100@127.0.0.1>;tag={to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 ACK\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    /// The TU retains and retransmits a successful final until its dialog ACK
+    /// arrives. The ACK uses a different branch and reaches the application.
+    #[tokio::test]
+    async fn test_2xx_retransmits_until_new_branch_ack_reaches_tu() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let invite = build_invite_request("accepted-call", "z9hG4bKaccepted");
+        stack.handle_request(invite.clone(), peer_addr).await;
+        let _ = rx.recv().await;
+        let mut ok = invite.create_response(200, "OK").unwrap();
+        ok.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::TO))
+            .unwrap().value.push_str(";tag=server-tag");
+        assert!(stack.record_invite_final(&invite, &ok));
+        stack.send_response(ok.clone(), peer_addr).await.unwrap();
+        assert_eq!(recv_peer(&peer).await.to_string(), ok.to_string());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        stack.handle_timers().await;
+        assert_eq!(recv_peer(&peer).await.to_string(), ok.to_string(),
+            "the cached 2xx must be byte-equivalent");
+
+        let ack = build_2xx_ack("accepted-call", "z9hG4bKnew-ack-branch", "server-tag");
+        stack.handle_request(ack.clone(), peer_addr).await;
+        match rx.recv().await.expect("2xx ACK must reach TU") {
+            SipEvent::IncomingAck { call_id, request, remote_addr } => {
+                assert_eq!(call_id, "accepted-call");
+                assert_eq!(request.to_string(), ack.to_string());
+                assert_eq!(remote_addr, peer_addr);
+            }
+            other => panic!("Expected IncomingAck, got {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        stack.handle_timers().await;
+        assert!(recv_peer_opt(&peer, 300).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_2xx_ack_timeout_reaches_tu() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let branch = "z9hG4bKack-timeout";
+        let invite = build_invite_request("ack-timeout-call", branch);
+        stack.handle_request(invite.clone(), peer_addr).await;
+        let _ = rx.recv().await;
+        let mut ok = invite.create_response(200, "OK").unwrap();
+        ok.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::TO))
+            .unwrap().value.push_str(";tag=server-tag");
+        assert!(stack.record_invite_final(&invite, &ok));
+        stack.transaction_layer.write().invite_server_txns
+            .get_mut(branch).unwrap().expire_final_response_timer();
+
+        stack.handle_timers().await;
+        assert!(matches!(rx.recv().await, Some(SipEvent::TransactionTimeout { .. })));
+        assert!(matches!(rx.recv().await,
+            Some(SipEvent::InviteAckTimeout { ref call_id }) if call_id == "ack-timeout-call"));
     }
 
     /// A CANCEL matching no INVITE transaction gets 481 Call/Transaction

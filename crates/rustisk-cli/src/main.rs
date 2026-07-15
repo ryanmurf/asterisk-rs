@@ -2027,6 +2027,16 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                     // dialplan execution (issue #55).
                                     event_handler.handle_cancel(&request, remote_addr).await;
                                 }
+                                asterisk_sip::stack::SipEvent::IncomingAck {
+                                    call_id,
+                                    request: _,
+                                    remote_addr: _,
+                                } => {
+                                    debug!("Received dialog ACK for {}", call_id);
+                                }
+                                asterisk_sip::stack::SipEvent::InviteAckTimeout { call_id } => {
+                                    event_handler.handle_invite_ack_timeout(&call_id);
+                                }
                                 asterisk_sip::stack::SipEvent::IncomingRequest {
                                     request,
                                     remote_addr,
