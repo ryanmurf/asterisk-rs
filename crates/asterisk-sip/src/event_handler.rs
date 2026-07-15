@@ -45,6 +45,10 @@ pub struct SipResourceCounts {
     pub call_id_mappings: usize,
     pub call_states: usize,
     pub notify_channels: usize,
+    pub invite_client_transactions: usize,
+    pub invite_server_transactions: usize,
+    pub non_invite_client_transactions: usize,
+    pub non_invite_server_transactions: usize,
 }
 
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
@@ -132,6 +136,19 @@ impl SipEventHandler {
         match self.stack.get() {
             Some(stack) => stack.record_invite_final(request, response),
             None => true,
+        }
+    }
+
+    /// Send a TU response through the stack when available so non-INVITE
+    /// server transactions cache it, enter Completed, and reap on Timer J.
+    async fn send_server_response(
+        &self,
+        response: &SipMessage,
+        remote_addr: SocketAddr,
+    ) -> Result<(), crate::transport::TransportError> {
+        match self.stack.get() {
+            Some(stack) => stack.send_response(response.clone(), remote_addr).await,
+            None => self.transport.send(response, remote_addr).await,
         }
     }
 
@@ -1021,7 +1038,7 @@ impl SipEventHandler {
             // Send 200 OK to the BYE
             match request.create_response(200, "OK") {
                 Ok(ok_resp) => {
-                    if let Err(e) = self.transport.send(&ok_resp, remote_addr).await {
+                    if let Err(e) = self.send_server_response(&ok_resp, remote_addr).await {
                         warn!(call_id = %call_id, "Failed to send 200 OK to BYE: {}", e);
                     } else {
                         info!(call_id = %call_id, "Sent 200 OK to BYE");
@@ -1166,7 +1183,7 @@ impl SipEventHandler {
                 "Rejected REGISTER from source outside configured identify CIDRs"
             );
             if let Ok(resp) = request.create_response(403, "Forbidden") {
-                let _ = self.transport.send(&resp, remote_addr).await;
+                let _ = self.send_server_response(&resp, remote_addr).await;
             }
             return;
         }
@@ -1185,7 +1202,7 @@ impl SipEventHandler {
             if !creds.is_empty() {
                 let authenticator = crate::authenticator::InboundAuthenticator::new();
                 if let Err(challenge) = authenticator.verify(request, &creds, false) {
-                    if let Err(e) = self.transport.send(&challenge, remote_addr).await {
+                    if let Err(e) = self.send_server_response(&challenge, remote_addr).await {
                         warn!(call_id = %call_id, "Failed to send REGISTER 401 challenge: {}", e);
                     } else {
                         debug!(call_id = %call_id, "Sent 401 challenge for REGISTER");
@@ -1222,7 +1239,7 @@ impl SipEventHandler {
                         "REGISTER denied: authenticated user may not bind this AoR"
                     );
                     if let Ok(resp) = request.create_response(403, "Forbidden") {
-                        let _ = self.transport.send(&resp, remote_addr).await;
+                        let _ = self.send_server_response(&resp, remote_addr).await;
                     }
                     return;
                 }
@@ -1232,7 +1249,7 @@ impl SipEventHandler {
         // Authenticated (or no auth required): perform the registration.
         let response = self.registrar.handle_register(request);
         let status = response.status_code().unwrap_or(0);
-        if let Err(e) = self.transport.send(&response, remote_addr).await {
+        if let Err(e) = self.send_server_response(&response, remote_addr).await {
             warn!(call_id = %call_id, "Failed to send REGISTER response: {}", e);
         } else {
             info!(call_id = %call_id, status, "Handled REGISTER");
@@ -1602,6 +1619,9 @@ impl SipEventHandler {
 
     /// Snapshot the resource owners that must return to baseline after a call.
     pub fn resource_counts(&self) -> SipResourceCounts {
+        let transaction_counts = self.stack.get()
+            .map(|stack| stack.transaction_counts())
+            .unwrap_or_default();
         SipResourceCounts {
             driver_channels: self.channel_driver.get()
                 .map(|driver| driver.active_channel_count())
@@ -1609,6 +1629,10 @@ impl SipEventHandler {
             call_id_mappings: self.callid_map.read().len(),
             call_states: self.call_states.read().len(),
             notify_channels: crate::notify_service::global_notify_service().active_channel_count(),
+            invite_client_transactions: transaction_counts.invite_client,
+            invite_server_transactions: transaction_counts.invite_server,
+            non_invite_client_transactions: transaction_counts.non_invite_client,
+            non_invite_server_transactions: transaction_counts.non_invite_server,
         }
     }
 }

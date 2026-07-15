@@ -48,6 +48,9 @@ The M1 outbound checks are deliberately asymmetric:
 - AMI `CoreStatus` snapshots the channel store, driver map, Call-ID map,
   call-state map, and NOTIFY channel map. Every case must return all five to
   the exact pre-test baseline within two seconds.
+- The same action exposes the INVITE client/server and non-INVITE
+  client/server transaction-map sizes. Every case must return all four to the
+  exact pre-test baseline after any RFC 3261 UDP absorption timer expires.
 
 [RFC 3551]: https://www.rfc-editor.org/info/rfc3551/
 [RFC 4733]: https://www.rfc-editor.org/info/rfc4733/

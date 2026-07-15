@@ -21,6 +21,7 @@ FS_HOST_IP="10.253.$NETWORK_THIRD_OCTET.3"
 AMI_HOST="$FS_HOST_IP"
 RUSTISK_PID=""
 BASELINE_RESOURCES=""
+BASELINE_TRANSACTIONS=""
 
 cleanup() {
     if docker inspect "$RUSTISK_CONTAINER" >/dev/null 2>&1; then
@@ -125,6 +126,40 @@ resource_snapshot() {
     (IFS=/; printf '%s\n' "${values[*]}")
 }
 
+transaction_snapshot() {
+    local response
+    local fields=(SIPInviteClientTransactions SIPInviteServerTransactions SIPNonInviteClientTransactions SIPNonInviteServerTransactions)
+    local values=()
+    response="$(ami_action $'Action: CoreStatus\r\n\r\n')"
+    for field in "${fields[@]}"; do
+        local value
+        value="$(stat_value "$field" "$response")"
+        [[ "$value" =~ ^[0-9]+$ ]] || fail "$field missing from CoreStatus: $response"
+        values+=("$value")
+    done
+    (IFS=/; printf '%s\n' "${values[*]}")
+}
+
+wait_for_transaction_baseline() {
+    local label="$1"
+    local started_ms
+    local snapshot=""
+    local elapsed_ms
+    started_ms="$(now_ms)"
+    while true; do
+        snapshot="$(transaction_snapshot)"
+        elapsed_ms="$(($(now_ms) - started_ms))"
+        if [[ "$snapshot" == "$BASELINE_TRANSACTIONS" ]]; then
+            printf '%s: TransactionBaseline=%s RestoredInMs=%d\n' \
+                "$label" "$snapshot" "$elapsed_ms"
+            return
+        fi
+        (( elapsed_ms < 40000 )) \
+            || fail "$label transactions did not return to exact baseline: baseline=$BASELINE_TRANSACTIONS actual=$snapshot"
+        sleep 0.05
+    done
+}
+
 wait_for_resource_baseline() {
     local label="$1"
     local hangup_observed_ms="$2"
@@ -138,6 +173,7 @@ wait_for_resource_baseline() {
                 || fail "$label resources reached baseline after the 2s deadline: ${elapsed_ms}ms"
             printf '%s: ResourceBaseline=%s RestoredFromReceiverHangupInMs=%d\n' \
                 "$label" "$snapshot" "$elapsed_ms"
+            wait_for_transaction_baseline "$label"
             return
         fi
         (( elapsed_ms < 2000 )) \
@@ -158,6 +194,7 @@ wait_for_resource_baseline_eventually() {
         if [[ "$snapshot" == "$BASELINE_RESOURCES" ]]; then
             printf '%s: ResourceBaseline=%s RestoredEventuallyInMs=%d\n' \
                 "$label" "$snapshot" "$elapsed_ms"
+            wait_for_transaction_baseline "$label"
             return
         fi
         (( elapsed_ms < 40000 )) \
@@ -413,7 +450,9 @@ docker run --rm --name "$RUSTISK_CONTAINER" \
 RUSTISK_PID=$!
 wait_for_ami
 BASELINE_RESOURCES="$(resource_snapshot)"
+BASELINE_TRANSACTIONS="$(transaction_snapshot)"
 printf 'Exact resource baseline: %s (store/driver/call-id/state/notify)\n' "$BASELINE_RESOURCES"
+printf 'Exact transaction baseline: %s (invite-client/invite-server/non-invite-client/non-invite-server)\n' "$BASELINE_TRANSACTIONS"
 
 run_case 1 123456 GRANTED
 run_case 2 123450 REJECTED

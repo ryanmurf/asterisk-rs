@@ -426,6 +426,34 @@ fn handle_core_status(
                 .unwrap_or(0)
                 .to_string(),
         )
+        .with_header(
+            "SIPInviteClientTransactions",
+            sip_counts
+                .map(|counts| counts.invite_client_transactions)
+                .unwrap_or(0)
+                .to_string(),
+        )
+        .with_header(
+            "SIPInviteServerTransactions",
+            sip_counts
+                .map(|counts| counts.invite_server_transactions)
+                .unwrap_or(0)
+                .to_string(),
+        )
+        .with_header(
+            "SIPNonInviteClientTransactions",
+            sip_counts
+                .map(|counts| counts.non_invite_client_transactions)
+                .unwrap_or(0)
+                .to_string(),
+        )
+        .with_header(
+            "SIPNonInviteServerTransactions",
+            sip_counts
+                .map(|counts| counts.non_invite_server_transactions)
+                .unwrap_or(0)
+                .to_string(),
+        )
         .with_header("CoreStartupSecs", uptime_secs.to_string())
 }
 
@@ -2538,6 +2566,10 @@ mod tests {
             "SIPCallIdMappings",
             "SIPCallStates",
             "SIPNotifyChannels",
+            "SIPInviteClientTransactions",
+            "SIPInviteServerTransactions",
+            "SIPNonInviteClientTransactions",
+            "SIPNonInviteServerTransactions",
         ] {
             assert!(
                 resp.headers.get(field).is_some_and(|value| value.parse::<usize>().is_ok()),
