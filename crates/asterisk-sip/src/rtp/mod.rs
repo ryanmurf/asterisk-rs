@@ -28,7 +28,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
-use asterisk_types::{AsteriskError, AsteriskResult, Frame};
+use asterisk_types::{AsteriskError, AsteriskResult, Frame, RtpTiming};
 
 /// Standard RTP header size.
 const RTP_HEADER_SIZE: usize = 12;
@@ -370,6 +370,8 @@ pub struct RtpSession {
     /// Last emitted RFC 4733 end event. Senders repeat end packets for
     /// reliability; only one logical digit may reach dialplan applications.
     last_dtmf_end: Mutex<Option<(u32, u32, u8)>>,
+    /// Mapping from source RTP clock values to this session's outgoing clock.
+    outbound_timing: Mutex<Option<RtpTimingRebase>>,
     /// Samples per packet (for timestamp advancement).
     pub samples_per_packet: u32,
     /// Statistics.
@@ -421,6 +423,12 @@ pub struct RtpStatsSnapshot {
     pub discarded_unstable_ssrc: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RtpTimingRebase {
+    source: RtpTiming,
+    destination: RtpTiming,
+}
+
 impl RtpStats {
     /// Read all counters without blocking the media path.
     pub fn snapshot(&self) -> RtpStatsSnapshot {
@@ -462,6 +470,7 @@ impl RtpSession {
             payload_type: AtomicU8::new(0),
             dtmf_payload_type: AtomicU8::new(NO_DTMF_PAYLOAD_TYPE),
             last_dtmf_end: Mutex::new(None),
+            outbound_timing: Mutex::new(None),
             samples_per_packet: 160,
             stats: Arc::new(RtpStats::default()),
         }
@@ -521,8 +530,10 @@ impl RtpSession {
 
     /// Send an audio frame as RTP.
     pub async fn send_frame(&self, frame: &Frame) -> AsteriskResult<()> {
-        let data = match frame {
-            Frame::Voice { data, .. } => data,
+        let (data, samples, source_timing) = match frame {
+            Frame::Voice { data, samples, rtp_timing, .. } => {
+                (data, *samples, *rtp_timing)
+            }
             _ => return Ok(()),
         };
 
@@ -530,10 +541,34 @@ impl RtpSession {
             .remote_addr()
             .ok_or_else(|| AsteriskError::InvalidArgument("No remote address".into()))?;
 
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let ts = self
-            .timestamp
-            .fetch_add(self.samples_per_packet, Ordering::Relaxed);
+        let (seq, ts) = if let Some(source) = source_timing {
+            let mut timing = self.outbound_timing.lock();
+            let rebase = timing.get_or_insert_with(|| RtpTimingRebase {
+                source,
+                destination: RtpTiming {
+                    sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                    timestamp: self.timestamp.fetch_add(samples, Ordering::Relaxed),
+                },
+            });
+            let sequence = rebase
+                .destination
+                .sequence
+                .wrapping_add(source.sequence.wrapping_sub(rebase.source.sequence));
+            let timestamp = rebase
+                .destination
+                .timestamp
+                .wrapping_add(source.timestamp.wrapping_sub(rebase.source.timestamp));
+            self.sequence.store(sequence.wrapping_add(1), Ordering::Relaxed);
+            self.timestamp.store(timestamp.wrapping_add(samples), Ordering::Relaxed);
+            (sequence, timestamp)
+        } else {
+            *self.outbound_timing.lock() = None;
+            (
+                self.sequence.fetch_add(1, Ordering::Relaxed),
+                self.timestamp
+                    .fetch_add(self.samples_per_packet, Ordering::Relaxed),
+            )
+        };
 
         let header = RtpHeader {
             version: 2,
@@ -688,10 +723,12 @@ impl RtpSession {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            return Ok(Frame::voice(
+            return Ok(Frame::voice_with_rtp_timing(
                 header.payload_type as u32,
                 samples,
                 Bytes::copy_from_slice(payload),
+                header.sequence,
+                header.timestamp,
             ));
         }
     }
@@ -709,6 +746,9 @@ impl RtpSession {
             AsteriskError::InvalidArgument("telephone-event was not negotiated".into())
         })?;
 
+        // The DTMF packets consume sequence numbers outside the source voice
+        // mapping. Re-base the next timed voice frame from the new counters.
+        *self.outbound_timing.lock() = None;
         let event_num = DtmfEvent::digit_to_event(digit);
         let start_seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let start_ts = self.timestamp.load(Ordering::Relaxed);
@@ -1361,7 +1401,17 @@ mod tests {
         negotiated_peer.send_to(
             &build_rtp_packet(&accepted, &[0x7f; 160]), target
         ).await.unwrap();
-        assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
+        let received = session.recv_frame().await.unwrap();
+        assert!(matches!(
+            received,
+            Frame::Voice {
+                rtp_timing: Some(RtpTiming {
+                    sequence: 1,
+                    timestamp: 160,
+                }),
+                ..
+            }
+        ));
         let after_accepted = session.stats.snapshot();
         assert_eq!(after_accepted.packets_received, 1);
         assert_eq!(after_accepted.voice_frames_received, 1);
@@ -1387,6 +1437,39 @@ mod tests {
         ).await.unwrap();
         assert!(matches!(session.recv_frame().await.unwrap(), Frame::Voice { .. }));
         assert_eq!(session.stats.snapshot().packets_received, 2);
+    }
+
+    #[tokio::test]
+    async fn send_frame_rebases_source_timing_and_preserves_gaps() {
+        let session = RtpSession::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        session.set_remote_addr(peer.local_addr().unwrap());
+
+        session.send_frame(&Frame::voice_with_rtp_timing(
+            0,
+            160,
+            Bytes::from(vec![0x11; 160]),
+            100,
+            1000,
+        )).await.unwrap();
+        session.send_frame(&Frame::voice_with_rtp_timing(
+            0,
+            160,
+            Bytes::from(vec![0x22; 160]),
+            102,
+            1320,
+        )).await.unwrap();
+
+        let mut packet = [0u8; 2048];
+        let (first_len, _) = peer.recv_from(&mut packet).await.unwrap();
+        let (first, first_payload) = parse_rtp_header(&packet[..first_len]).unwrap();
+        assert_eq!(first_payload, &[0x11; 160]);
+
+        let (second_len, _) = peer.recv_from(&mut packet).await.unwrap();
+        let (second, second_payload) = parse_rtp_header(&packet[..second_len]).unwrap();
+        assert_eq!(second_payload, &[0x22; 160]);
+        assert_eq!(second.sequence.wrapping_sub(first.sequence), 2);
+        assert_eq!(second.timestamp.wrapping_sub(first.timestamp), 320);
     }
 
     #[test]

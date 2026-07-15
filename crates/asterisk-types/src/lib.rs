@@ -14,6 +14,6 @@ pub use channel_state::ChannelState;
 pub use hangup_cause::HangupCause;
 pub use media_type::MediaType;
 pub use party::*;
-pub use frame::Frame;
+pub use frame::{Frame, RtpTiming};
 pub use error::*;
 pub use flags::*;

@@ -11,6 +11,7 @@ pub mod bridge_channel;
 pub mod event_loop;
 pub mod softmix;
 pub mod basic;
+pub mod lifetime;
 
 use asterisk_types::{AsteriskResult, AsteriskError, BridgeCapability, BridgeFlags, Frame};
 use crate::channel::{Channel, ChannelId};
