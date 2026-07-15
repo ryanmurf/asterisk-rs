@@ -1969,8 +1969,6 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                 if let Some(mut rx) = event_rx {
                     let transport_for_handler: Arc<dyn asterisk_sip::transport::SipTransport> =
                         transport.clone();
-                    let transport_for_options: Arc<dyn asterisk_sip::transport::SipTransport> =
-                        transport.clone();
                     let event_handler =
                         Arc::new(asterisk_sip::event_handler::SipEventHandler::new(
                             dialplan.clone(),
@@ -2059,8 +2057,8 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                             );
                                             ok_resp.add_header("Accept", "application/sdp");
                                             ok_resp.add_header("Server", "Rustisk/0.1.0");
-                                            let _ = transport_for_options
-                                                .send(&ok_resp, remote_addr)
+                                            let _ = sip_stack
+                                                .send_response(ok_resp, remote_addr)
                                                 .await;
                                             debug!("Sent 200 OK for OPTIONS from {}", remote_addr);
                                         }

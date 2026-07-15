@@ -140,6 +140,15 @@ struct TransactionTimeoutEvent {
     invite_ack_call_id: Option<String>,
 }
 
+/// Exact sizes of the four RFC 3261 transaction maps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransactionCounts {
+    pub invite_client: usize,
+    pub invite_server: usize,
+    pub non_invite_client: usize,
+    pub non_invite_server: usize,
+}
+
 struct MatchedResponse {
     branch: String,
     transaction_ack: Option<(SipMessage, SocketAddr)>,
@@ -258,6 +267,35 @@ impl TransactionLayer {
             }
         }
         None
+    }
+
+    /// Cache a TU response in its non-INVITE server transaction. A final
+    /// response enters Completed and arms Timer J; a duplicate request can
+    /// then replay the exact response without reaching the TU again.
+    fn record_non_invite_response(&mut self, response: &SipMessage, remote_addr: SocketAddr) {
+        let Some(branch) = Self::extract_branch(response) else {
+            return;
+        };
+        let Some(status) = response.status_code() else {
+            return;
+        };
+        let Some(txn) = self.non_invite_server_txns.get_mut(&branch) else {
+            return;
+        };
+        if txn.remote_addr != remote_addr
+            || txn.request.call_id() != response.call_id()
+            || cseq_number(&txn.request) != cseq_number(response)
+            || txn.request.from_header().and_then(extract_tag)
+                != response.from_header().and_then(extract_tag)
+        {
+            return;
+        }
+
+        if status < 200 {
+            txn.send_provisional(response.clone());
+        } else {
+            txn.send_final(response.clone());
+        }
     }
 
     /// A 2xx ACK has a new Via branch. Match it by the dialog identity,
@@ -513,7 +551,21 @@ impl SipStack {
         response: SipMessage,
         remote_addr: SocketAddr,
     ) -> Result<(), TransportError> {
+        self.transaction_layer
+            .write()
+            .record_non_invite_response(&response, remote_addr);
         self.transport.send(&response, remote_addr).await
+    }
+
+    /// Snapshot the live transaction-map sizes for exact lifecycle checks.
+    pub fn transaction_counts(&self) -> TransactionCounts {
+        let layer = self.transaction_layer.read();
+        TransactionCounts {
+            invite_client: layer.invite_client_txns.len(),
+            invite_server: layer.invite_server_txns.len(),
+            non_invite_client: layer.non_invite_client_txns.len(),
+            non_invite_server: layer.non_invite_server_txns.len(),
+        }
     }
 
     /// Get a clone of the transport for use by external components
@@ -1559,6 +1611,42 @@ mod tests {
              Content-Length: 0\r\n\r\n"
         );
         SipMessage::parse(raw.as_bytes()).unwrap()
+    }
+
+    /// A TU final completes a non-INVITE server transaction, duplicates get
+    /// the byte-identical cached response without another event, and Timer J
+    /// removes the map entry.
+    #[tokio::test]
+    async fn test_options_final_replays_and_timer_j_reaps_transaction() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut stack = SipStack::new(addr).await.unwrap();
+        let mut rx = stack.take_event_rx().unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let branch = "z9hG4bKoptions-complete";
+        let request = build_options_request("options-complete", branch);
+
+        stack.handle_request(request.clone(), peer_addr).await;
+        assert!(matches!(rx.recv().await, Some(SipEvent::IncomingRequest { .. })));
+        assert_eq!(stack.transaction_counts().non_invite_server, 1);
+
+        let response = request.create_response(200, "OK").unwrap();
+        stack.send_response(response.clone(), peer_addr).await.unwrap();
+        assert_eq!(recv_peer(&peer).await.to_string(), response.to_string());
+        assert_eq!(
+            stack.transaction_layer.read().non_invite_server_txns
+                .get(branch).unwrap().state,
+            crate::transaction::NonInviteServerState::Completed,
+        );
+
+        stack.handle_request(request, peer_addr).await;
+        assert_eq!(recv_peer(&peer).await.to_string(), response.to_string());
+        assert!(rx.try_recv().is_err(), "duplicate OPTIONS must not reach the TU");
+
+        stack.transaction_layer.write().non_invite_server_txns
+            .get_mut(branch).unwrap().expire_timer_j();
+        stack.handle_timers().await;
+        assert_eq!(stack.transaction_counts().non_invite_server, 0);
     }
 
     /// The TU retains and retransmits a successful final until its dialog ACK
