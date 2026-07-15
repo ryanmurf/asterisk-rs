@@ -419,6 +419,13 @@ fn handle_core_status(
             "SIPCallStates",
             sip_counts.map(|counts| counts.call_states).unwrap_or(0).to_string(),
         )
+        .with_header(
+            "SIPNotifyChannels",
+            sip_counts
+                .map(|counts| counts.notify_channels)
+                .unwrap_or(0)
+                .to_string(),
+        )
         .with_header("CoreStartupSecs", uptime_secs.to_string())
 }
 
@@ -596,7 +603,7 @@ fn handle_originate(
                     .with_header("Uniqueid", &chan_uid),
             );
             let _ = driver.hangup(&mut call_channel).await;
-            asterisk_core::channel_store::deregister(&chan_uid);
+            release_originate_leg(&tech, &chan_name, &chan_uid);
             return;
         }
 
@@ -666,11 +673,25 @@ fn handle_originate(
                 .with_header("Uniqueid", &chan_uid),
         );
 
-        // Remove from the global channel store
-        asterisk_core::channel_store::deregister(&chan_uid);
+        release_originate_leg(&tech, &chan_name, &chan_uid);
     });
 
     AmiResponse::success("Originate successfully queued")
+}
+
+/// Release every resource held by a technology-backed Originate leg.
+///
+/// PJSIP teardown is centralized in `release_outbound_leg`, which also clears
+/// its Call-ID, call-state, driver-media, and NOTIFY registrations. Other
+/// channel technologies only need the generic store entry removed here.
+fn release_originate_leg(technology: &str, channel_name: &str, unique_id: &str) {
+    if technology.eq_ignore_ascii_case("PJSIP") {
+        if let Some(handler) = asterisk_sip::get_global_event_handler() {
+            handler.release_outbound_leg(channel_name);
+            return;
+        }
+    }
+    asterisk_core::channel_store::deregister(unique_id);
 }
 
 /// Simple originate: allocate a channel directly and run pbx_run on it.
@@ -2496,6 +2517,7 @@ mod tests {
             "SIPDriverChannels",
             "SIPCallIdMappings",
             "SIPCallStates",
+            "SIPNotifyChannels",
         ] {
             assert!(
                 resp.headers.get(field).is_some_and(|value| value.parse::<usize>().is_ok()),

@@ -113,7 +113,7 @@ ami_action() {
 
 resource_snapshot() {
     local response
-    local fields=(CoreCurrentCalls SIPDriverChannels SIPCallIdMappings SIPCallStates)
+    local fields=(CoreCurrentCalls SIPDriverChannels SIPCallIdMappings SIPCallStates SIPNotifyChannels)
     local values=()
     response="$(ami_action $'Action: CoreStatus\r\n\r\n')"
     for field in "${fields[@]}"; do
@@ -413,7 +413,7 @@ docker run --rm --name "$RUSTISK_CONTAINER" \
 RUSTISK_PID=$!
 wait_for_ami
 BASELINE_RESOURCES="$(resource_snapshot)"
-printf 'Exact resource baseline: %s (store/driver/call-id/state)\n' "$BASELINE_RESOURCES"
+printf 'Exact resource baseline: %s (store/driver/call-id/state/notify)\n' "$BASELINE_RESOURCES"
 
 run_case 1 123456 GRANTED
 run_case 2 123450 REJECTED

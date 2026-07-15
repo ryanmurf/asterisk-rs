@@ -33,17 +33,21 @@ capture used for the retained artifacts.
 
 The M1 outbound checks are deliberately asymmetric:
 
-- FreeSWITCH's B endpoint answers and records but remains listen-only for the
-  entire call.
+- FreeSWITCH's B endpoint answers and records while its sleeping dialplan sends
+  zero media packets to rustisk for the entire call.
 - Completed `RTPStats` must report `RTPVoiceFramesRx == 0` and
   `RTPVoiceFramesTx > 0` for the rustisk outbound leg.
+- The symmetric-RTP latch exists only in `RtpSession::recv_frame`, which also
+  increments `voice_frames_received` for every non-empty voice payload. Any
+  socket read capable of latching would therefore make `RTPVoiceFramesRx`
+  non-zero and fail the case.
 - A spectral check on FreeSWITCH's receiver-side WAV must find the expected
   tone; a non-empty recording alone is not accepted.
 - A separate one-second `Dial()` timeout must appear as a `CANCEL` in
   FreeSWITCH's SIP trace.
-- AMI `CoreStatus` snapshots the channel store, driver map, Call-ID map, and
-  call-state map. Every case must return all four to the exact pre-test
-  baseline within two seconds.
+- AMI `CoreStatus` snapshots the channel store, driver map, Call-ID map,
+  call-state map, and NOTIFY channel map. Every case must return all five to
+  the exact pre-test baseline within two seconds.
 
 [RFC 3551]: https://www.rfc-editor.org/info/rfc3551/
 [RFC 4733]: https://www.rfc-editor.org/info/rfc4733/
