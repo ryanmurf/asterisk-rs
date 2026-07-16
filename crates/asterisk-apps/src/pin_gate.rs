@@ -10,6 +10,7 @@ use asterisk_core::channel::{Channel, ChannelDriver};
 use asterisk_types::{ChannelState, Frame};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tracing::{error, warn};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -47,12 +48,14 @@ impl PinSecret {
     /// Compare exactly six positions and fold the entered length into the result.
     /// There is no data-dependent early return.
     fn matches(&self, entered: &[u8]) -> bool {
-        let mut difference = entered.len() ^ PIN_LENGTH;
-        for (index, secret_byte) in self.0.iter().enumerate() {
-            let entered_byte = entered.get(index).copied().unwrap_or(0);
-            difference |= usize::from(entered_byte ^ secret_byte);
+        let mut candidate = [0_u8; PIN_LENGTH];
+        for (index, byte) in candidate.iter_mut().enumerate() {
+            *byte = entered.get(index).copied().unwrap_or(0);
         }
-        difference == 0
+        let length_matches = (entered.len() as u64).ct_eq(&(PIN_LENGTH as u64));
+        let matches = candidate.ct_eq(&self.0) & length_matches;
+        candidate.zeroize();
+        matches.into()
     }
 }
 

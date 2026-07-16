@@ -46,6 +46,7 @@ aes = "0.8"
 hex = "0.4"
 rand = "0.8"
 zeroize = "1"
+subtle = "2"
 base64 = "0.22"
 inventory = "0.3"
 clap = { version = "4", features = ["derive"] }
