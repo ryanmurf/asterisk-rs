@@ -28,6 +28,8 @@ RTP_HELPER_LABEL="rustisk.m2.helper=$FS_CONTAINER"
 IMPAIRMENT_CONTROL="$RUNTIME_DIR/impairment-control.json"
 IMPAIRMENT_STATE="$RUNTIME_DIR/impairment-state.json"
 IMPAIRMENT_GENERATION=0
+M4_TIMER_B_MIN_MS=28000
+M4_TIMER_B_MAX_MS=38000
 
 cleanup() {
     if docker inspect "$IMPAIRMENT_CONTAINER" >/dev/null 2>&1; then
@@ -570,15 +572,30 @@ wait_for_call_end() {
     fail "FreeSWITCH call $uuid did not end"
 }
 
-wait_for_call_end_eventually() {
-    local uuid="$1"
-    for _ in {1..450}; do
-        if [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" != "true" ]]; then
+wait_for_transaction_baseline_in_timer_b_window() {
+    local started_ms="$1"
+    local elapsed_ms
+    local snapshot
+    # CoreStatus uses one AMI connection per sample. The transaction is already
+    # proven live above, so wait without polling until just before the window.
+    sleep 27
+    while true; do
+        elapsed_ms="$(($(now_ms) - started_ms))"
+        snapshot="$(transaction_snapshot)"
+        if [[ "$snapshot" == "$BASELINE_TRANSACTIONS" ]]; then
+            (( elapsed_ms >= M4_TIMER_B_MIN_MS )) \
+                || fail "INVITE client transaction drained before Timer B: ${elapsed_ms}ms"
+            printf '%s\n' "$elapsed_ms"
             return
         fi
-        sleep 0.1
+        (( elapsed_ms < M4_TIMER_B_MAX_MS )) \
+            || fail "INVITE client transaction did not drain in Timer B window (${M4_TIMER_B_MIN_MS}-${M4_TIMER_B_MAX_MS}ms): baseline=$BASELINE_TRANSACTIONS actual=$snapshot; 70s direct-Originate hold is still pending"
+        sleep 0.25
     done
-    fail "FreeSWITCH call $uuid did not end within the transaction timeout window"
+}
+
+timer_b_teardown_count() {
+    grep -c 'Timer B tore down unanswered outbound INVITE' "$RUSTISK_LOG" || true
 }
 
 run_case() {
@@ -868,10 +885,11 @@ queue_m4_originate() {
     local destination="$1"
     local context="${2:-m4-wait}"
     local extension="${3:-s}"
+    local timeout_ms="${4:-5000}"
     local action
     local response
-    printf -v action 'Action: Originate\r\nActionID: m4-%s\r\nChannel: PJSIP/%s@%s:5060\r\nContext: %s\r\nExten: %s\r\nPriority: 1\r\nTimeout: 5000\r\nAsync: true\r\n\r\n' \
-        "$destination" "$destination" "$IMPAIRMENT_IP" "$context" "$extension"
+    printf -v action 'Action: Originate\r\nActionID: m4-%s\r\nChannel: PJSIP/%s@%s:5060\r\nContext: %s\r\nExten: %s\r\nPriority: 1\r\nTimeout: %s\r\nAsync: true\r\n\r\n' \
+        "$destination" "$destination" "$IMPAIRMENT_IP" "$context" "$extension" "$timeout_ms"
     response="$(ami_action "$action")"
     grep -q 'Message: Originate successfully queued' <<<"$response" \
         || fail "M4 Originate $destination was not queued: $response"
@@ -967,20 +985,34 @@ PY
 }
 
 run_m4_provisional_silence_case() {
-    local originate_response
-    local outer_uuid
     local inner_uuid
+    local active_transactions
+    local active_invite_clients
+    local baseline_invite_clients
+    local timer_b_started_ms
+    local timer_b_elapsed_ms
+    local timer_b_logs_before
+    local timer_b_logs_after
     printf '\nRunning M4 180-then-silence Timer-B case...\n'
     set_impairment none
-    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9403@$FS_HOST_IP:15060 &park()")"
-    outer_uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
-    [[ -n "$outer_uuid" ]] || fail "M4 provisional originate failed: $originate_response"
+    timer_b_logs_before="$(timer_b_teardown_count)"
+    queue_m4_originate 9303 m4-timer-b-hold s 70000
     inner_uuid="$(wait_for_fs_destination_uuid 9303)"
     wait_for_impairment_counter fs_to_rustisk_response_180_INVITE 1 >/dev/null
-    wait_for_call_end_eventually "$outer_uuid"
+    active_transactions="$(transaction_snapshot)"
+    active_invite_clients="${active_transactions%%/*}"
+    baseline_invite_clients="${BASELINE_TRANSACTIONS%%/*}"
+    (( active_invite_clients == baseline_invite_clients + 1 )) \
+        || fail "180 response did not leave exactly one live INVITE client transaction: baseline=$BASELINE_TRANSACTIONS actual=$active_transactions"
+    timer_b_started_ms="$(now_ms)"
+    timer_b_elapsed_ms="$(wait_for_transaction_baseline_in_timer_b_window "$timer_b_started_ms")"
     wait_for_resource_baseline_eventually "M4_180_SILENCE_TIMER_B"
+    timer_b_logs_after="$(timer_b_teardown_count)"
+    (( timer_b_logs_after == timer_b_logs_before + 1 )) \
+        || fail "Timer B teardown log count must increase by one: $timer_b_logs_before->$timer_b_logs_after"
     fs_cli "uuid_kill $inner_uuid NORMAL_CLEARING" >/dev/null 2>&1 || true
-    printf 'M4_180_SILENCE_TIMER_B: PASS (FreeSWITCH sent 180; Timer B ended caller)\n'
+    printf 'M4_180_SILENCE_TIMER_B: PASS (FreeSWITCH sent 180; TimerBTransactionDrainMs=%s; DirectOriginateHoldSec=70)\n' \
+        "$timer_b_elapsed_ms"
 }
 
 run_m4_forged_dialog_case() {
@@ -1198,6 +1230,13 @@ BASELINE_RESOURCES="$(resource_snapshot)"
 BASELINE_TRANSACTIONS="$(transaction_snapshot)"
 printf 'Exact resource baseline: %s (store/driver/call-id/state/notify)\n' "$BASELINE_RESOURCES"
 printf 'Exact transaction baseline: %s (invite-client/invite-server/non-invite-client/non-invite-server)\n' "$BASELINE_TRANSACTIONS"
+
+if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m4-timer-b" ]]; then
+    run_m4_provisional_silence_case
+    printf '\nPASS: isolated M4 Timer B impairment acceptance.\n'
+    printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
+    exit 0
+fi
 
 run_case 1 123456 GRANTED
 run_case 2 123450 REJECTED

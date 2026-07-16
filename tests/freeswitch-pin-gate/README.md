@@ -31,6 +31,9 @@ G.711 payload. [RFC 3551] assigns PCMU and PCMA static payload types 0 and 8.
 FreeSWITCH's [`uuid_record` documentation] describes the established-call WAV
 capture used for the retained artifacts.
 
+Set `FREESWITCH_PIN_GATE_CASE=m4-timer-b` to run only the isolated Timer B
+negative-control target while developing the impairment harness.
+
 The M1 outbound checks are deliberately asymmetric:
 
 - FreeSWITCH's B endpoint answers and records while its sleeping dialplan sends
@@ -87,6 +90,13 @@ from the allowed proxy address, ten simultaneous calls with distinct captured
 tones, the CANCEL/200 crossing order, and non-2xx or absent BYE finals. Every
 individual case restores both the five core maps and four transaction maps to
 their exact `0/0/0/0/0` and `0/0/0/0` baselines.
+
+The 180-then-silence case directly originates its outbound leg into a 70-second
+hold, proves the provisional response left a live INVITE-client transaction,
+then requires that map to drain in Timer B's 28-38 second window before checking
+the exact map baselines. This makes the transaction timer, rather than either
+the old `Dial()` timeout or a short post-originate hangup's CANCEL/487/Timer-D
+path, load-bearing for the case.
 
 [RFC 3551]: https://www.rfc-editor.org/info/rfc3551/
 [RFC 4733]: https://www.rfc-editor.org/info/rfc4733/

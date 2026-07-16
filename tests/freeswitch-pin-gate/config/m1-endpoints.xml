@@ -45,7 +45,8 @@
   <extension name="rustisk-m4-provisional-silence">
     <condition field="destination_number" expression="^9303$">
       <action application="ring_ready"/>
-      <action application="sleep" data="45000"/>
+      <!-- Stay provisional beyond Timer B and the harness assertion window. -->
+      <action application="sleep" data="70000"/>
     </condition>
   </extension>
 
