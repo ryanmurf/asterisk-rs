@@ -22,3 +22,4 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
+zeroize = { workspace = true }

@@ -37,6 +37,7 @@ impl AppRegistry {
         registry.register(Arc::new(crate::softhangup::AppSoftHangup));
         registry.register(Arc::new(crate::originate::AppOriginate));
         registry.register(Arc::new(crate::read::AppRead));
+        registry.register(Arc::new(crate::pin_gate::AppPinGate));
         registry.register(Arc::new(crate::system::AppSystem));
         registry.register(Arc::new(crate::system::AppTrySystem));
         registry.register(Arc::new(crate::sendtext::AppSendText));
