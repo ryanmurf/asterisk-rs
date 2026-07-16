@@ -12,12 +12,28 @@ Run it from the rustisk repository:
 tests/freeswitch-pin-gate/run.sh
 ```
 
-The first call enters `123456#` and must take the `GRANTED` branch. The second
-enters `123450#` and must take the `REJECTED` branch. Both calls use negotiated
-[RFC 4733] telephone events from FreeSWITCH. [FreeSWITCH's documented default]
-when `dtmf_type` is unset is to use the method negotiated in SDP. The harness
-fails unless rustisk's authenticated AMI `RTPStats` action proves all of the
-following for each completed call:
+Each run generates a throwaway six-digit test PIN under
+`/mnt/data/herodevs-agents`, mounts that one file read-only at
+`/run/secrets/rustisk/pin`, derives a wrong test PIN, and removes the input file
+during cleanup. No PIN value or secret file is committed. Both calls use
+negotiated [RFC 4733] telephone events from FreeSWITCH. [FreeSWITCH's documented
+default] when `dtmf_type` is unset is to use the method negotiated in SDP.
+
+M3 proves the granted call reaches FreeSWITCH B and reuses M2's two receiver
+recordings and tone analyzers in both directions. The rejected call must add
+exactly zero B-side INVITEs. A no-input call must end at the five-second absolute
+deadline within one second. Before the daemon starts, absent and invalid mounted
+secret files must both produce a nonzero startup exit.
+
+An authenticated AMI subscriber using the user's default read permissions is
+live for the granted and rejected calls and must observe ordinary `Newexten` and
+`VarSet` events, including the non-secret `PINGATESTATUS`. A SIP-only pcap is
+captured at the same time. The final zero-hit audit scans maximum-verbosity
+rustisk logs, FreeSWITCH logs, the pcap, the AMI transcript, CDR/CEL artifacts,
+audio, and counter proofs for both test PIN patterns.
+
+The harness also fails unless rustisk's authenticated AMI `RTPStats` action
+proves all of the following for each completed PIN call:
 
 - RTP packets were transmitted and received.
 - Voice frames were transmitted and received.
@@ -33,6 +49,8 @@ capture used for the retained artifacts.
 
 Set `FREESWITCH_PIN_GATE_CASE=m4-timer-b` to run only the isolated Timer B
 negative-control target while developing the impairment harness.
+Set it to `m3` to run only startup fail-closed, the three M3 call cases, the AMI
+subscriber, the SIP-only pcap, and the zero-hit audit.
 
 The M1 outbound checks are deliberately asymmetric:
 
