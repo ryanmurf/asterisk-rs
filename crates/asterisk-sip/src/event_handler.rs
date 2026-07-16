@@ -1114,7 +1114,7 @@ impl SipEventHandler {
 
             if cs.abandoned {
                 if let Some(bye) = cs.session.build_bye() {
-                    if let Err(error) = self.transport.send(&bye, cs.remote_addr).await {
+                    if let Err(error) = self.send_client_request(bye, cs.remote_addr).await {
                         warn!(call_id = %call_id, %error,
                             "Failed to send BYE after abandoned INVITE received 200");
                     } else {
@@ -1144,7 +1144,7 @@ impl SipEventHandler {
                     warn!(call_id = %call_id, channel = %channel_name, %error,
                         "Rejecting unusable outbound SDP answer");
                     if let Some(bye) = cs.session.build_bye() {
-                        if let Err(send_error) = self.transport.send(&bye, remote_addr).await {
+                        if let Err(send_error) = self.send_client_request(bye, remote_addr).await {
                             warn!(call_id = %call_id,
                                 "Failed to send BYE after rejecting answer: {}", send_error);
                         }
@@ -1357,6 +1357,39 @@ impl SipEventHandler {
         self.callid_map.write().remove(call_id);
         self.call_states.write().remove(call_id);
         crate::notify_sip_hangup(call_id);
+    }
+
+    /// Apply abnormal outbound transaction timeouts to the owning call. Timer
+    /// B fails an unanswered outbound INVITE; Timer F finishes a BYE whose
+    /// final response was lost. Normal D/I/J/K expiry never reaches this path.
+    pub fn handle_client_transaction_timeout(
+        &self,
+        call_id: &str,
+        method: crate::parser::SipMethod,
+    ) {
+        let channel_name = self.callid_map.read().get(call_id).cloned();
+        match method {
+            crate::parser::SipMethod::Invite => {
+                if let Some(ref name) = channel_name {
+                    if let Some(channel) = store::find_by_name(name) {
+                        let mut channel = channel.lock();
+                        channel.hangup_cause = HangupCause::NoAnswer;
+                        channel.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                    }
+                    self.release_outbound_leg(name);
+                } else {
+                    self.callid_map.write().remove(call_id);
+                    self.call_states.write().remove(call_id);
+                }
+                info!(call_id, "Timer B tore down unanswered outbound INVITE");
+            }
+            crate::parser::SipMethod::Bye => {
+                self.callid_map.write().remove(call_id);
+                self.call_states.write().remove(call_id);
+                info!(call_id, "Timer F reaped outbound BYE signaling state");
+            }
+            _ => {}
+        }
     }
 
     /// Handle an incoming SIP REGISTER request.
@@ -1694,7 +1727,7 @@ impl SipEventHandler {
             if let Some(cs_arc) = cs_arc {
                 let mut cs = cs_arc.lock().await;
                 if let Some(bye) = cs.session.build_bye() {
-                    if let Err(e) = self.transport.send(&bye, cs.remote_addr).await {
+                    if let Err(e) = self.send_client_request(bye, cs.remote_addr).await {
                         warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
                     } else {
                         eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
@@ -1816,7 +1849,7 @@ impl SipEventHandler {
                 };
                 if let Some(request) = request {
                     let method = request.method();
-                    if let Err(error) = self.transport.send(&request, cs.remote_addr).await {
+                    if let Err(error) = self.send_client_request(request, cs.remote_addr).await {
                         warn!(call_id = %call_id, channel = channel_name,
                             ?method, %error, "Failed to signal abandoned Dial leg");
                     } else {

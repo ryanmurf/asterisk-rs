@@ -33,4 +33,28 @@
       <action application="sleep" data="10000"/>
     </condition>
   </extension>
+
+  <extension name="rustisk-m4-normal-receivers">
+    <condition field="destination_number" expression="^93(00|01|02|04|05|06)$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="answer"/>
+      <action application="sleep" data="45000"/>
+    </condition>
+  </extension>
+
+  <extension name="rustisk-m4-provisional-silence">
+    <condition field="destination_number" expression="^9303$">
+      <action application="ring_ready"/>
+      <action application="sleep" data="45000"/>
+    </condition>
+  </extension>
+
+  <extension name="rustisk-m4-concurrency-receivers">
+    <condition field="destination_number" expression="^93(1[0-9])$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="answer"/>
+      <action application="record_session" data="/var/lib/freeswitch/recordings/m4-${destination_number}.wav"/>
+      <action application="sleep" data="45000"/>
+    </condition>
+  </extension>
 </include>

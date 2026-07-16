@@ -28,6 +28,10 @@ fn cseq_number(msg: &SipMessage) -> Option<&str> {
     msg.get_header(header_names::CSEQ)?.split_whitespace().next()
 }
 
+fn cseq_method(msg: &SipMessage) -> Option<&str> {
+    msg.get_header(header_names::CSEQ)?.split_whitespace().nth(1)
+}
+
 fn request_identity_matches(original: &SipMessage, retransmission: &SipMessage) -> bool {
     original.call_id() == retransmission.call_id()
         && cseq_number(original) == cseq_number(retransmission)
@@ -138,6 +142,9 @@ pub enum SipEvent {
     /// A transaction timed out.
     TransactionTimeout {
         branch: String,
+        call_id: Option<String>,
+        method: Option<SipMethod>,
+        client: bool,
     },
 }
 
@@ -151,6 +158,9 @@ struct CachedInviteFinal {
 
 struct TransactionTimeoutEvent {
     branch: String,
+    call_id: Option<String>,
+    method: Option<SipMethod>,
+    client: bool,
     invite_ack_call_id: Option<String>,
 }
 
@@ -209,21 +219,30 @@ impl TransactionLayer {
     ) -> Option<MatchedResponse> {
         let branch = Self::extract_branch(response)?;
 
-        if let Some(txn) = self.invite_client_txns.get_mut(&branch) {
-            if txn.remote_addr != src {
-                return None;
+        if cseq_method(response).is_some_and(|method| method.eq_ignore_ascii_case("INVITE")) {
+            if let Some(txn) = self.invite_client_txns.get_mut(&branch) {
+                if txn.remote_addr != src {
+                    return None;
+                }
+                let status = response.status_code().unwrap_or_default();
+                let transaction_ack = (300..700).contains(&status)
+                    .then(|| build_non_2xx_ack(&txn.request, response))
+                    .flatten()
+                    .map(|ack| (ack, txn.remote_addr));
+                txn.on_response(response.clone());
+                return Some(MatchedResponse { branch, transaction_ack });
             }
-            let status = response.status_code().unwrap_or_default();
-            let transaction_ack = (300..700).contains(&status)
-                .then(|| build_non_2xx_ack(&txn.request, response))
-                .flatten()
-                .map(|ack| (ack, txn.remote_addr));
-            txn.on_response(response.clone());
-            return Some(MatchedResponse { branch, transaction_ack });
         }
 
         if let Some(txn) = self.non_invite_client_txns.get_mut(&branch) {
             if txn.remote_addr != src {
+                return None;
+            }
+            let response_method = cseq_method(response);
+            let request_method = txn.request.method().map(|method| method.as_str());
+            if response_method.zip(request_method)
+                .is_none_or(|(response, request)| !response.eq_ignore_ascii_case(request))
+            {
                 return None;
             }
             txn.on_response(response.clone());
@@ -364,6 +383,9 @@ impl TransactionLayer {
                 txn.terminate();
                 events.push(TransactionTimeoutEvent {
                     branch: branch.clone(),
+                    call_id: txn.request.call_id().map(str::to_string),
+                    method: txn.request.method(),
+                    client: true,
                     invite_ack_call_id: None,
                 });
             } else if txn.timer_d_expired() {
@@ -376,6 +398,9 @@ impl TransactionLayer {
                 txn.terminate();
                 events.push(TransactionTimeoutEvent {
                     branch: branch.clone(),
+                    call_id: txn.request.call_id().map(str::to_string),
+                    method: txn.request.method(),
+                    client: true,
                     invite_ack_call_id: None,
                 });
             } else if txn.timer_k_expired() {
@@ -392,6 +417,9 @@ impl TransactionLayer {
                 txn.terminate();
                 events.push(TransactionTimeoutEvent {
                     branch: branch.clone(),
+                    call_id: txn.request.call_id().map(str::to_string),
+                    method: txn.request.method(),
+                    client: false,
                     invite_ack_call_id,
                 });
             } else if txn.timer_i_expired() {
@@ -525,15 +553,19 @@ impl SipStack {
         let branch = TransactionLayer::extract_branch(&request)
             .unwrap_or_else(|| format!("z9hG4bK{}", uuid::Uuid::new_v4()));
 
-        // Send the initial request
-        self.transport.send(&request, remote_addr).await?;
-
-        // Create the client transaction
+        // Publish the transaction before the datagram. A loopback/nearby peer
+        // can answer before `send().await` returns; inserting afterward loses
+        // that one-shot response (especially 200 to CANCEL/BYE).
+        let request_to_send = request.clone();
         let txn = ClientTransaction::new(request, remote_addr, branch.clone());
         self.transaction_layer
             .write()
             .invite_client_txns
             .insert(branch.clone(), txn);
+        if let Err(error) = self.transport.send(&request_to_send, remote_addr).await {
+            self.transaction_layer.write().invite_client_txns.remove(&branch);
+            return Err(error);
+        }
 
         debug!(branch = %branch, "Created INVITE client transaction");
         Ok(branch)
@@ -548,13 +580,16 @@ impl SipStack {
         let branch = TransactionLayer::extract_branch(&request)
             .unwrap_or_else(|| format!("z9hG4bK{}", uuid::Uuid::new_v4()));
 
-        self.transport.send(&request, remote_addr).await?;
-
+        let request_to_send = request.clone();
         let txn = NonInviteClientTransaction::new(request, remote_addr, branch.clone());
         self.transaction_layer
             .write()
             .non_invite_client_txns
             .insert(branch.clone(), txn);
+        if let Err(error) = self.transport.send(&request_to_send, remote_addr).await {
+            self.transaction_layer.write().non_invite_client_txns.remove(&branch);
+            return Err(error);
+        }
 
         debug!(branch = %branch, "Created non-INVITE client transaction");
         Ok(branch)
@@ -1035,6 +1070,9 @@ impl SipStack {
             warn!(branch = %timeout.branch, "Transaction timed out");
             self.emit_event(SipEvent::TransactionTimeout {
                 branch: timeout.branch,
+                call_id: timeout.call_id,
+                method: timeout.method,
+                client: timeout.client,
             })
             .await;
             if let Some(call_id) = timeout.invite_ack_call_id {
@@ -1226,6 +1264,9 @@ mod tests {
                     stack
                         .emit_event(SipEvent::TransactionTimeout {
                             branch: format!("b{}", i),
+                            call_id: None,
+                            method: None,
+                            client: true,
                         })
                         .await;
                 }
@@ -1247,7 +1288,7 @@ mod tests {
                 })
                 .expect("channel closed");
             match event {
-                SipEvent::TransactionTimeout { branch } => {
+                SipEvent::TransactionTimeout { branch, .. } => {
                     assert_eq!(branch, format!("b{}", expected), "events reordered");
                 }
                 other => panic!("Expected TransactionTimeout, got {:?}", other),
@@ -1274,6 +1315,9 @@ mod tests {
             stack
                 .emit_event(SipEvent::TransactionTimeout {
                     branch: format!("filler{}", i),
+                    call_id: None,
+                    method: None,
+                    client: true,
                 })
                 .await;
         }

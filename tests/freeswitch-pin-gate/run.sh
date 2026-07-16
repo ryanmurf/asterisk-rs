@@ -13,18 +13,30 @@ FS_IMAGE="safarov/freeswitch@sha256:b31c743f4c911a19687c61e3214968f2a24f93f9d3d6
 RUSTISK_IMAGE="python@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3"
 FS_CONTAINER="rustisk-fs-pin-gate-$$"
 RUSTISK_CONTAINER="rustisk-m1-gate-$$"
+IMPAIRMENT_CONTAINER="rustisk-m4-impairment-$$"
 FS_NETWORK="rustisk-fs-pin-gate-net-$$"
 NETWORK_THIRD_OCTET="$((20 + ($$ % 200)))"
 FS_SUBNET="10.253.$NETWORK_THIRD_OCTET.0/24"
 FS_CONTAINER_IP="10.253.$NETWORK_THIRD_OCTET.2"
 FS_HOST_IP="10.253.$NETWORK_THIRD_OCTET.3"
+IMPAIRMENT_IP="10.253.$NETWORK_THIRD_OCTET.4"
 AMI_HOST="$FS_HOST_IP"
 RUSTISK_PID=""
 BASELINE_RESOURCES=""
 BASELINE_TRANSACTIONS=""
 RTP_HELPER_LABEL="rustisk.m2.helper=$FS_CONTAINER"
+IMPAIRMENT_CONTROL="$RUNTIME_DIR/impairment-control.json"
+IMPAIRMENT_STATE="$RUNTIME_DIR/impairment-state.json"
+IMPAIRMENT_GENERATION=0
 
 cleanup() {
+    if docker inspect "$IMPAIRMENT_CONTAINER" >/dev/null 2>&1; then
+        local impairment_host_pid
+        impairment_host_pid="$(docker inspect -f '{{.State.Pid}}' "$IMPAIRMENT_CONTAINER")"
+        kill -TERM "$impairment_host_pid" 2>/dev/null || true
+        timeout 3 docker wait "$IMPAIRMENT_CONTAINER" >/dev/null 2>&1 || true
+        docker rm -f "$IMPAIRMENT_CONTAINER" >/dev/null 2>&1 || true
+    fi
     docker ps -aq --filter "label=$RTP_HELPER_LABEL" \
         | xargs -r docker rm -f >/dev/null 2>&1 || true
     if docker inspect "$RUSTISK_CONTAINER" >/dev/null 2>&1; then
@@ -139,7 +151,7 @@ resource_snapshot() {
     local response
     local fields=(CoreCurrentCalls SIPDriverChannels SIPCallIdMappings SIPCallStates SIPNotifyChannels)
     local values=()
-    response="$(ami_action $'Action: CoreStatus\r\n\r\n')"
+    response="$(core_status_response)"
     for field in "${fields[@]}"; do
         local value
         value="$(stat_value "$field" "$response")"
@@ -153,7 +165,7 @@ transaction_snapshot() {
     local response
     local fields=(SIPInviteClientTransactions SIPInviteServerTransactions SIPNonInviteClientTransactions SIPNonInviteServerTransactions)
     local values=()
-    response="$(ami_action $'Action: CoreStatus\r\n\r\n')"
+    response="$(core_status_response)"
     for field in "${fields[@]}"; do
         local value
         value="$(stat_value "$field" "$response")"
@@ -161,6 +173,122 @@ transaction_snapshot() {
         values+=("$value")
     done
     (IFS=/; printf '%s\n' "${values[*]}")
+}
+
+core_status_response() {
+    local response=""
+    for _ in {1..10}; do
+        if response="$(ami_action $'Action: CoreStatus\r\n\r\n' 2>/dev/null)" \
+            && grep -q 'SIPNonInviteServerTransactions:' <<<"$response"; then
+            printf '%s\n' "$response"
+            return
+        fi
+        sleep 0.2
+    done
+    fail "CoreStatus did not respond after retries"
+}
+
+set_impairment() {
+    local mode="$1"
+    local inject_forged="${2:-false}"
+    IMPAIRMENT_GENERATION="$((IMPAIRMENT_GENERATION + 1))"
+    python3 - "$IMPAIRMENT_CONTROL" "$IMPAIRMENT_GENERATION" "$mode" "$inject_forged" <<'PY'
+import json
+import os
+import sys
+
+path, generation, mode, inject_forged = sys.argv[1:]
+tmp = path + ".new"
+with open(tmp, "w", encoding="utf-8") as output:
+    json.dump({
+        "generation": int(generation),
+        "mode": mode,
+        "inject_forged": inject_forged == "true",
+    }, output)
+os.replace(tmp, path)
+PY
+    for _ in {1..100}; do
+        if [[ -f "$IMPAIRMENT_STATE" ]] \
+            && [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$IMPAIRMENT_STATE" 2>/dev/null || true)" == "$IMPAIRMENT_GENERATION" ]]; then
+            return
+        fi
+        sleep 0.2
+    done
+    fail "impairment proxy did not acknowledge generation $IMPAIRMENT_GENERATION ($mode)"
+}
+
+impairment_counter() {
+    local name="$1"
+    python3 - "$IMPAIRMENT_STATE" "$name" <<'PY'
+import json
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+print(state.get("counters", {}).get(sys.argv[2], 0))
+PY
+}
+
+wait_for_impairment_counter() {
+    local name="$1"
+    local minimum="$2"
+    local value=0
+    for _ in {1..800}; do
+        value="$(impairment_counter "$name")"
+        if (( value >= minimum )); then
+            printf '%s\n' "$value"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "impairment counter $name must reach $minimum, got $value"
+}
+
+assert_impairment_hash_count() {
+    local direction="$1"
+    local status="$2"
+    local cseq_method="$3"
+    local expected="$4"
+    python3 - "$IMPAIRMENT_STATE" "$direction" "$status" "$cseq_method" "$expected" <<'PY'
+import json
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+direction, status, cseq_method, expected = sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+events = [event for event in state["events"]
+          if event["direction"] == direction
+          and event["status"] == status
+          and event["cseq_method"] == cseq_method]
+if len(events) != expected:
+    raise SystemExit(f"expected {expected} matching events, got {len(events)}: {events}")
+hashes = {event["sha256"] for event in events}
+if len(hashes) != 1:
+    raise SystemExit(f"matching messages were not byte-identical: {hashes}")
+print(f"Identical{status}{cseq_method}={expected} SHA256={next(iter(hashes))}")
+PY
+}
+
+assert_impairment_hashes_identical_minimum() {
+    local direction="$1"
+    local status="$2"
+    local cseq_method="$3"
+    local minimum="$4"
+    python3 - "$IMPAIRMENT_STATE" "$direction" "$status" "$cseq_method" "$minimum" <<'PY'
+import json
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+direction, status, cseq_method, minimum = sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+events = [event for event in state["events"]
+          if event["direction"] == direction
+          and event["status"] == status
+          and event["cseq_method"] == cseq_method]
+if len(events) < minimum:
+    raise SystemExit(f"expected at least {minimum} {status}/{cseq_method} messages, got {len(events)}")
+hashes = {event["sha256"] for event in events}
+if len(hashes) != 1:
+    raise SystemExit(f"{status}/{cseq_method} messages were not byte-identical: {hashes}")
+print(f"Identical{status}{cseq_method}={len(events)} SHA256={next(iter(hashes))}")
+PY
 }
 
 wait_for_transaction_baseline() {
@@ -179,7 +307,7 @@ wait_for_transaction_baseline() {
         fi
         (( elapsed_ms < 40000 )) \
             || fail "$label transactions did not return to exact baseline: baseline=$BASELINE_TRANSACTIONS actual=$snapshot"
-        sleep 0.05
+        sleep 0.2
     done
 }
 
@@ -222,7 +350,7 @@ wait_for_resource_baseline_eventually() {
         fi
         (( elapsed_ms < 40000 )) \
             || fail "$label resources did not eventually return to baseline: baseline=$BASELINE_RESOURCES actual=$snapshot"
-        sleep 0.05
+        sleep 0.1
     done
 }
 
@@ -440,6 +568,17 @@ wait_for_call_end() {
         sleep 0.1
     done
     fail "FreeSWITCH call $uuid did not end"
+}
+
+wait_for_call_end_eventually() {
+    local uuid="$1"
+    for _ in {1..450}; do
+        if [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" != "true" ]]; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "FreeSWITCH call $uuid did not end within the transaction timeout window"
 }
 
 run_case() {
@@ -725,6 +864,248 @@ run_m2_deadline_silent_case() {
     printf 'M2_DEADLINE_SILENT: PASS (InboundRTPPacketsRx=0 OutboundRTPPacketsRx=0)\n'
 }
 
+queue_m4_originate() {
+    local destination="$1"
+    local context="${2:-m4-wait}"
+    local extension="${3:-s}"
+    local action
+    local response
+    printf -v action 'Action: Originate\r\nActionID: m4-%s\r\nChannel: PJSIP/%s@%s:5060\r\nContext: %s\r\nExten: %s\r\nPriority: 1\r\nTimeout: 5000\r\nAsync: true\r\n\r\n' \
+        "$destination" "$destination" "$IMPAIRMENT_IP" "$context" "$extension"
+    response="$(ami_action "$action")"
+    grep -q 'Message: Originate successfully queued' <<<"$response" \
+        || fail "M4 Originate $destination was not queued: $response"
+}
+
+run_m4_dropped_200_case() {
+    local uuid
+    local hangup_observed_ms
+    printf '\nRunning M4 dropped-200 retransmission case through Contact proxy...\n'
+    set_impairment drop_first_invite_200
+    queue_m4_originate 9300
+    uuid="$(wait_for_fs_destination_uuid 9300)"
+    wait_for_impairment_counter fs_to_rustisk_response_200_INVITE 2 >/dev/null
+    wait_for_impairment_counter rustisk_to_fs_request_ACK 1 >/dev/null
+    [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" == "true" ]] \
+        || fail "FreeSWITCH call ended before the retransmitted 200 was ACKed"
+    assert_impairment_hashes_identical_minimum fs_to_rustisk 200 INVITE 2 \
+        | tee "$RUNTIME_DIR/m4-dropped-200-proof.txt"
+    wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "M4_DROPPED_200" "$hangup_observed_ms"
+    printf 'M4_DROPPED_200: PASS (FreeSWITCH retransmitted identical 200 and received ACK)\n'
+}
+
+run_m4_late_invite_replay_case() {
+    local originate_response
+    local uuid
+    local live_snapshot
+    local baseline_calls
+    local live_calls
+    local hangup_observed_ms
+    printf '\nRunning M4 late duplicate-INVITE replay case...\n'
+    set_impairment replay_invite_after_200
+    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9401@$IMPAIRMENT_IP:5060 &park()")"
+    uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$uuid" ]] || fail "M4 replay originate failed: $originate_response"
+    wait_for_impairment_counter rustisk_to_fs_response_200_INVITE 3 >/dev/null
+    assert_impairment_hash_count rustisk_to_fs 200 INVITE 3 \
+        | tee "$RUNTIME_DIR/m4-late-invite-replay-proof.txt"
+    live_snapshot="$(resource_snapshot)"
+    baseline_calls="${BASELINE_RESOURCES%%/*}"
+    live_calls="${live_snapshot%%/*}"
+    (( live_calls == baseline_calls + 1 )) \
+        || fail "late INVITEs created more than one call: baseline=$BASELINE_RESOURCES live=$live_snapshot"
+    [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" == "true" ]] \
+        || fail "FreeSWITCH did not retain the single established call"
+    fs_cli "uuid_kill $uuid NORMAL_CLEARING" >/dev/null
+    wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "M4_LATE_INVITE_REPLAY" "$hangup_observed_ms"
+    printf 'M4_LATE_INVITE_REPLAY: PASS (Identical200s=3 Calls=1)\n'
+}
+
+run_m4_dropped_ack_case() {
+    local originate_response
+    local uuid
+    printf '\nRunning M4 dropped-ACK Timer-H teardown case...\n'
+    set_impairment drop_all_ack
+    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9402@$IMPAIRMENT_IP:5060 &park()")"
+    uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$uuid" ]] || fail "M4 dropped-ACK originate failed: $originate_response"
+    wait_for_impairment_counter fs_to_rustisk_request_ACK 2 >/dev/null
+    wait_for_impairment_counter rustisk_to_fs_response_200_INVITE 2 >/dev/null
+    wait_for_resource_baseline_eventually "M4_DROPPED_ACK_TIMER_H"
+    fs_cli "uuid_kill $uuid NORMAL_CLEARING" >/dev/null 2>&1 || true
+    printf 'M4_DROPPED_ACK_TIMER_H: PASS (ACKsDropped=%s Retransmitted200s=%s)\n' \
+        "$(impairment_counter fs_to_rustisk_request_ACK)" \
+        "$(impairment_counter rustisk_to_fs_response_200_INVITE)"
+}
+
+run_m4_dropped_bye_case() {
+    local uuid
+    local hangup_observed_ms
+    printf '\nRunning M4 dropped-BYE retransmission case...\n'
+    set_impairment drop_first_bye
+    queue_m4_originate 9301
+    uuid="$(wait_for_fs_destination_uuid 9301)"
+    wait_for_impairment_counter rustisk_to_fs_request_BYE 2 >/dev/null
+    python3 - "$IMPAIRMENT_STATE" <<'PY' | tee "$RUNTIME_DIR/m4-dropped-bye-proof.txt"
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+events = [event for event in state["events"]
+          if event["direction"] == "rustisk_to_fs" and event["method"] == "BYE"]
+if len(events) < 2 or len({event["sha256"] for event in events}) != 1:
+    raise SystemExit(f"BYE was not retransmitted byte-identically: {events}")
+print(f"IdenticalBYEs={len(events)} SHA256={events[0]['sha256']}")
+PY
+    wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "M4_DROPPED_BYE" "$hangup_observed_ms"
+    printf 'M4_DROPPED_BYE: PASS (FreeSWITCH received retransmitted BYE)\n'
+}
+
+run_m4_provisional_silence_case() {
+    local originate_response
+    local outer_uuid
+    local inner_uuid
+    printf '\nRunning M4 180-then-silence Timer-B case...\n'
+    set_impairment none
+    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9403@$FS_HOST_IP:15060 &park()")"
+    outer_uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$outer_uuid" ]] || fail "M4 provisional originate failed: $originate_response"
+    inner_uuid="$(wait_for_fs_destination_uuid 9303)"
+    wait_for_impairment_counter fs_to_rustisk_response_180_INVITE 1 >/dev/null
+    wait_for_call_end_eventually "$outer_uuid"
+    wait_for_resource_baseline_eventually "M4_180_SILENCE_TIMER_B"
+    fs_cli "uuid_kill $inner_uuid NORMAL_CLEARING" >/dev/null 2>&1 || true
+    printf 'M4_180_SILENCE_TIMER_B: PASS (FreeSWITCH sent 180; Timer B ended caller)\n'
+}
+
+run_m4_forged_dialog_case() {
+    local originate_response
+    local uuid
+    local live_snapshot
+    local baseline_calls
+    local live_calls
+    local hangup_observed_ms
+    printf '\nRunning M4 allowed-source forged dialog identity case...\n'
+    set_impairment none
+    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9405@$IMPAIRMENT_IP:5060 &park()")"
+    uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$uuid" ]] || fail "M4 forged-dialog originate failed: $originate_response"
+    wait_for_impairment_counter fs_to_rustisk_request_ACK 1 >/dev/null
+    [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" == "true" ]] \
+        || fail "forged-dialog setup call was not established at FreeSWITCH"
+    set_impairment inject_forged true
+    wait_for_impairment_counter forged_injected 3 >/dev/null
+    sleep 0.3
+    [[ "$(fs_cli "uuid_exists $uuid" | tr -d '\r\n')" == "true" ]] \
+        || fail "forged Call-ID/tag/CSeq tore down the live FreeSWITCH call"
+    live_snapshot="$(resource_snapshot)"
+    baseline_calls="${BASELINE_RESOURCES%%/*}"
+    live_calls="${live_snapshot%%/*}"
+    (( live_calls == baseline_calls + 1 )) \
+        || fail "forged dialog requests corrupted live resources: $live_snapshot"
+    fs_cli "uuid_kill $uuid NORMAL_CLEARING" >/dev/null
+    wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "M4_FORGED_DIALOG" "$hangup_observed_ms"
+    printf 'M4_FORGED_DIALOG: PASS (AllowedSource=true ForgedCallIdTagCSeq=3 LiveCallPreserved=true)\n'
+}
+
+run_m4_concurrency_case() {
+    local index
+    local destination
+    local frequency
+    local uuid
+    local capture
+    local uuids=()
+    printf '\nRunning M4 10-way distinct-tone concurrency case...\n'
+    set_impairment none
+    for index in {0..9}; do
+        destination="$((9310 + index))"
+        queue_m4_originate "$destination" m4-concurrency "$index"
+    done
+    for index in {0..9}; do
+        destination="$((9310 + index))"
+        uuid="$(wait_for_fs_destination_uuid "$destination")"
+        uuids+=("$uuid")
+    done
+    for uuid in "${uuids[@]}"; do
+        wait_for_call_end "$uuid"
+    done
+    wait_for_resource_baseline_eventually "M4_CONCURRENCY_10"
+    for index in {0..9}; do
+        destination="$((9310 + index))"
+        frequency="$((400 + index * 50))"
+        capture="$RUNTIME_DIR/m4-$destination.wav"
+        docker cp "$FS_CONTAINER:/var/lib/freeswitch/recordings/m4-$destination.wav" \
+            "$capture" >/dev/null
+        python3 "$HARNESS_DIR/assert_tone.py" "$capture" "$frequency" \
+            | sed "s/^/M4_CONCURRENCY_$destination: /"
+    done | tee "$RUNTIME_DIR/m4-concurrency-tone-proof.txt"
+    printf 'M4_CONCURRENCY_10: PASS (Calls=10 DistinctReceiverTones=10)\n'
+}
+
+run_m4_abandon_200_race_case() {
+    local originate_response
+    local outer_uuid
+    local hangup_observed_ms
+    printf '\nRunning M4 CANCEL/200 crossing case...\n'
+    set_impairment hold_invite_200_until_cancel
+    originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9404@$FS_HOST_IP:15060 &park()")"
+    outer_uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$outer_uuid" ]] || fail "M4 abandon race originate failed: $originate_response"
+    wait_for_impairment_counter held_200_released_after_cancel 1 >/dev/null
+    wait_for_impairment_counter rustisk_to_fs_request_BYE 1 >/dev/null
+    python3 - "$IMPAIRMENT_STATE" <<'PY' | tee "$RUNTIME_DIR/m4-abandon-200-order-proof.txt"
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+methods = [event["method"] for event in state["events"]
+           if event["direction"] == "rustisk_to_fs" and event["method"] in ("CANCEL", "ACK", "BYE")]
+try:
+    positions = [methods.index(name) for name in ("CANCEL", "ACK", "BYE")]
+except ValueError as error:
+    raise SystemExit(f"missing crossing method: {methods}") from error
+if positions != sorted(positions):
+    raise SystemExit(f"crossing order was not CANCEL then ACK then BYE: {methods}")
+print(f"ReceiverMethodOrder={methods}")
+PY
+    wait_for_call_end "$outer_uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_resource_baseline "M4_ABANDON_200" "$hangup_observed_ms"
+    printf 'M4_ABANDON_200: PASS (FreeSWITCH observed CANCEL then ACK then BYE)\n'
+}
+
+run_m4_bye_final_failure_cases() {
+    local uuid
+    local hangup_observed_ms
+    printf '\nRunning M4 non-2xx BYE-final consumption case...\n'
+    set_impairment rewrite_bye_final_481
+    queue_m4_originate 9305
+    uuid="$(wait_for_fs_destination_uuid 9305)"
+    wait_for_call_end "$uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_impairment_counter fs_to_rustisk_response_200_BYE 1 >/dev/null
+    wait_for_resource_baseline "M4_BYE_FINAL_481" "$hangup_observed_ms"
+    grep -q '"action": "rewrite-481"' "$IMPAIRMENT_STATE" \
+        || fail "proxy did not rewrite the BYE final to 481"
+    printf 'M4_BYE_FINAL_481: PASS (ForwardedStatus=481)\n'
+
+    printf '\nRunning M4 dropped BYE-final Timer-F reaper case...\n'
+    set_impairment drop_all_bye_final
+    queue_m4_originate 9306
+    uuid="$(wait_for_fs_destination_uuid 9306)"
+    wait_for_call_end "$uuid"
+    wait_for_impairment_counter fs_to_rustisk_response_200_BYE 1 >/dev/null
+    wait_for_resource_baseline_eventually "M4_BYE_FINAL_DROPPED"
+    printf 'M4_BYE_FINAL_DROPPED: PASS (ResponsesDropped=%s TimerFReaped=true)\n' \
+        "$(impairment_counter fs_to_rustisk_response_200_BYE)"
+}
+
 require_command cargo
 require_command docker
 require_command python3
@@ -757,6 +1138,7 @@ sed 's/bindaddr = 127.0.0.1/bindaddr = 0.0.0.0/' \
     "$HARNESS_DIR/config/manager.conf" >"$CONFIG_DIR/manager.conf"
 sed \
     -e "s|@FS_CONTAINER_IP@|$FS_CONTAINER_IP|g" \
+    -e "s|@IMPAIRMENT_IP@|$IMPAIRMENT_IP|g" \
     -e "s|bind = 0.0.0.0:15060|bind = $FS_HOST_IP:15060|" \
     "$HARNESS_DIR/config/pjsip.conf" >"$CONFIG_DIR/pjsip.conf"
 cp "$HARNESS_DIR/config/rtp.conf" "$CONFIG_DIR/rtp.conf"
@@ -778,9 +1160,26 @@ docker run --rm --name "$FS_CONTAINER" \
 wait_for_freeswitch
 fs_cli "sofia global siptrace on" >/dev/null
 
+printf 'Starting deterministic on-path SIP impairment proxy...\n'
+docker run --rm --name "$IMPAIRMENT_CONTAINER" \
+    --network "$FS_NETWORK" \
+    --ip "$IMPAIRMENT_IP" \
+    --user "$(id -u):$(id -g)" \
+    --mount "type=bind,src=$HARNESS_DIR/sip_impairment_proxy.py,dst=/sip_impairment_proxy.py,readonly" \
+    --mount "type=bind,src=$RUNTIME_DIR,dst=/runtime" \
+    -d "$RUSTISK_IMAGE" python3 /sip_impairment_proxy.py \
+        --listen 0.0.0.0:5060 \
+        --freeswitch "$FS_CONTAINER_IP:5060" \
+        --rustisk "$FS_HOST_IP:15060" \
+        --proxy-host "$IMPAIRMENT_IP" \
+        --control /runtime/impairment-control.json \
+        --state /runtime/impairment-state.json >/dev/null
+set_impairment none
+
 sed \
     -e "s|@PROMPT_DIR@|$PROMPT_DIR|g" \
     -e "s|@FS_CONTAINER_IP@|$FS_CONTAINER_IP|g" \
+    -e "s|@IMPAIRMENT_IP@|$IMPAIRMENT_IP|g" \
     "$HARNESS_DIR/config/extensions.conf" >"$CONFIG_DIR/extensions.conf"
 
 printf 'Starting isolated rustisk...\n'
@@ -806,6 +1205,15 @@ run_outbound_listen_only_case
 run_dial_timeout_case
 run_m2_two_way_bye_case
 run_m2_deadline_silent_case
+run_m4_dropped_200_case
+run_m4_late_invite_replay_case
+run_m4_dropped_ack_case
+run_m4_dropped_bye_case
+run_m4_provisional_silence_case
+run_m4_forged_dialog_case
+run_m4_concurrency_case
+run_m4_abandon_200_race_case
+run_m4_bye_final_failure_cases
 
-printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN, M1, and M2 two-way acceptance.\n'
+printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN, M1, M2, and M4 impairment acceptance.\n'
 printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"

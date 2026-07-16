@@ -1958,6 +1958,7 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                 let event_rx = sip_stack.take_event_rx();
 
                 let sip_stack = Arc::new(sip_stack);
+                sip_driver_ref.set_stack(sip_stack.clone());
 
                 // Spawn the SIP stack event loop
                 let stack_clone = sip_stack.clone();
@@ -2069,8 +2070,20 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                         event_handler.handle_update(&request, remote_addr).await;
                                     }
                                 }
-                                asterisk_sip::stack::SipEvent::TransactionTimeout { branch } => {
+                                asterisk_sip::stack::SipEvent::TransactionTimeout {
+                                    branch,
+                                    call_id,
+                                    method,
+                                    client,
+                                } => {
                                     debug!("Transaction timed out: {}", branch);
+                                    if client {
+                                        if let (Some(call_id), Some(method)) = (call_id, method) {
+                                            event_handler.handle_client_transaction_timeout(
+                                                &call_id, method,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }

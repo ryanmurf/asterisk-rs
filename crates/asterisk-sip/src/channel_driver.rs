@@ -77,6 +77,10 @@ pub struct SipChannelDriver {
     channels: RwLock<HashMap<String, Arc<SipChannelPrivate>>>,
     /// SIP transport.
     transport: RwLock<Option<Arc<dyn SipTransport>>>,
+    /// Shared SIP stack for outbound client transactions. Startup attaches
+    /// this alongside the transport; driver-only tests retain the transport
+    /// fallback.
+    stack: RwLock<Option<Arc<crate::stack::SipStack>>>,
     /// Supported codecs.
     codecs: Vec<Codec>,
     /// Shared bounded allocator used by inbound and outbound RTP legs.
@@ -111,6 +115,7 @@ impl SipChannelDriver {
             local_addr,
             channels: RwLock::new(HashMap::new()),
             transport: RwLock::new(None),
+            stack: RwLock::new(None),
             codecs: vec![
                 codecs::pcmu(), codecs::pcma(), codecs::telephone_event(),
                 codecs::vp8(), codecs::h264(), codecs::vp9(), codecs::h265(),
@@ -180,6 +185,12 @@ impl SipChannelDriver {
     /// Set an externally-created transport (shared with the SIP stack).
     pub fn set_transport(&self, transport: Arc<dyn SipTransport>) {
         *self.transport.write() = Some(transport);
+    }
+
+    /// Attach the shared stack so outbound requests use RFC 3261 client
+    /// transactions and their retransmission/timeout timers.
+    pub fn set_stack(&self, stack: Arc<crate::stack::SipStack>) {
+        *self.stack.write() = Some(stack);
     }
 
     fn get_private(&self, name: &str) -> Option<Arc<SipChannelPrivate>> {
@@ -548,9 +559,17 @@ impl ChannelDriver for SipChannelDriver {
         // Preserve resolver ordering, but do not pin a call to one address if
         // the transport rejects it. The selected address becomes the dialog's
         // signalling peer for subsequent CANCEL/BYE requests.
+        let stack = self.stack.read().clone();
         let mut last_error = None;
         for remote_addr in &priv_data.remote_targets {
-            match priv_data.transport.send(&invite, *remote_addr).await {
+            let send_result = match &stack {
+                Some(stack) => stack
+                    .send_invite(invite.clone(), *remote_addr)
+                    .await
+                    .map(|_| ()),
+                None => priv_data.transport.send(&invite, *remote_addr).await,
+            };
+            match send_result {
                 Ok(()) => {
                     session.remote_addr = *remote_addr;
                     last_error = None;
@@ -654,7 +673,15 @@ impl ChannelDriver for SipChannelDriver {
 
         if session.state == SessionState::Established || session.state == SessionState::Early {
             if let Some(bye) = session.build_bye() {
-                let _ = priv_data.transport.send(&bye, session.remote_addr).await;
+                let stack = self.stack.read().clone();
+                match stack {
+                    Some(stack) => {
+                        let _ = stack.send_request(bye, session.remote_addr).await;
+                    }
+                    None => {
+                        let _ = priv_data.transport.send(&bye, session.remote_addr).await;
+                    }
+                }
             }
         }
 
