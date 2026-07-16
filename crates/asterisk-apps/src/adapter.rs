@@ -154,6 +154,7 @@ pub fn register_all_apps() {
     use crate::hangup::AppHangup;
     use crate::if_::{AppGotoIf, AppGotoIfTime, AppIf, AppElseIf, AppElse, AppEndIf};
     use crate::playback::AppPlayback;
+    use crate::pin_gate::AppPinGate;
     use crate::read::AppRead;
     use crate::set::{AppMSet, AppSet};
     use crate::stack::{AppGoSub, AppGoSubIf, AppReturn, AppStackPop};
@@ -265,6 +266,13 @@ pub fn register_all_apps() {
         "Read",
         "Read DTMF digits from the caller",
         |channel, args| Box::pin(AppRead::exec(channel, args)),
+    )));
+
+    // PinGate - sink-free DTMF collection and fail-closed absolute deadline.
+    APP_REGISTRY.register(Arc::new(AsyncAppAdapter::new(
+        "PinGate",
+        "Authenticate a caller without publishing entered digits",
+        |channel, args| Box::pin(AppPinGate::exec(channel, args)),
     )));
 
     // Echo - async exec (takes only channel, no args)
