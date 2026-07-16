@@ -22,8 +22,11 @@ AMI_HOST="$FS_HOST_IP"
 RUSTISK_PID=""
 BASELINE_RESOURCES=""
 BASELINE_TRANSACTIONS=""
+RTP_HELPER_LABEL="rustisk.m2.helper=$FS_CONTAINER"
 
 cleanup() {
+    docker ps -aq --filter "label=$RTP_HELPER_LABEL" \
+        | xargs -r docker rm -f >/dev/null 2>&1 || true
     if docker inspect "$RUSTISK_CONTAINER" >/dev/null 2>&1; then
         local rustisk_host_pid
         rustisk_host_pid="$(docker inspect -f '{{.State.Pid}}' "$RUSTISK_CONTAINER")"
@@ -62,6 +65,26 @@ require_command() {
 fs_cli() {
     docker exec "$FS_CONTAINER" fs_cli \
         -H 127.0.0.1 -P 8021 -p ClueCon -t 10000 -x "$1"
+}
+
+rtp_helper() {
+    docker run --rm \
+        --label "$RTP_HELPER_LABEL" \
+        --network "container:$FS_CONTAINER" \
+        --cap-add NET_RAW \
+        --mount "type=bind,src=$HARNESS_DIR/rtp_injector.py,dst=/rtp_injector.py,readonly" \
+        --mount "type=bind,src=$RUNTIME_DIR,dst=/runtime" \
+        "$RUSTISK_IMAGE" python3 /rtp_injector.py "$@"
+}
+
+rtp_sniffer() {
+    docker run --rm \
+        --label "$RTP_HELPER_LABEL" \
+        --network "container:$RUSTISK_CONTAINER" \
+        --cap-add NET_RAW \
+        --mount "type=bind,src=$HARNESS_DIR/rtp_injector.py,dst=/rtp_injector.py,readonly" \
+        --mount "type=bind,src=$RUNTIME_DIR,dst=/runtime" \
+        "$RUSTISK_IMAGE" python3 /rtp_injector.py "$@"
 }
 
 wait_for_freeswitch() {
@@ -222,6 +245,21 @@ wait_for_completed_stats() {
     fail "completed RTPStats record was not available for $channel: $response"
 }
 
+wait_for_active_stats() {
+    local channel="$1"
+    local response=""
+    for _ in {1..100}; do
+        response="$(ami_rtp_stats "$channel")"
+        if grep -q 'Message: RTP statistics' <<<"$response" \
+            && grep -q 'RTPActive: true' <<<"$response"; then
+            printf '%s\n' "$response"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "active RTPStats record was not available for $channel: $response"
+}
+
 stat_value() {
     local field="$1"
     local response="$2"
@@ -244,6 +282,153 @@ assert_counter_equals() {
     local value
     value="$(stat_value "$field" "$response")"
     [[ "$value" == "$expected" ]] || fail "$field must equal $expected, got ${value:-missing}"
+}
+
+assert_counter_delta() {
+    local field="$1"
+    local expected_delta="$2"
+    local before="$3"
+    local after="$4"
+    local before_value
+    local after_value
+    before_value="$(stat_value "$field" "$before")"
+    after_value="$(stat_value "$field" "$after")"
+    [[ "$before_value" =~ ^[0-9]+$ && "$after_value" =~ ^[0-9]+$ ]] \
+        || fail "$field missing from AMI RTPStats response"
+    (( after_value - before_value == expected_delta )) \
+        || fail "$field delta must equal $expected_delta, got $before_value->$after_value"
+}
+
+active_sip_channels() {
+    ami_action $'Action: CoreShowChannels\r\n\r\n' \
+        | awk -F ': ' '$1 == "Channel" { sub(/\r$/, "", $2); if ($2 ~ /^PJSIP\//) print $2 }'
+}
+
+wait_for_rustisk_bridge_channels() {
+    local outbound_destination="$1"
+    local channels=""
+    local inbound=""
+    local outbound=""
+    for _ in {1..100}; do
+        channels="$(active_sip_channels)"
+        inbound="$(grep '^PJSIP/fs-carrier-' <<<"$channels" | tail -n1 || true)"
+        outbound="$(grep "^PJSIP/$outbound_destination-" <<<"$channels" | tail -n1 || true)"
+        if [[ -n "$inbound" && -n "$outbound" ]]; then
+            printf '%s|%s\n' "$inbound" "$outbound"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "rustisk bridge channels did not appear for $outbound_destination: $channels"
+}
+
+wait_for_fs_destination_uuid() {
+    local destination="$1"
+    local response=""
+    local uuid=""
+    for _ in {1..100}; do
+        response="$(fs_cli 'show channels as csv')"
+        uuid="$(grep "$destination" <<<"$response" \
+            | grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' | head -n1 || true)"
+        if [[ -n "$uuid" ]]; then
+            printf '%s\n' "$uuid"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "FreeSWITCH destination $destination did not appear: $response"
+}
+
+fs_channel_var() {
+    local uuid="$1"
+    local variable="$2"
+    fs_cli "uuid_getvar $uuid $variable" | tr -d '\r\n'
+}
+
+wait_for_fs_channel_var() {
+    local uuid="$1"
+    local variable="$2"
+    local expected="$3"
+    local value=""
+    for _ in {1..100}; do
+        value="$(fs_channel_var "$uuid" "$variable")"
+        if [[ "$value" == "$expected" ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "FreeSWITCH $variable on $uuid must equal $expected, got $value"
+}
+
+assert_accepted_media_unchanged() {
+    local before="$1"
+    local after="$2"
+    local field
+    for field in RTPPacketsRx RTPOctetsRx RTPVoiceFramesRx RTPDTMFDigitsRx; do
+        assert_counter_delta "$field" 0 "$before" "$after"
+    done
+}
+
+assert_media_quiet() {
+    local label="$1"
+    local inbound_channel="$2"
+    local outbound_channel="$3"
+    local inbound_before
+    local inbound_after
+    local outbound_before
+    local outbound_after
+    inbound_before="$(wait_for_active_stats "$inbound_channel")"
+    outbound_before="$(wait_for_active_stats "$outbound_channel")"
+    sleep 0.3
+    inbound_after="$(wait_for_active_stats "$inbound_channel")"
+    outbound_after="$(wait_for_active_stats "$outbound_channel")"
+    assert_accepted_media_unchanged "$inbound_before" "$inbound_after"
+    assert_accepted_media_unchanged "$outbound_before" "$outbound_after"
+    printf '%s: BothRtpSourcesSilent=true AcceptedMediaStable=true\n' "$label"
+}
+
+assert_hostile_injection() {
+    local kind="$1"
+    local expected_field="$2"
+    local channel="$3"
+    local source_port="$4"
+    local destination_port="$5"
+    local payload_type="$6"
+    local sequence="$7"
+    local timestamp="$8"
+    local ssrc="$9"
+    local before
+    local after
+    local before_remote
+    local field
+    local output
+    before="$(wait_for_active_stats "$channel")"
+    before_remote="$(stat_value RTPRemoteAddress "$before")"
+    output="$(rtp_helper inject \
+        --kind "$kind" \
+        --source-ip "$FS_CONTAINER_IP" \
+        --source-port "$source_port" \
+        --destination-ip "$FS_HOST_IP" \
+        --destination-port "$destination_port" \
+        --payload-type "$payload_type" \
+        --sequence "$sequence" \
+        --timestamp "$timestamp" \
+        --ssrc "$ssrc")"
+    sleep 0.1
+    after="$(wait_for_active_stats "$channel")"
+    assert_accepted_media_unchanged "$before" "$after"
+    for field in RTPDiscardWrongSource RTPDiscardWrongPayloadType RTPDiscardMalformed RTPDiscardUnstableSSRC; do
+        if [[ "$field" == "$expected_field" ]]; then
+            assert_counter_delta "$field" 1 "$before" "$after"
+        else
+            assert_counter_delta "$field" 0 "$before" "$after"
+        fi
+    done
+    [[ "$(stat_value RTPRemoteAddress "$after")" == "$before_remote" ]] \
+        || fail "$kind injection repointed RTP remote: $before_remote -> $(stat_value RTPRemoteAddress "$after")"
+    printf 'INGRESS_%s: PASS (%s; %s +1; accepted media unchanged; Remote=%s)\n' \
+        "${kind^^}" "$output" "$expected_field" "$before_remote"
 }
 
 wait_for_call_end() {
@@ -379,6 +564,167 @@ run_dial_timeout_case() {
         "$((after_cancel_count - before_cancel_count))"
 }
 
+run_m2_two_way_bye_case() {
+    local originate_response
+    local a_uuid
+    local b_uuid
+    local channels
+    local inbound_channel
+    local outbound_channel
+    local a_source_port
+    local a_destination_port
+    local negotiated_remote
+    local sniff_pid
+    local metadata_file="$RUNTIME_DIR/m2-a-rtp-metadata.json"
+    local sniffer_ready="$RUNTIME_DIR/m2-sniffer-ready"
+    local metadata
+    local payload_type
+    local sequence
+    local timestamp
+    local ssrc
+    local pattern_output
+    local inbound_stats
+    local outbound_stats
+    local hangup_observed_ms
+    local a_capture_remote="/var/lib/freeswitch/recordings/m2-a-capture.wav"
+    local a_capture="$RUNTIME_DIR/m2-a-capture.wav"
+    local b_capture="$RUNTIME_DIR/m2-b-capture.wav"
+
+    printf '\nRunning M2 two-way receiver, ingress hygiene, and BYE-silent teardown case...\n'
+    if ! originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9200@$FS_HOST_IP:15060 &park()" 2>&1)"; then
+        fail "FreeSWITCH M2 originate failed: $originate_response"
+    fi
+    a_uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$a_uuid" ]] || fail "FreeSWITCH M2 originate failed: $originate_response"
+    b_uuid="$(wait_for_fs_destination_uuid 9201)"
+    channels="$(wait_for_rustisk_bridge_channels "9201@$FS_CONTAINER_IP:5060")"
+    IFS='|' read -r inbound_channel outbound_channel <<<"$channels"
+    wait_for_active_stats "$inbound_channel" >/dev/null
+    wait_for_active_stats "$outbound_channel" >/dev/null
+
+    fs_cli "uuid_record $a_uuid start $a_capture_remote" >/dev/null
+    a_source_port="$(fs_channel_var "$a_uuid" local_media_port)"
+    a_destination_port="$(fs_channel_var "$a_uuid" remote_media_port)"
+    [[ "$a_source_port" =~ ^[0-9]+$ && "$a_destination_port" =~ ^[0-9]+$ ]] \
+        || fail "FreeSWITCH did not expose A RTP ports: local=$a_source_port remote=$a_destination_port"
+    negotiated_remote="$(stat_value RTPRemoteAddress "$(wait_for_active_stats "$inbound_channel")")"
+    [[ "$negotiated_remote" == "$FS_CONTAINER_IP:$a_source_port" ]] \
+        || fail "inbound negotiated remote mismatch: expected=$FS_CONTAINER_IP:$a_source_port actual=$negotiated_remote"
+
+    rm -f "$sniffer_ready"
+    rtp_sniffer sniff \
+        --source-ip "$FS_CONTAINER_IP" \
+        --source-port "$a_source_port" \
+        --destination-ip "$FS_HOST_IP" \
+        --destination-port "$a_destination_port" \
+        --ready-file /runtime/m2-sniffer-ready \
+        --timeout 5 >"$metadata_file" &
+    sniff_pid=$!
+    for _ in {1..100}; do
+        [[ -f "$sniffer_ready" ]] && break
+        sleep 0.05
+    done
+    [[ -f "$sniffer_ready" ]] || fail "RTP sniffer did not become ready"
+    fs_cli "uuid_broadcast $a_uuid tone_stream://%(1000,0,440) aleg" >/dev/null
+    wait "$sniff_pid" || fail "RTP sniffer did not observe A's negotiated source"
+    sleep 1.2
+    fs_cli "uuid_broadcast $b_uuid tone_stream://%(1000,0,660) aleg" >/dev/null
+    sleep 1.2
+    fs_cli "uuid_send_dtmf $a_uuid 7@200" >/dev/null
+    wait_for_fs_channel_var "$b_uuid" M2DecodedDigit 7 >/dev/null
+    wait_for_fs_channel_var "$b_uuid" RTPDTMFDigitsRx 1 >/dev/null
+    printf 'M2_DTMF_A_TO_B: PASS (FreeSWITCH-B RTPDTMFDigitsRx=1 Digit=7)\n'
+    sleep 0.5
+
+    metadata="$(<"$metadata_file")"
+    payload_type="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["payload_type"])' <<<"$metadata")"
+    sequence="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sequence"])' <<<"$metadata")"
+    timestamp="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["timestamp"])' <<<"$metadata")"
+    ssrc="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ssrc"])' <<<"$metadata")"
+    sequence="$(((sequence + 200) & 65535))"
+    timestamp="$(((timestamp + 32000) & 4294967295))"
+
+    assert_media_quiet "M2_PRE_INJECTION" "$inbound_channel" "$outbound_channel"
+    assert_hostile_injection wrong-source RTPDiscardWrongSource \
+        "$inbound_channel" "$a_source_port" "$a_destination_port" \
+        "$payload_type" "$sequence" "$timestamp" "$ssrc"
+    assert_hostile_injection wrong-pt RTPDiscardWrongPayloadType \
+        "$inbound_channel" "$a_source_port" "$a_destination_port" \
+        "$payload_type" "$((sequence + 1))" "$((timestamp + 160))" "$ssrc"
+    assert_hostile_injection malformed RTPDiscardMalformed \
+        "$inbound_channel" "$a_source_port" "$a_destination_port" \
+        "$payload_type" "$((sequence + 2))" "$((timestamp + 320))" "$ssrc"
+    assert_hostile_injection unstable-ssrc RTPDiscardUnstableSSRC \
+        "$inbound_channel" "$a_source_port" "$a_destination_port" \
+        "$payload_type" "$((sequence + 3))" "$((timestamp + 480))" "$ssrc"
+
+    pattern_output="$(rtp_helper pattern \
+        --source-ip "$FS_CONTAINER_IP" \
+        --source-port "$a_source_port" \
+        --destination-ip "$FS_HOST_IP" \
+        --destination-port "$a_destination_port" \
+        --payload-type "$payload_type" \
+        --sequence "$((sequence + 20))" \
+        --timestamp "$((timestamp + 3200))" \
+        --ssrc "$ssrc")"
+    printf 'M2_PATTERN_INJECTION: %s\n' "$pattern_output"
+    sleep 0.8
+    assert_media_quiet "M2_BYE" "$inbound_channel" "$outbound_channel"
+    fs_cli "uuid_kill $a_uuid NORMAL_CLEARING" >/dev/null
+    wait_for_call_end "$a_uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_call_end "$b_uuid"
+    wait_for_resource_baseline "M2_BYE_SILENT" "$hangup_observed_ms"
+
+    inbound_stats="$(wait_for_completed_stats "$inbound_channel")"
+    outbound_stats="$(wait_for_completed_stats "$outbound_channel")"
+    printf '%s\n' "$inbound_stats" >"$RUNTIME_DIR/m2-inbound-rtp-stats.txt"
+    printf '%s\n' "$outbound_stats" >"$RUNTIME_DIR/m2-outbound-rtp-stats.txt"
+    assert_positive_counter RTPVoiceFramesRx "$inbound_stats"
+    assert_positive_counter RTPVoiceFramesRx "$outbound_stats"
+
+    docker cp "$FS_CONTAINER:$a_capture_remote" "$a_capture" >/dev/null
+    docker cp "$FS_CONTAINER:/var/lib/freeswitch/recordings/m2-b-capture.wav" "$b_capture" >/dev/null
+    python3 "$HARNESS_DIR/assert_tone.py" "$b_capture" 440 \
+        | sed 's/^/M2_A_TO_B: /' | tee "$RUNTIME_DIR/m2-a-to-b-tone-proof.txt"
+    python3 "$HARNESS_DIR/assert_tone.py" "$a_capture" 660 \
+        | sed 's/^/M2_B_TO_A: /' | tee "$RUNTIME_DIR/m2-b-to-a-tone-proof.txt"
+    python3 "$HARNESS_DIR/assert_recovered_pattern.py" "$b_capture" \
+        | tee "$RUNTIME_DIR/m2-recovered-pattern-proof.txt"
+    printf 'M2_TWO_WAY_BYE: PASS (AReceiver=%s BReceiver=%s)\n' "$a_capture" "$b_capture"
+}
+
+run_m2_deadline_silent_case() {
+    local originate_response
+    local a_uuid
+    local b_uuid
+    local channels
+    local inbound_channel
+    local outbound_channel
+    local inbound_stats
+    local outbound_stats
+    local hangup_observed_ms
+
+    printf '\nRunning M2 absolute-deadline teardown with both RTP sources silent...\n'
+    if ! originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9202@$FS_HOST_IP:15060 &park()" 2>&1)"; then
+        fail "FreeSWITCH M2 deadline originate failed: $originate_response"
+    fi
+    a_uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$a_uuid" ]] || fail "FreeSWITCH M2 deadline originate failed: $originate_response"
+    b_uuid="$(wait_for_fs_destination_uuid 9203)"
+    channels="$(wait_for_rustisk_bridge_channels "9203@$FS_CONTAINER_IP:5060")"
+    IFS='|' read -r inbound_channel outbound_channel <<<"$channels"
+    wait_for_call_end "$a_uuid"
+    hangup_observed_ms="$(now_ms)"
+    wait_for_call_end "$b_uuid"
+    wait_for_resource_baseline "M2_DEADLINE_SILENT" "$hangup_observed_ms"
+    inbound_stats="$(wait_for_completed_stats "$inbound_channel")"
+    outbound_stats="$(wait_for_completed_stats "$outbound_channel")"
+    assert_counter_equals RTPPacketsRx 0 "$inbound_stats"
+    assert_counter_equals RTPPacketsRx 0 "$outbound_stats"
+    printf 'M2_DEADLINE_SILENT: PASS (InboundRTPPacketsRx=0 OutboundRTPPacketsRx=0)\n'
+}
+
 require_command cargo
 require_command docker
 require_command python3
@@ -458,6 +804,8 @@ run_case 1 123456 GRANTED
 run_case 2 123450 REJECTED
 run_outbound_listen_only_case
 run_dial_timeout_case
+run_m2_two_way_bye_case
+run_m2_deadline_silent_case
 
-printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN and M1 outbound acceptance.\n'
+printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN, M1, and M2 two-way acceptance.\n'
 printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"

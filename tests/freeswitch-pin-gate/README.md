@@ -52,6 +52,30 @@ The M1 outbound checks are deliberately asymmetric:
   client/server transaction-map sizes. Every case must return all four to the
   exact pre-test baseline after any RFC 3261 UDP absorption timer expires.
 
+The M2 case establishes two FreeSWITCH channels on opposite sides of a real
+rustisk `Dial()` bridge and records both of them. It injects 440 Hz on A and
+requires it in B's capture, injects 660 Hz on B and requires it in A's capture,
+and sends one RFC 4733 digit on A that FreeSWITCH B must decode into its
+`RTPDTMFDigitsRx` dialplan variable. A transmit counter or non-empty recording
+cannot satisfy any of those assertions.
+
+The same live call supplies the M2 ingress-hygiene and reorder proof. A helper
+shares the isolated FreeSWITCH network namespace to send wrong-source,
+wrong-payload-type, malformed, and unstable-SSRC datagrams to the negotiated
+rustisk RTP port. Each injection must increment only its named discard counter,
+leave all accepted-media counters unchanged, and leave `RTPRemoteAddress`
+pointing at the SDP-negotiated FreeSWITCH address. A deterministic PCMU stream
+then carries a marker plus a four-frequency audio sequence with a gap, a
+duplicate, and swapped packet pairs. The far-side FreeSWITCH WAV must recover
+at least 44 of 47 ordered audio frames; the passing proof currently reports
+all 47.
+
+Finally, the harness proves pump cancellation with both sources silent for two
+independent teardown paths: a receiver-originated BYE and the absolute `Dial()`
+media deadline. Both must restore the five resource maps to the exact
+`0/0/0/0/0` baseline within two seconds. The deadline case additionally
+requires zero accepted RTP packets on both completed rustisk legs.
+
 [RFC 3551]: https://www.rfc-editor.org/info/rfc3551/
 [RFC 4733]: https://www.rfc-editor.org/info/rfc4733/
 [FreeSWITCH's documented default]: https://developer.signalwire.com/freeswitch/reference/channel-variables/#dtmf
