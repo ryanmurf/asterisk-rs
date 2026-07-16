@@ -685,10 +685,20 @@ fn handle_originate(
             }
         };
 
-        // PBX execution changes channel state, but technology teardown is the
-        // driver's responsibility. Without this call a direct PJSIP Originate
-        // leaves its dialog/RTP entry alive and never sends BYE.
-        {
+        // Direct PJSIP Originate teardown keeps the event handler's dialog as
+        // the CSeq authority and retains only signaling state until a BYE
+        // final (or Timer F). Other technologies use their driver teardown.
+        let pjsip_signaling_retained = if tech.eq_ignore_ascii_case("PJSIP") {
+            if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                handler.finish_outbound_originate(&chan_name).await;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !pjsip_signaling_retained {
             let mut ch = pbx_channel.lock().await;
             if let Err(error) = driver.hangup(&mut ch).await {
                 warn!("Originate: driver.hangup() failed for {}: {}", chan_name, error);
@@ -701,7 +711,9 @@ fn handle_originate(
                 .with_header("Uniqueid", &chan_uid),
         );
 
-        release_originate_leg(&tech, &chan_name, &chan_uid);
+        if !pjsip_signaling_retained {
+            release_originate_leg(&tech, &chan_name, &chan_uid);
+        }
     });
 
     AmiResponse::success("Originate successfully queued")

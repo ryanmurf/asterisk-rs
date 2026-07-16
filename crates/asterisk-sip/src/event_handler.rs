@@ -47,6 +47,12 @@ const ABANDONED_SIGNALING_GRACE: std::time::Duration =
 #[cfg(test)]
 const ABANDONED_SIGNALING_GRACE: std::time::Duration =
     std::time::Duration::from_millis(50);
+#[cfg(not(test))]
+const OUTBOUND_BYE_SIGNALING_GRACE: std::time::Duration =
+    crate::transaction::timers::TIMER_F;
+#[cfg(test)]
+const OUTBOUND_BYE_SIGNALING_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 /// Exact live-resource counts for SIP call teardown verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +165,20 @@ impl SipEventHandler {
         match self.stack.get() {
             Some(stack) => stack.send_response(response.clone(), remote_addr).await,
             None => self.transport.send(response, remote_addr).await,
+        }
+    }
+
+    /// Send a dialog request through the non-INVITE client transaction when
+    /// the production stack is attached. Handler-only tests retain their
+    /// transport fallback.
+    async fn send_client_request(
+        &self,
+        request: SipMessage,
+        remote_addr: SocketAddr,
+    ) -> Result<(), crate::transport::TransportError> {
+        match self.stack.get() {
+            Some(stack) => stack.send_request(request, remote_addr).await.map(|_| ()),
+            None => self.transport.send(&request, remote_addr).await,
         }
     }
 
@@ -1045,7 +1065,7 @@ impl SipEventHandler {
         // per-call cleanup task observes the removed state and releases its
         // store channel, driver entry, and RTP reservation on its next poll
         // instead of idling for the full 32-second stale-dialog deadline.
-        if (200..300).contains(&status_code) && cseq_method == "BYE" {
+        if status_code >= 200 && cseq_method == "BYE" {
             self.call_states.write().remove(&call_id);
             self.callid_map.write().remove(&call_id);
             debug!(call_id = %call_id, status_code, "BYE transaction completed");
@@ -1687,6 +1707,77 @@ impl SipEventHandler {
         // cleared and the driver channel entry + its bound socket leaked for
         // the lifetime of the process (issue #28).
         self.release_outbound_leg(channel_name);
+    }
+
+    /// Finish a direct outbound Originate while retaining only the signaling
+    /// state needed to consume the BYE final response.
+    ///
+    /// The event-handler session is authoritative for dialog CSeq. Building
+    /// the BYE here keeps response validation aligned, while media, store, and
+    /// NOTIFY resources are released immediately. A lost final is bounded by
+    /// Timer F instead of stranding the two signaling maps indefinitely.
+    pub async fn finish_outbound_originate(&self, channel_name: &str) {
+        let call_id = {
+            let map = self.callid_map.read();
+            map.iter().find(|(_, name)| name.as_str() == channel_name)
+                .map(|(call_id, _)| call_id.clone())
+        };
+        let Some(call_id) = call_id else {
+            self.release_outbound_leg(channel_name);
+            return;
+        };
+        let call_state = {
+            let states = self.call_states.read();
+            states.get(&call_id).cloned()
+        };
+        let Some(call_state) = call_state else {
+            self.release_outbound_leg(channel_name);
+            return;
+        };
+
+        let sent_bye = {
+            let mut state = call_state.lock().await;
+            match state.session.build_bye() {
+                Some(bye) => {
+                    if let Err(error) = self.send_client_request(bye, state.remote_addr).await {
+                        warn!(call_id = %call_id, channel = channel_name, %error,
+                            "Failed to send BYE for completed Originate");
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+
+        if !sent_bye {
+            self.release_outbound_leg(channel_name);
+            return;
+        }
+
+        self.release_outbound_media(channel_name);
+        self.schedule_outbound_bye_signaling_reap(call_id, call_state);
+    }
+
+    fn schedule_outbound_bye_signaling_reap(
+        &self,
+        call_id: String,
+        call_state: Arc<tokio::sync::Mutex<CallState>>,
+    ) {
+        let callid_map = self.callid_map.clone();
+        let call_states = self.call_states.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(OUTBOUND_BYE_SIGNALING_GRACE).await;
+            let still_current = call_states
+                .read()
+                .get(&call_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &call_state));
+            if still_current {
+                call_states.write().remove(&call_id);
+                callid_map.write().remove(&call_id);
+                debug!(call_id = %call_id,
+                    "Reaped outbound BYE signaling state after Timer F");
+            }
+        });
     }
 
     /// Put the correct SIP request on the wire for an abandoned outbound Dial
@@ -2527,11 +2618,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bye_2xx_removes_call_maps_without_waiting_for_dialog_timeout() {
+    async fn every_bye_final_removes_call_maps_without_waiting_for_timer_f() {
         let (_driver, handler) = driver_and_handler().await;
         let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
-        let channel_name = "PJSIP/bye-final-00000001";
-        let mut session = SipSession::new_outbound("127.0.0.1:5061".parse().unwrap(), remote);
+        for (index, status, reason) in [
+            (1, 200, "OK"),
+            (2, 408, "Request Timeout"),
+            (3, 481, "Call/Transaction Does Not Exist"),
+        ] {
+            let channel_name = format!("PJSIP/bye-final-{index:08}");
+            let mut session = SipSession::new_outbound(
+                "127.0.0.1:5061".parse().unwrap(), remote,
+            );
+            let invite = session.build_invite("sip:peer@127.0.0.1:5060");
+            let mut answer = invite.create_response(200, "OK").unwrap();
+            answer
+                .headers
+                .iter_mut()
+                .find(|header| header.name.eq_ignore_ascii_case("To"))
+                .unwrap()
+                .value
+                .push_str(";tag=remote");
+            answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
+            session.on_response(&answer);
+            let call_id = session.call_id.clone();
+            let bye = session.build_bye().unwrap();
+            let response = bye.create_response(status, reason).unwrap();
+            handler.register_outbound_callid(&call_id, &channel_name);
+            handler.register_outbound_session(
+                &call_id, &channel_name, session, remote,
+            );
+            assert_eq!(handler.active_calls(), 1);
+            assert_eq!(handler.call_states.read().len(), 1);
+            handler.handle_response(&response, remote).await;
+
+            assert_eq!(handler.active_calls(), 0,
+                "Call-ID map must clear immediately for BYE status {status}");
+            assert_eq!(handler.call_states.read().len(), 0,
+                "call state must clear immediately for BYE status {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_originate_bye_has_bounded_signaling_fallback() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        );
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut session = SipSession::new_outbound(transport.local_addr, remote);
         let invite = session.build_invite("sip:peer@127.0.0.1:5060");
         let mut answer = invite.create_response(200, "OK").unwrap();
         answer
@@ -2544,17 +2679,21 @@ mod tests {
         answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
         session.on_response(&answer);
         let call_id = session.call_id.clone();
-        let bye = session.build_bye().unwrap();
-        let response = bye.create_response(200, "OK").unwrap();
+        let channel_name = "PJSIP/originate-bye-fallback";
         handler.register_outbound_callid(&call_id, channel_name);
-        handler.register_outbound_session(&call_id, channel_name, session, remote);
-        assert_eq!(handler.active_calls(), 1);
-        assert_eq!(handler.call_states.read().len(), 1);
-        handler.handle_response(&response, remote).await;
+        handler.register_outbound_session(
+            &call_id, channel_name, session, remote,
+        );
 
-        assert_eq!(handler.active_calls(), 0, "Call-ID map must clear immediately");
-        assert_eq!(handler.call_states.read().len(), 0,
-            "per-call state must clear immediately");
+        handler.finish_outbound_originate(channel_name).await;
+        assert_eq!(transport.methods(), vec![crate::parser::SipMethod::Bye]);
+        assert_eq!(handler.active_calls(), 1,
+            "only signaling routing is retained until a final or Timer F");
+        assert_eq!(handler.call_states.read().len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(handler.call_states.read().len(), 0);
     }
 
     fn outbound_session_ready_for_cancel(
