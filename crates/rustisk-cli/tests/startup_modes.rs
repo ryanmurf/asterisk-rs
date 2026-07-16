@@ -24,6 +24,7 @@ fn lock_cli_tests() -> MutexGuard<'static, ()> {
 
 struct Fixture {
     root: PathBuf,
+    config_dir: PathBuf,
     config_file: PathBuf,
     run_dir: PathBuf,
 }
@@ -74,9 +75,17 @@ impl Fixture {
             "[general]\nenabled = yes\nbindaddr = 127.0.0.1\nport = 0\n\n[admin]\nsecret = admin\n",
         )
         .unwrap();
+        let secret_file = root.join("pin-secret");
+        fs::write(&secret_file, "246810\n").unwrap();
+        fs::write(
+            config_dir.join("pin_gate.conf"),
+            format!("[general]\nsecret_file = {}\n", secret_file.display()),
+        )
+        .unwrap();
 
         Self {
             root,
+            config_dir,
             config_file,
             run_dir,
         }
@@ -85,6 +94,73 @@ impl Fixture {
     fn socket_path(&self) -> PathBuf {
         self.run_dir.join("asterisk.ctl")
     }
+}
+
+#[test]
+fn missing_mounted_pin_secret_fails_before_fully_booted() {
+    let _guard = lock_cli_tests();
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("pin-secret")).unwrap();
+
+    let output = run_asterisk(&fixture, &["-f"], None, Duration::from_secs(10));
+
+    assert!(!output.timed_out, "{}", output.combined());
+    assert!(!output.status.success(), "{}", output.combined());
+    assert!(
+        output.combined().contains("required mounted PIN secret file"),
+        "{}",
+        output.combined()
+    );
+    assert!(
+        !output.combined().contains("Rustisk is fully booted"),
+        "{}",
+        output.combined()
+    );
+}
+
+#[test]
+fn invalid_mounted_pin_secret_fails_before_fully_booted() {
+    let _guard = lock_cli_tests();
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("pin-secret"), "invalid\n").unwrap();
+
+    let output = run_asterisk(&fixture, &["-f"], None, Duration::from_secs(10));
+
+    assert!(!output.timed_out, "{}", output.combined());
+    assert!(!output.status.success(), "{}", output.combined());
+    assert!(
+        output
+            .combined()
+            .contains("mounted PIN secret file is not a valid six-digit secret"),
+        "{}",
+        output.combined()
+    );
+    assert!(
+        !output.combined().contains("Rustisk is fully booted"),
+        "{}",
+        output.combined()
+    );
+}
+
+#[test]
+fn inline_pin_secret_configuration_is_rejected() {
+    let _guard = lock_cli_tests();
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.config_dir.join("pin_gate.conf"),
+        "[general]\nsecret = 246810\n",
+    )
+    .unwrap();
+
+    let output = run_asterisk(&fixture, &["-f"], None, Duration::from_secs(10));
+
+    assert!(!output.timed_out, "{}", output.combined());
+    assert!(!output.status.success(), "{}", output.combined());
+    assert!(
+        output.combined().contains("inline secrets are forbidden"),
+        "{}",
+        output.combined()
+    );
 }
 
 impl Drop for Fixture {

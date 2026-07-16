@@ -1698,6 +1698,80 @@ fn reload_dialplan(config_dir: &str) -> Vec<String> {
     output
 }
 
+/// Load the PIN from the file named by `pin_gate.conf`.
+///
+/// The configuration contains only a path. The secret value is accepted from
+/// no command-line flag, environment variable, or ordinary configuration key.
+fn load_pin_gate_secret(config_dir: &str) -> Result<asterisk_apps::pin_gate::PinSecret, String> {
+    let config_path = std::path::Path::new(config_dir).join("pin_gate.conf");
+    let content = std::fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "required PIN gate configuration {} is unavailable: {error}",
+            config_path.display()
+        )
+    })?;
+
+    let mut in_general = false;
+    let mut secret_file = None;
+    for raw_line in content.lines() {
+        let line = raw_line
+            .split_once(';')
+            .map_or(raw_line, |(before, _)| before)
+            .trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_general = line[1..line.len() - 1]
+                .trim()
+                .eq_ignore_ascii_case("general");
+            continue;
+        }
+        if !in_general {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "invalid entry in {}: expected key=value",
+                config_path.display()
+            ));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("secret_file") {
+            if secret_file.replace(value.to_string()).is_some() {
+                return Err("pin_gate.conf contains duplicate secret_file entries".to_string());
+            }
+        } else if key.eq_ignore_ascii_case("secret") || key.eq_ignore_ascii_case("pin") {
+            return Err(
+                "pin_gate.conf must name a mounted secret_file; inline secrets are forbidden"
+                    .to_string(),
+            );
+        }
+    }
+
+    let secret_file = secret_file
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "pin_gate.conf requires [general] secret_file".to_string())?;
+    let secret_path = std::path::Path::new(&secret_file);
+    if !secret_path.is_absolute() {
+        return Err("pin_gate.conf secret_file must be an absolute mounted-file path".to_string());
+    }
+    let metadata = std::fs::metadata(secret_path).map_err(|error| {
+        format!(
+            "required mounted PIN secret file {} is unavailable: {error}",
+            secret_path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > 8 {
+        return Err("mounted PIN secret file is not a valid six-digit secret".to_string());
+    }
+    let bytes = std::fs::read(secret_path)
+        .map_err(|error| format!("could not read mounted PIN secret file: {error}"))?;
+    asterisk_apps::pin_gate::PinSecret::parse(bytes)
+        .map_err(|_| "mounted PIN secret file is not a valid six-digit secret".to_string())
+}
+
 /// Parse pjsip_notify.conf content into notify templates.
 ///
 /// Format:
@@ -1754,6 +1828,10 @@ fn load_pjsip_notify_config(content: &str, config: &asterisk_sip::notify::Notify
 /// Perform the startup sequence.
 async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), String> {
     info!("Loading configuration from: {}", config_dir);
+
+    let pin_secret = load_pin_gate_secret(config_dir)?;
+    asterisk_apps::pin_gate::install_pin_secret(pin_secret)?;
+    info!("Loaded PIN gate secret from required mounted file");
 
     // Create module stubs (item 4)
     create_module_stubs(&dirs.mod_dir);
