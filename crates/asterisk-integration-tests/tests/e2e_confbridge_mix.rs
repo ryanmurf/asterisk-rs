@@ -125,12 +125,12 @@ fn invite_request(leg: &str, call_id: &str, sdp: &str, auth: &str) -> SipMessage
 }
 
 /// Build a raw BYE for one leg's dialog (matched by Call-ID).
-fn bye_request(leg: &str, call_id: &str) -> SipMessage {
+fn bye_request(leg: &str, call_id: &str, local_tag: &str) -> SipMessage {
     let raw = format!(
         "BYE sip:{CONF_EXTEN}@127.0.0.1 SIP/2.0\r\n\
          Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bKbye{leg}\r\n\
          From: <sip:{USER}@127.0.0.1>;tag=leg-{leg}\r\n\
-         To: <sip:{CONF_EXTEN}@127.0.0.1>;tag=as\r\n\
+         To: <sip:{CONF_EXTEN}@127.0.0.1>;tag={local_tag}\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: 2 BYE\r\n\
          Content-Length: 0\r\n\r\n"
@@ -230,6 +230,7 @@ struct Leg {
     sip_addr: SocketAddr,
     rtp: Arc<UdpSocket>,
     call_id: String,
+    local_tag: String,
     /// The conference-side RTP address this leg sends to (from the answer).
     media_addr: SocketAddr,
 }
@@ -343,6 +344,10 @@ async fn e2e_three_leg_confbridge_mixing() {
             .await
             .unwrap_or_else(|| panic!("leg {name}: expected 200 OK with SDP answer"));
         let answer = SessionDescription::parse(&ok.body).expect("answer SDP must parse");
+        let local_tag = ok
+            .to_header()
+            .and_then(asterisk_sip::parser::extract_tag)
+            .expect("200 OK must establish a local dialog tag");
         let audio = answer
             .media_descriptions
             .iter()
@@ -358,6 +363,7 @@ async fn e2e_three_leg_confbridge_mixing() {
             sip_addr,
             rtp,
             call_id,
+            local_tag,
             media_addr,
         });
     }
@@ -423,7 +429,10 @@ async fn e2e_three_leg_confbridge_mixing() {
     // ---- Phase 2: A hangs up; B and C must keep passing audio -----------
     send_a.abort();
     handler
-        .handle_bye(&bye_request("a", &legs[0].call_id), legs[0].sip_addr)
+        .handle_bye(
+            &bye_request("a", &legs[0].call_id, &legs[0].local_tag),
+            legs[0].sip_addr,
+        )
         .await;
     let bye_ok = recv_sip_status(&legs[0].sip, 200, Duration::from_secs(2)).await;
     assert!(bye_ok.is_some(), "leg a: BYE must be answered with 200 OK");
@@ -470,10 +479,16 @@ async fn e2e_three_leg_confbridge_mixing() {
     // ---- Phase 3: everyone leaves; conference + mixer torn down ---------
     send_b.abort();
     handler
-        .handle_bye(&bye_request("b", &legs[1].call_id), legs[1].sip_addr)
+        .handle_bye(
+            &bye_request("b", &legs[1].call_id, &legs[1].local_tag),
+            legs[1].sip_addr,
+        )
         .await;
     handler
-        .handle_bye(&bye_request("c", &legs[2].call_id), legs[2].sip_addr)
+        .handle_bye(
+            &bye_request("c", &legs[2].call_id, &legs[2].local_tag),
+            legs[2].sip_addr,
+        )
         .await;
     for leg in &legs[1..] {
         let ok = recv_sip_status(&leg.sip, 200, Duration::from_secs(2)).await;

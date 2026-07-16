@@ -4,7 +4,17 @@
 //! that persists for some time. Dialogs are identified by Call-ID,
 //! local tag, and remote tag.
 
-use crate::parser::{extract_tag, extract_uri, SipMessage, header_names};
+use crate::parser::{extract_tag, extract_uri, SipMessage, SipMethod, header_names};
+
+/// Why a message was rejected as not belonging to an established dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogValidationError {
+    CallId,
+    LocalTag,
+    RemoteTag,
+    RouteSet,
+    CSeq,
+}
 
 /// Dialog state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +176,87 @@ impl Dialog {
         self.call_id == call_id && self.local_tag == local_tag && self.remote_tag == remote_tag
     }
 
+    /// Validate a request received from the remote dialog participant before
+    /// the transaction user mutates call state.
+    ///
+    /// Remote requests carry our tag in `To` and the peer's tag in `From`.
+    /// ACK reuses the CSeq of the INVITE it acknowledges; every other
+    /// in-dialog request must advance the peer's sequence number. A Route
+    /// header is optional by the time the request reaches the endpoint (the
+    /// last proxy may consume it), but a supplied route set may not conflict
+    /// with the one established by Record-Route.
+    pub fn validate_remote_request(
+        &mut self,
+        request: &SipMessage,
+    ) -> Result<(), DialogValidationError> {
+        if request.call_id() != Some(self.call_id.as_str()) {
+            return Err(DialogValidationError::CallId);
+        }
+        if request.to_header().and_then(extract_tag).as_deref()
+            != Some(self.local_tag.as_str())
+        {
+            return Err(DialogValidationError::LocalTag);
+        }
+        if request.from_header().and_then(extract_tag).as_deref()
+            != Some(self.remote_tag.as_str())
+        {
+            return Err(DialogValidationError::RemoteTag);
+        }
+
+        let routes = normalized_headers(request, header_names::ROUTE);
+        if !routes.is_empty() && routes != normalized_route_set(&self.route_set) {
+            return Err(DialogValidationError::RouteSet);
+        }
+
+        let cseq = cseq_number(request).ok_or(DialogValidationError::CSeq)?;
+        match request.method() {
+            Some(SipMethod::Ack) if self.remote_seq == Some(cseq) => {}
+            Some(SipMethod::Ack) => return Err(DialogValidationError::CSeq),
+            Some(_) if self.remote_seq.is_none_or(|previous| cseq > previous) => {
+                self.remote_seq = Some(cseq);
+            }
+            _ => return Err(DialogValidationError::CSeq),
+        }
+        Ok(())
+    }
+
+    /// Validate a response received for a locally generated in-dialog
+    /// request. Record-Route arrives in wire order, while a UAC stores its
+    /// route set in reverse order.
+    pub fn validate_remote_response(
+        &self,
+        response: &SipMessage,
+        expected_cseq: u32,
+    ) -> Result<(), DialogValidationError> {
+        if response.call_id() != Some(self.call_id.as_str()) {
+            return Err(DialogValidationError::CallId);
+        }
+        if response.from_header().and_then(extract_tag).as_deref()
+            != Some(self.local_tag.as_str())
+        {
+            return Err(DialogValidationError::LocalTag);
+        }
+        if response.to_header().and_then(extract_tag).as_deref()
+            != Some(self.remote_tag.as_str())
+        {
+            return Err(DialogValidationError::RemoteTag);
+        }
+        if cseq_number(response) != Some(expected_cseq) {
+            return Err(DialogValidationError::CSeq);
+        }
+
+        let mut record_routes = normalized_headers(response, header_names::RECORD_ROUTE);
+        if !record_routes.is_empty() {
+            if self.is_uac {
+                record_routes.reverse();
+            }
+            if record_routes != normalized_route_set(&self.route_set) {
+                return Err(DialogValidationError::RouteSet);
+            }
+        }
+        Ok(())
+    }
+
     /// Confirm an early dialog (after receiving 2xx).
     pub fn confirm(&mut self) {
         self.state = DialogState::Confirmed;
@@ -185,6 +276,26 @@ impl Dialog {
     pub fn update_remote_target(&mut self, contact_uri: &str) {
         self.remote_target = contact_uri.to_string();
     }
+}
+
+fn cseq_number(message: &SipMessage) -> Option<u32> {
+    message.cseq()?.split_whitespace().next()?.parse().ok()
+}
+
+fn normalized_headers(message: &SipMessage, name: &str) -> Vec<String> {
+    message
+        .get_headers(name)
+        .into_iter()
+        .map(normalize_route)
+        .collect()
+}
+
+fn normalized_route_set(routes: &[String]) -> Vec<String> {
+    routes.iter().map(|route| normalize_route(route)).collect()
+}
+
+fn normalize_route(route: &str) -> String {
+    route.split_whitespace().collect::<String>().to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -226,5 +337,119 @@ Content-Length: 0\r\n\
         assert_eq!(dialog.remote_tag, "totag");
         assert_eq!(dialog.state, DialogState::Confirmed);
         assert_eq!(dialog.remote_target, "sip:bob@10.0.0.2");
+    }
+
+    fn inbound_dialog() -> Dialog {
+        Dialog {
+            call_id: "dialog-1".to_string(),
+            local_tag: "local-tag".to_string(),
+            remote_tag: "remote-tag".to_string(),
+            local_seq: 0,
+            remote_seq: Some(10),
+            local_uri: "sip:local@example.com".to_string(),
+            remote_uri: "sip:remote@example.com".to_string(),
+            remote_target: "sip:remote@192.0.2.10".to_string(),
+            route_set: vec!["<sip:proxy.example.com;lr>".to_string()],
+            state: DialogState::Confirmed,
+            is_uac: false,
+        }
+    }
+
+    fn remote_request(method: &str, cseq: u32) -> SipMessage {
+        SipMessage::parse(
+            format!(
+                "{method} sip:local@example.com SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 192.0.2.10;branch=z9hG4bKremote\r\n\
+                 From: <sip:remote@example.com>;tag=remote-tag\r\n\
+                 To: <sip:local@example.com>;tag=local-tag\r\n\
+                 Call-ID: dialog-1\r\n\
+                 CSeq: {cseq} {method}\r\n\
+                 Route: <sip:proxy.example.com;lr>\r\n\
+                 Content-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validates_remote_request_identity_route_and_monotonic_cseq() {
+        let mut dialog = inbound_dialog();
+        dialog.validate_remote_request(&remote_request("BYE", 11)).unwrap();
+        assert_eq!(dialog.remote_seq, Some(11));
+
+        let stale = remote_request("UPDATE", 11);
+        assert_eq!(
+            dialog.validate_remote_request(&stale),
+            Err(DialogValidationError::CSeq)
+        );
+
+        let mut wrong_tag = remote_request("INVITE", 12);
+        wrong_tag
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::FROM))
+            .unwrap()
+            .value = "<sip:remote@example.com>;tag=forged".to_string();
+        assert_eq!(
+            dialog.validate_remote_request(&wrong_tag),
+            Err(DialogValidationError::RemoteTag)
+        );
+        assert_eq!(dialog.remote_seq, Some(11));
+
+        let mut wrong_route = remote_request("INVITE", 12);
+        wrong_route
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::ROUTE))
+            .unwrap()
+            .value = "<sip:attacker.example.com;lr>".to_string();
+        assert_eq!(
+            dialog.validate_remote_request(&wrong_route),
+            Err(DialogValidationError::RouteSet)
+        );
+        assert_eq!(dialog.remote_seq, Some(11));
+    }
+
+    #[test]
+    fn ack_must_reuse_latest_remote_invite_cseq_without_advancing_it() {
+        let mut dialog = inbound_dialog();
+        dialog.validate_remote_request(&remote_request("ACK", 10)).unwrap();
+        assert_eq!(dialog.remote_seq, Some(10));
+        assert_eq!(
+            dialog.validate_remote_request(&remote_request("ACK", 11)),
+            Err(DialogValidationError::CSeq)
+        );
+    }
+
+    #[test]
+    fn response_must_match_tags_route_set_and_local_cseq() {
+        let mut dialog = inbound_dialog();
+        dialog.is_uac = true;
+        dialog.local_seq = 12;
+        let response = SipMessage::parse(
+            b"SIP/2.0 200 OK\r\n\
+              Via: SIP/2.0/UDP 192.0.2.20;branch=z9hG4bKlocal\r\n\
+              From: <sip:local@example.com>;tag=local-tag\r\n\
+              To: <sip:remote@example.com>;tag=remote-tag\r\n\
+              Call-ID: dialog-1\r\n\
+              CSeq: 12 INVITE\r\n\
+              Record-Route: <sip:proxy.example.com;lr>\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        dialog.validate_remote_response(&response, 12).unwrap();
+
+        let mut forged = response.clone();
+        forged
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::RECORD_ROUTE))
+            .unwrap()
+            .value = "<sip:attacker.example.com;lr>".to_string();
+        assert_eq!(
+            dialog.validate_remote_response(&forged, 12),
+            Err(DialogValidationError::RouteSet)
+        );
     }
 }
