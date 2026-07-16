@@ -152,6 +152,95 @@ impl SipEventHandler {
         }
     }
 
+    async fn validate_in_dialog_request(
+        &self,
+        request: &SipMessage,
+        remote_addr: SocketAddr,
+    ) -> Result<(), &'static str> {
+        let call_id = request.call_id().ok_or("missing Call-ID")?;
+        let call_state = self
+            .call_states
+            .read()
+            .get(call_id)
+            .cloned()
+            .ok_or("unknown Call-ID")?;
+        let mut call_state = call_state.lock().await;
+        if call_state.remote_addr != remote_addr {
+            return Err("source tuple mismatch");
+        }
+        let dialog = call_state
+            .session
+            .dialog
+            .as_mut()
+            .ok_or("session has no dialog")?;
+        dialog
+            .validate_remote_request(request)
+            .map_err(|_| "dialog identity, route set, or CSeq mismatch")
+    }
+
+    async fn reject_in_dialog_request(
+        &self,
+        request: &SipMessage,
+        remote_addr: SocketAddr,
+        reason: &'static str,
+    ) {
+        let call_id = request.call_id().unwrap_or("<missing>");
+        warn!(call_id, source = %remote_addr, reason, "Rejected forged in-dialog request");
+        let Ok(response) = request.create_response(481, "Call/Transaction Does Not Exist") else {
+            return;
+        };
+        if request.method() == Some(crate::parser::SipMethod::Invite) {
+            if self.may_send_invite_final(request, &response) {
+                let _ = self.transport.send(&response, remote_addr).await;
+            }
+        } else {
+            let _ = self.send_server_response(&response, remote_addr).await;
+        }
+    }
+
+    async fn response_matches_dialog(
+        &self,
+        response: &SipMessage,
+        remote_addr: SocketAddr,
+    ) -> bool {
+        let Some(call_id) = response.call_id() else {
+            return false;
+        };
+        let Some(call_state) = self.call_states.read().get(call_id).cloned() else {
+            return false;
+        };
+        let call_state = call_state.lock().await;
+        if call_state.remote_addr != remote_addr {
+            return false;
+        }
+
+        let Some(response_cseq) = response
+            .cseq()
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return false;
+        };
+
+        if let Some(dialog) = call_state.session.dialog.as_ref() {
+            return dialog
+                .validate_remote_response(response, dialog.local_seq)
+                .is_ok();
+        }
+
+        let Some(invite) = call_state.session.invite.as_ref() else {
+            return false;
+        };
+        invite.call_id() == response.call_id()
+            && invite.from_header().and_then(crate::parser::extract_tag)
+                == response.from_header().and_then(crate::parser::extract_tag)
+            && invite
+                .cseq()
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(response_cseq)
+    }
+
     /// Attach the SIP channel driver used to wire the inbound media plane.
     ///
     /// Called once at startup with the same `SipChannelDriver` that is
@@ -928,6 +1017,18 @@ impl SipEventHandler {
             .map(|m| m.to_uppercase())
             .unwrap_or_default();
 
+        // The stack deliberately reports stray responses to the TU. Never
+        // let one mutate a live session merely because it reused a known
+        // Call-ID: source tuple, dialog tags, route set, and local CSeq must
+        // all match first.
+        if matches!(cseq_method.as_str(), "INVITE" | "BYE")
+            && !self.response_matches_dialog(response, remote_addr).await
+        {
+            warn!(call_id = %call_id, source = %remote_addr,
+                "Ignored response that did not match the live dialog");
+            return;
+        }
+
         // A final response to our BYE completes the dialog immediately. The
         // per-call cleanup task observes the removed state and releases its
         // store channel, driver entry, and RTP reservation on its next poll
@@ -1038,6 +1139,14 @@ impl SipEventHandler {
         if let Some(call_id) = request.call_id() {
             let call_id = call_id.to_string();
 
+            if let Err(reason) = self
+                .validate_in_dialog_request(request, remote_addr)
+                .await
+            {
+                self.reject_in_dialog_request(request, remote_addr, reason).await;
+                return;
+            }
+
             // Send 200 OK to the BYE
             match request.create_response(200, "OK") {
                 Ok(ok_resp) => {
@@ -1091,6 +1200,39 @@ impl SipEventHandler {
 
             // Notify any SFU conferences that this SIP call was hung up.
             crate::notify_sip_hangup(&call_id);
+        }
+    }
+
+    /// Validate a transaction-user ACK. The stack has already checked the
+    /// INVITE transaction identity; this enforces the remaining dialog and
+    /// route-set constraints before the application accepts it.
+    pub async fn handle_ack(&self, request: &SipMessage, remote_addr: SocketAddr) {
+        if let Err(reason) = self
+            .validate_in_dialog_request(request, remote_addr)
+            .await
+        {
+            warn!(
+                call_id = request.call_id().unwrap_or("<missing>"),
+                source = %remote_addr,
+                reason,
+                "Ignored ACK that did not match the live dialog"
+            );
+        }
+    }
+
+    /// Validate UPDATE even though SDP renegotiation itself belongs to M5.
+    /// A valid request receives an explicit unsupported response so its
+    /// non-INVITE server transaction can complete instead of leaking.
+    pub async fn handle_update(&self, request: &SipMessage, remote_addr: SocketAddr) {
+        if let Err(reason) = self
+            .validate_in_dialog_request(request, remote_addr)
+            .await
+        {
+            self.reject_in_dialog_request(request, remote_addr, reason).await;
+            return;
+        }
+        if let Ok(response) = request.create_response(501, "Not Implemented") {
+            let _ = self.send_server_response(&response, remote_addr).await;
         }
     }
 
@@ -1308,6 +1450,12 @@ impl SipEventHandler {
             return;
         }
 
+        if !self.response_matches_dialog(response, remote_addr).await {
+            warn!(call_id = %call_id, source = %remote_addr,
+                "Ignored re-INVITE response that did not match the live dialog");
+            return;
+        }
+
         let cs_arc = {
             let states = self.call_states.read();
             match states.get(&call_id) {
@@ -1344,6 +1492,14 @@ impl SipEventHandler {
             let states = self.call_states.read();
             states.get(&call_id)?.clone()
         };
+
+        if let Err(reason) = self
+            .validate_in_dialog_request(request, remote_addr)
+            .await
+        {
+            self.reject_in_dialog_request(request, remote_addr, reason).await;
+            return None;
+        }
 
         // Parse the re-INVITE's SDP offer
         let remote_sdp = session.remote_sdp.clone();
@@ -2245,27 +2401,26 @@ mod tests {
     async fn bye_2xx_removes_call_maps_without_waiting_for_dialog_timeout() {
         let (_driver, handler) = driver_and_handler().await;
         let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
-        let call_id = "bye-final-1";
         let channel_name = "PJSIP/bye-final-00000001";
-        handler.register_outbound_callid(call_id, channel_name);
-        handler.register_outbound_session(
-            call_id,
-            channel_name,
-            SipSession::new_outbound("127.0.0.1:5061".parse().unwrap(), remote),
-            remote,
-        );
+        let mut session = SipSession::new_outbound("127.0.0.1:5061".parse().unwrap(), remote);
+        let invite = session.build_invite("sip:peer@127.0.0.1:5060");
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        answer
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=remote");
+        answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
+        session.on_response(&answer);
+        let call_id = session.call_id.clone();
+        let bye = session.build_bye().unwrap();
+        let response = bye.create_response(200, "OK").unwrap();
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(&call_id, channel_name, session, remote);
         assert_eq!(handler.active_calls(), 1);
         assert_eq!(handler.call_states.read().len(), 1);
-
-        let response = SipMessage::parse(
-            b"SIP/2.0 200 OK\r\n\
-              Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bKbye\r\n\
-              From: <sip:asterisk@127.0.0.1>;tag=local\r\n\
-              To: <sip:peer@127.0.0.1>;tag=remote\r\n\
-              Call-ID: bye-final-1\r\n\
-              CSeq: 2 BYE\r\n\
-              Content-Length: 0\r\n\r\n",
-        ).unwrap();
         handler.handle_response(&response, remote).await;
 
         assert_eq!(handler.active_calls(), 0, "Call-ID map must clear immediately");
@@ -2394,24 +2549,33 @@ mod tests {
         let channel_name = ch.name.clone();
         store::register_existing_channel(ch);
         let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
-        handler.register_outbound_callid("bye-call-1", &channel_name);
-        handler.register_outbound_session(
-            "bye-call-1",
-            &channel_name,
-            SipSession::new_outbound("127.0.0.1:0".parse().unwrap(), remote),
-            remote,
-        );
+        let mut session = SipSession::new_outbound("127.0.0.1:5061".parse().unwrap(), remote);
+        let invite = session.build_invite("sip:dave@127.0.0.1:5060");
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        answer
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=remote-tag");
+        answer.add_header("Contact", "<sip:dave@127.0.0.1:5060>");
+        session.on_response(&answer);
+        let call_id = session.call_id.clone();
+        let local_tag = session.local_tag.clone();
+        handler.register_outbound_callid(&call_id, &channel_name);
+        handler.register_outbound_session(&call_id, &channel_name, session, remote);
         assert_eq!(driver.active_channel_count(), 1);
         assert!(store::find_by_name(&channel_name).is_some());
 
         // Remote sends a BYE for this call.
-        let bye_raw = "BYE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
+        let bye_raw = format!("BYE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
              Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbye1\r\n\
-             From: <sip:dave@127.0.0.1>;tag=f1\r\n\
-             To: <sip:asterisk@127.0.0.1>;tag=t1\r\n\
-             Call-ID: bye-call-1\r\n\
+             From: <sip:dave@127.0.0.1>;tag=remote-tag\r\n\
+             To: <sip:asterisk@127.0.0.1>;tag={local_tag}\r\n\
+             Call-ID: {call_id}\r\n\
              CSeq: 2 BYE\r\n\
-             Content-Length: 0\r\n\r\n";
+             Content-Length: 0\r\n\r\n");
         let bye = SipMessage::parse(bye_raw.as_bytes()).unwrap();
         handler.handle_bye(&bye, remote).await;
 
@@ -2422,6 +2586,130 @@ mod tests {
         );
         assert!(store::find_by_name(&channel_name).is_none(),
             "remote BYE must deregister the outbound global store channel");
+    }
+
+    #[tokio::test]
+    async fn forged_in_dialog_byes_from_allowed_source_do_not_tear_down_call() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(Arc::new(Dialplan::new()), transport.clone());
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut session = SipSession::new_outbound(transport.local_addr, remote);
+        let invite = session.build_invite("sip:peer@127.0.0.1:5060");
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        answer
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=peer-tag");
+        answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
+        session.on_response(&answer);
+        session.dialog.as_mut().unwrap().remote_seq = Some(10);
+        let call_id = session.call_id.clone();
+        let local_tag = session.local_tag.clone();
+        let channel_name = "PJSIP/dialog-forgery";
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(&call_id, channel_name, session, remote);
+
+        let make_bye = |candidate_call_id: &str, remote_tag: &str, cseq: u32, branch: &str| {
+            SipMessage::parse(
+                format!(
+                    "BYE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
+                     Via: SIP/2.0/UDP 127.0.0.1:5060;branch={branch}\r\n\
+                     From: <sip:peer@127.0.0.1>;tag={remote_tag}\r\n\
+                     To: <sip:asterisk@127.0.0.1>;tag={local_tag}\r\n\
+                     Call-ID: {candidate_call_id}\r\n\
+                     CSeq: {cseq} BYE\r\n\
+                     Content-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+
+        for (forged, source) in [
+            (make_bye("unknown-call", "peer-tag", 11, "z9hG4bKcall"), remote),
+            (make_bye(&call_id, "wrong-tag", 11, "z9hG4bKtag"), remote),
+            (make_bye(&call_id, "peer-tag", 10, "z9hG4bKcseq"), remote),
+            (
+                make_bye(&call_id, "peer-tag", 11, "z9hG4bKsource"),
+                "127.0.0.1:5062".parse().unwrap(),
+            ),
+        ] {
+            handler.handle_bye(&forged, source).await;
+            assert_eq!(handler.active_calls(), 1);
+            assert_eq!(handler.call_states.read().len(), 1);
+        }
+        assert_eq!(transport.statuses(), vec![481, 481, 481, 481]);
+
+        handler.release_outbound_leg(channel_name);
+    }
+
+    #[tokio::test]
+    async fn stray_finals_cannot_mutate_established_dialog() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(Arc::new(Dialplan::new()), transport.clone());
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let mut session = SipSession::new_outbound(transport.local_addr, remote);
+        let invite = session.build_invite("sip:peer@127.0.0.1:5060");
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        answer
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=peer-tag");
+        answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
+        session.on_response(&answer);
+        let call_id = session.call_id.clone();
+        let channel_name = "PJSIP/forged-final";
+        let channel = store::register_existing_channel(
+            asterisk_core::channel::Channel::new(channel_name),
+        );
+        channel.lock().set_state(ChannelState::Up);
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(&call_id, channel_name, session, remote);
+
+        let mut failure = invite.create_response(486, "Busy Here").unwrap();
+        failure
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=peer-tag");
+
+        let mut wrong_tag = failure.clone();
+        wrong_tag
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value = "<sip:peer@127.0.0.1:5060>;tag=forged".to_string();
+        let mut wrong_cseq = failure.clone();
+        wrong_cseq
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("CSeq"))
+            .unwrap()
+            .value = "2 INVITE".to_string();
+
+        handler
+            .handle_response(&failure, "127.0.0.1:5062".parse().unwrap())
+            .await;
+        handler.handle_response(&wrong_tag, remote).await;
+        handler.handle_response(&wrong_cseq, remote).await;
+
+        assert!(!channel.lock().check_hangup());
+        let state = handler.call_states.read().get(&call_id).cloned().unwrap();
+        assert_eq!(
+            state.lock().await.session.state,
+            crate::session::SessionState::Established
+        );
+
+        handler.release_outbound_leg(channel_name);
     }
 
     #[tokio::test]

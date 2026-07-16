@@ -35,6 +35,20 @@ fn request_identity_matches(original: &SipMessage, retransmission: &SipMessage) 
             == retransmission.from_header().and_then(extract_tag)
 }
 
+fn ack_route_set_matches(invite: &SipMessage, ack: &SipMessage) -> bool {
+    let actual = ack.get_headers(header_names::ROUTE);
+    if actual.is_empty() {
+        return true;
+    }
+    let expected = invite.get_headers(header_names::RECORD_ROUTE);
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            actual.split_whitespace().collect::<String>().eq_ignore_ascii_case(
+                &expected.split_whitespace().collect::<String>(),
+            )
+        })
+}
+
 /// Build the transaction ACK for a 300-699 INVITE response. It reuses the
 /// INVITE branch and Request-URI, unlike the new-branch dialog ACK for 2xx.
 fn build_non_2xx_ack(invite: &SipMessage, response: &SipMessage) -> Option<SipMessage> {
@@ -313,6 +327,7 @@ impl TransactionLayer {
                 || txn.request.from_header().and_then(extract_tag).as_deref()
                     != Some(from_tag.as_str())
                 || cseq_number(&txn.request) != Some(ack_cseq)
+                || !ack_route_set_matches(&txn.request, ack)
             {
                 return None;
             }
@@ -1659,7 +1674,8 @@ mod tests {
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
 
-        let invite = build_invite_request("accepted-call", "z9hG4bKaccepted");
+        let mut invite = build_invite_request("accepted-call", "z9hG4bKaccepted");
+        invite.add_header("Record-Route", "<sip:proxy.example.com;lr>");
         stack.handle_request(invite.clone(), peer_addr).await;
         let _ = rx.recv().await;
         let mut ok = invite.create_response(200, "OK").unwrap();
@@ -1674,6 +1690,23 @@ mod tests {
         stack.handle_timers().await;
         assert_eq!(recv_peer(&peer).await.to_string(), ok.to_string(),
             "the cached 2xx must be byte-equivalent");
+
+        let mut forged_ack =
+            build_2xx_ack("accepted-call", "z9hG4bKforged-ack-branch", "server-tag");
+        forged_ack.add_header("Route", "<sip:attacker.example.com;lr>");
+        stack.handle_request(forged_ack, peer_addr).await;
+        assert!(rx.try_recv().is_err(), "forged route-set ACK must not reach TU");
+        assert_eq!(
+            stack
+                .transaction_layer
+                .read()
+                .invite_server_txns
+                .get("z9hG4bKaccepted")
+                .unwrap()
+                .state,
+            crate::transaction::InviteServerState::Accepted,
+            "forged ACK must not stop 2xx retransmission"
+        );
 
         let ack = build_2xx_ack("accepted-call", "z9hG4bKnew-ack-branch", "server-tag");
         stack.handle_request(ack.clone(), peer_addr).await;

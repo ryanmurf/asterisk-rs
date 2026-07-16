@@ -2027,9 +2027,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                 }
                                 asterisk_sip::stack::SipEvent::IncomingAck {
                                     call_id,
-                                    request: _,
-                                    remote_addr: _,
+                                    request,
+                                    remote_addr,
                                 } => {
+                                    event_handler.handle_ack(&request, remote_addr).await;
                                     debug!("Received dialog ACK for {}", call_id);
                                 }
                                 asterisk_sip::stack::SipEvent::InviteAckTimeout { call_id } => {
@@ -2062,6 +2063,10 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                                 .await;
                                             debug!("Sent 200 OK for OPTIONS from {}", remote_addr);
                                         }
+                                    } else if request.method()
+                                        == Some(asterisk_sip::SipMethod::Update)
+                                    {
+                                        event_handler.handle_update(&request, remote_addr).await;
                                     }
                                 }
                                 asterisk_sip::stack::SipEvent::TransactionTimeout { branch } => {
