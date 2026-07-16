@@ -349,9 +349,8 @@ impl AppRead {
         channel.set_variable("READSTATUS", status.as_str());
 
         debug!(
-            "Read: result variable '{}' = '{}', READSTATUS = {}",
+            "Read: result variable '{}' updated (digit count redacted), READSTATUS = {}",
             parsed.variable,
-            digits,
             status.as_str()
         );
 

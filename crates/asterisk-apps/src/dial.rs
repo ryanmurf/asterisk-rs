@@ -1851,7 +1851,8 @@ impl AppDial {
 
         // The bridge loop: wait until either channel hangs up or is redirected.
         // Poll the channel store for state changes.
-        eprintln!("[DEBUG] bridge_channels: entering bridge loop for {} <-> {}", caller.name, leg.destination.resource);
+        debug!(caller = %caller.name, destination = %leg.destination.resource,
+            "Dial: entering bridge loop");
         loop {
             if bridge_deadline.is_some_and(|deadline| bridge_started.elapsed() >= deadline) {
                 caller.softhangup(asterisk_core::softhangup::AST_SOFTHANGUP_TIMEOUT);
@@ -1870,7 +1871,8 @@ impl AppDial {
 
             // Check if caller hung up
             if caller.state == ChannelState::Down || caller.check_hangup() {
-                eprintln!("[DEBUG] bridge: caller hung up (state={:?}, hangup={})", caller.state, caller.check_hangup());
+                debug!(caller = %caller.name, state = ?caller.state,
+                    "Dial: bridge ended - caller hung up");
                 lifetime.cancel();
                 break;
             }
@@ -1883,7 +1885,8 @@ impl AppDial {
                 if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&callee_name) {
                     let ch = store_chan.lock();
                     if ch.state == ChannelState::Down || ch.check_hangup() {
-                        eprintln!("[DEBUG] bridge: callee hung up (state={:?}, hangup={})", ch.state, ch.check_hangup());
+                        debug!(callee = %callee_name, state = ?ch.state,
+                            "Dial: bridge ended - callee hung up");
                         lifetime.cancel();
                         break;
                     }
@@ -1894,7 +1897,7 @@ impl AppDial {
                         break;
                     }
                 } else {
-                    eprintln!("[DEBUG] bridge: callee channel '{}' not found in store", callee_name);
+                    debug!(callee = %callee_name, "Dial: bridge ended - callee left store");
                     lifetime.cancel();
                     break;
                 }
@@ -1945,7 +1948,7 @@ impl AppDial {
                     }
                 };
                 if was_redirected {
-                    eprintln!("[DEBUG] Callee {} was redirected, spawning PBX execution", callee_name);
+                    debug!(callee = %callee_name, "Dial: spawning redirected PBX execution");
                     if let Some(dialplan) = asterisk_core::get_global_dialplan() {
                         // Clone channel data from parking_lot::Mutex into tokio::sync::Mutex
                         let channel_data = {
