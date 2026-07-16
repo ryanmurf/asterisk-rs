@@ -76,6 +76,18 @@ media deadline. Both must restore the five resource maps to the exact
 `0/0/0/0/0` baseline within two seconds. The deadline case additionally
 requires zero accepted RTP packets on both completed rustisk legs.
 
+The M4 stage adds a dedicated UDP SIP proxy on the internal network. The proxy
+inserts and removes its own top Via and rewrites Contact to itself, so both
+transaction responses and later ACK/BYE requests are provably on path; RTP
+still flows directly between the endpoints. Its deterministic modes drop,
+hold, replay, or rewrite selected messages. Receiver-side assertions cover a
+dropped 200, a late INVITE replay with three byte-identical 200s and one call,
+dropped ACK and BYE, 180 followed by silence, three forged dialog identities
+from the allowed proxy address, ten simultaneous calls with distinct captured
+tones, the CANCEL/200 crossing order, and non-2xx or absent BYE finals. Every
+individual case restores both the five core maps and four transaction maps to
+their exact `0/0/0/0/0` and `0/0/0/0` baselines.
+
 [RFC 3551]: https://www.rfc-editor.org/info/rfc3551/
 [RFC 4733]: https://www.rfc-editor.org/info/rfc4733/
 [FreeSWITCH's documented default]: https://developer.signalwire.com/freeswitch/reference/channel-variables/#dtmf

@@ -36,6 +36,8 @@ def main() -> None:
     write_tone(output_dir / "granted.wav", 880, 1.0)
     write_tone(output_dir / "rejected.wav", 220, 1.0)
     write_tone(output_dir / "outbound-tone.wav", 660, 1.5)
+    for index in range(10):
+        write_tone(output_dir / f"m4-tone-{index}.wav", 400 + index * 50, 1.5)
 
 
 if __name__ == "__main__":
