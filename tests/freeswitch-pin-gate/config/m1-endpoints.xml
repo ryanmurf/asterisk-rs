@@ -14,4 +14,23 @@
       <action application="sleep" data="10000"/>
     </condition>
   </extension>
+
+  <extension name="rustisk-m2-two-way-receiver">
+    <condition field="destination_number" expression="^9201$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="answer"/>
+      <action application="record_session" data="/var/lib/freeswitch/recordings/m2-b-capture.wav"/>
+      <action application="play_and_get_digits" data="1 1 1 15000 # silence_stream://15000 silence_stream://100 M2DecodedDigit ^[0-9]$ 2000"/>
+      <action application="set" data="RTPDTMFDigitsRx=1"/>
+      <action application="sleep" data="15000"/>
+    </condition>
+  </extension>
+
+  <extension name="rustisk-m2-silent-deadline-receiver">
+    <condition field="destination_number" expression="^9203$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="answer"/>
+      <action application="sleep" data="10000"/>
+    </condition>
+  </extension>
 </include>
