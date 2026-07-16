@@ -22,6 +22,9 @@ FS_HOST_IP="10.253.$NETWORK_THIRD_OCTET.3"
 IMPAIRMENT_IP="10.253.$NETWORK_THIRD_OCTET.4"
 AMI_HOST="$FS_HOST_IP"
 RUSTISK_PID=""
+AMI_SUBSCRIBER_PID=""
+SIP_CAPTURE_PID=""
+SECRET_DIR=""
 BASELINE_RESOURCES=""
 BASELINE_TRANSACTIONS=""
 RTP_HELPER_LABEL="rustisk.m2.helper=$FS_CONTAINER"
@@ -32,6 +35,15 @@ M4_TIMER_B_MIN_MS=28000
 M4_TIMER_B_MAX_MS=38000
 
 cleanup() {
+    touch "$RUNTIME_DIR/m3-ami.stop" "$RUNTIME_DIR/m3-sip-capture.stop" 2>/dev/null || true
+    if [[ -n "$AMI_SUBSCRIBER_PID" ]]; then
+        kill "$AMI_SUBSCRIBER_PID" 2>/dev/null || true
+        wait "$AMI_SUBSCRIBER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$SIP_CAPTURE_PID" ]]; then
+        kill "$SIP_CAPTURE_PID" 2>/dev/null || true
+        wait "$SIP_CAPTURE_PID" 2>/dev/null || true
+    fi
     if docker inspect "$IMPAIRMENT_CONTAINER" >/dev/null 2>&1; then
         local impairment_host_pid
         impairment_host_pid="$(docker inspect -f '{{.State.Pid}}' "$IMPAIRMENT_CONTAINER")"
@@ -62,6 +74,9 @@ cleanup() {
         docker rm -f "$FS_CONTAINER" >/dev/null 2>&1 || true
     fi
     docker network rm "$FS_NETWORK" >/dev/null 2>&1 || true
+    if [[ -n "$SECRET_DIR" && "$SECRET_DIR" == /mnt/data/herodevs-agents/m3-pin-secret.* ]]; then
+        rm -rf "$SECRET_DIR"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -74,6 +89,45 @@ fail() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+prove_startup_secret_fail_closed() {
+    printf 'Proving startup refuses an absent mounted PIN secret...\n'
+    if timeout 10 docker run --rm \
+        --network none \
+        --user "$(id -u):$(id -g)" \
+        --entrypoint /rustisk \
+        --mount "type=bind,src=$REPO_DIR/target/debug/rustisk,dst=/rustisk,readonly" \
+        --mount "type=bind,src=$RUNTIME_DIR,dst=$RUNTIME_DIR" \
+        "$RUSTISK_IMAGE" -f -C "$CONFIG_DIR/asterisk.conf" \
+        >"$RUNTIME_DIR/startup-absent-secret.log" 2>&1; then
+        fail "rustisk started without the required mounted PIN secret"
+    fi
+    grep -q 'Startup failed: required mounted PIN secret file' \
+        "$RUNTIME_DIR/startup-absent-secret.log" \
+        || fail "absent-secret startup failure did not identify the missing mounted file"
+    grep -q 'Rustisk is fully booted' "$RUNTIME_DIR/startup-absent-secret.log" \
+        && fail "absent-secret rustisk reached fully booted"
+    printf 'STARTUP_ABSENT_SECRET: PASS (exit nonzero before fully booted)\n'
+
+    printf 'Proving startup refuses an invalid mounted PIN secret...\n'
+    if timeout 10 docker run --rm \
+        --network none \
+        --user "$(id -u):$(id -g)" \
+        --entrypoint /rustisk \
+        --mount "type=bind,src=$REPO_DIR/target/debug/rustisk,dst=/rustisk,readonly" \
+        --mount "type=bind,src=$RUNTIME_DIR,dst=$RUNTIME_DIR" \
+        --mount "type=bind,src=$SECRET_DIR/invalid,dst=/run/secrets/rustisk/pin,readonly" \
+        "$RUSTISK_IMAGE" -f -C "$CONFIG_DIR/asterisk.conf" \
+        >"$RUNTIME_DIR/startup-invalid-secret.log" 2>&1; then
+        fail "rustisk started with an invalid mounted PIN secret"
+    fi
+    grep -q 'Startup failed: mounted PIN secret file is not a valid six-digit secret' \
+        "$RUNTIME_DIR/startup-invalid-secret.log" \
+        || fail "invalid-secret startup failure did not identify invalid contents"
+    grep -q 'Rustisk is fully booted' "$RUNTIME_DIR/startup-invalid-secret.log" \
+        && fail "invalid-secret rustisk reached fully booted"
+    printf 'STARTUP_INVALID_SECRET: PASS (exit nonzero before fully booted)\n'
 }
 
 fs_cli() {
@@ -572,6 +626,12 @@ wait_for_call_end() {
     fail "FreeSWITCH call $uuid did not end"
 }
 
+fs_b_invite_count() {
+    docker exec "$FS_CONTAINER" awk \
+        '/INVITE sip:9201@/ { count++ } END { print count + 0 }' \
+        /var/log/freeswitch/freeswitch.log
+}
+
 wait_for_transaction_baseline_in_timer_b_window() {
     local started_ms="$1"
     local elapsed_ms
@@ -607,8 +667,15 @@ run_case() {
     local uuid
     local stats
     local capture="/var/lib/freeswitch/recordings/pin-gate-${expected,,}.wav"
+    local b_invites_before
+    local b_invites_after
+    local b_uuid=""
+    local m3_a_capture_remote="/var/lib/freeswitch/recordings/m3-gate-a-capture.wav"
+    local m3_a_capture="$RUNTIME_DIR/m3-gate-a-capture.wav"
+    local m3_b_capture="$RUNTIME_DIR/m3-gate-b-capture.wav"
 
     printf '\nRunning %s case with receiver-side RFC4733 digits...\n' "$expected"
+    b_invites_before="$(fs_b_invite_count)"
     if ! originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9000@$FS_HOST_IP:15060 &park()" 2>&1)"; then
         fail "FreeSWITCH originate failed: $originate_response"
     fi
@@ -619,7 +686,40 @@ run_case() {
     fs_cli "uuid_broadcast $uuid tone_stream://%(1000,0,600) aleg" >/dev/null
     sleep 2.2
     fs_cli "uuid_send_dtmf $uuid ${digits}#@200" >/dev/null
+
+    if [[ "$expected" == "REJECTED" ]]; then
+        # Fail immediately if the compare is bypassed. Waiting for the call to
+        # end first would let the unexpected B leg mask this assertion.
+        sleep 5
+        b_invites_after="$(fs_b_invite_count)"
+        (( b_invites_after == b_invites_before )) \
+            || fail "rejected PIN reached FreeSWITCH B: INVITEs $b_invites_before->$b_invites_after"
+    else
+        b_uuid="$(wait_for_fs_destination_uuid 9201)"
+        fs_cli "uuid_record $uuid stop $capture" >/dev/null
+        fs_cli "uuid_record $uuid start $m3_a_capture_remote" >/dev/null
+        fs_cli "uuid_broadcast $uuid tone_stream://%(1000,0,440) aleg" >/dev/null
+        sleep 1.2
+        fs_cli "uuid_broadcast $b_uuid tone_stream://%(1000,0,660) aleg" >/dev/null
+        sleep 1.2
+        fs_cli "uuid_send_dtmf $uuid 7@200" >/dev/null
+        wait_for_fs_channel_var "$b_uuid" M2DecodedDigit 7 >/dev/null
+        fs_cli "uuid_kill $uuid NORMAL_CLEARING" >/dev/null
+    fi
     wait_for_call_end "$uuid"
+    if [[ -n "$b_uuid" ]]; then
+        wait_for_call_end "$b_uuid"
+    fi
+
+    b_invites_after="$(fs_b_invite_count)"
+    if [[ "$expected" == "REJECTED" ]]; then
+        (( b_invites_after == b_invites_before )) \
+            || fail "rejected PIN reached FreeSWITCH B: INVITEs $b_invites_before->$b_invites_after"
+        printf 'REJECTED_B_SIDE: PASS (FreeSWITCH-B INVITE delta=0)\n'
+    else
+        (( b_invites_after > b_invites_before )) \
+            || fail "granted PIN never reached FreeSWITCH B"
+    fi
 
     channel="PJSIP/fs-carrier-$(printf '%08d' "$ordinal")"
     stats="$(wait_for_completed_stats "$channel")"
@@ -629,7 +729,12 @@ run_case() {
     assert_positive_counter RTPPacketsRx "$stats"
     assert_positive_counter RTPVoiceFramesTx "$stats"
     assert_positive_counter RTPVoiceFramesRx "$stats"
-    assert_counter_equals RTPDTMFDigitsRx "${#digits}" "$stats"
+    if [[ "$expected" == "REJECTED" ]]; then
+        assert_counter_equals RTPDTMFDigitsRx "${#digits}" "$stats"
+    else
+        (( $(stat_value RTPDTMFDigitsRx "$stats") >= ${#digits} + 1 )) \
+            || fail "granted bridge did not receive gate digits plus forwarded M2 DTMF"
+    fi
     grep -q "Verbose: PIN_GATE_RESULT=$expected" "$RUSTISK_LOG" \
         || fail "dialplan did not take the $expected branch"
 
@@ -638,6 +743,18 @@ run_case() {
         || fail "FreeSWITCH audio capture has no samples"
 
     printf '%s\n' "$stats" >"$RUNTIME_DIR/${expected,,}-rtp-stats.txt"
+    if [[ "$expected" == "GRANTED" ]]; then
+        docker cp "$FS_CONTAINER:$m3_a_capture_remote" "$m3_a_capture" >/dev/null
+        docker cp "$FS_CONTAINER:/var/lib/freeswitch/recordings/m2-b-capture.wav" \
+            "$m3_b_capture" >/dev/null
+        python3 "$HARNESS_DIR/assert_tone.py" "$m3_b_capture" 440 \
+            | sed 's/^/M3_GRANTED_A_TO_B: /' \
+            | tee "$RUNTIME_DIR/m3-granted-a-to-b-tone-proof.txt"
+        python3 "$HARNESS_DIR/assert_tone.py" "$m3_a_capture" 660 \
+            | sed 's/^/M3_GRANTED_B_TO_A: /' \
+            | tee "$RUNTIME_DIR/m3-granted-b-to-a-tone-proof.txt"
+        printf 'GRANTED_BRIDGE: PASS (M2 two-way far-side receiver proof)\n'
+    fi
     wait_for_resource_baseline_eventually "$expected"
     printf '%s: PASS (TX voice=%s, RX voice=%s, RX DTMF=%s)\n' \
         "$expected" \
@@ -646,13 +763,120 @@ run_case() {
         "$(stat_value RTPDTMFDigitsRx "$stats")"
 }
 
+run_m3_no_input_deadline_case() {
+    local originate_response
+    local uuid
+    local answered_ms
+    local ended_ms
+    local elapsed_ms
+
+    printf '\nRunning M3 no-input absolute deadline case...\n'
+    if ! originate_response="$(fs_cli "originate {origination_caller_id_number=15551234567,ignore_early_media=true,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9002@$FS_HOST_IP:15060 &park()" 2>&1)"; then
+        fail "FreeSWITCH no-input originate failed: $originate_response"
+    fi
+    answered_ms="$(now_ms)"
+    uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$originate_response" | head -n1)"
+    [[ -n "$uuid" ]] || fail "FreeSWITCH no-input originate failed: $originate_response"
+    wait_for_call_end "$uuid"
+    ended_ms="$(now_ms)"
+    elapsed_ms="$((ended_ms - answered_ms))"
+    (( elapsed_ms >= 4000 && elapsed_ms <= 6000 )) \
+        || fail "no-input hangup missed the 5s absolute deadline ±1s: ${elapsed_ms}ms"
+    wait_for_resource_baseline_eventually "M3_NO_INPUT"
+    printf 'NO_INPUT_DEADLINE: PASS (AnsweredToHangupMs=%s DeadlineMs=5000 ToleranceMs=1000)\n' \
+        "$elapsed_ms"
+}
+
+start_m3_sink_receivers() {
+    rm -f "$RUNTIME_DIR/m3-ami.stop" "$RUNTIME_DIR/m3-sip-capture.stop"
+    docker exec "$RUSTISK_CONTAINER" python3 /ami_subscriber.py "$AMI_HOST" 15038 \
+        --stop-file "$RUNTIME_DIR/m3-ami.stop" \
+        >"$RUNTIME_DIR/m3-ami-transcript.txt" 2>&1 &
+    AMI_SUBSCRIBER_PID=$!
+    docker run --rm \
+        --label "$RTP_HELPER_LABEL" \
+        --network "container:$RUSTISK_CONTAINER" \
+        --cap-add NET_RAW \
+        --mount "type=bind,src=$HARNESS_DIR/sip_capture.py,dst=/sip_capture.py,readonly" \
+        --mount "type=bind,src=$RUNTIME_DIR,dst=/runtime" \
+        "$RUSTISK_IMAGE" python3 /sip_capture.py \
+            --output /runtime/m3-sip-only.pcap \
+            --stop-file /runtime/m3-sip-capture.stop \
+        >"$RUNTIME_DIR/m3-sip-capture-proof.txt" 2>&1 &
+    SIP_CAPTURE_PID=$!
+
+    for _ in {1..100}; do
+        grep -q 'Authentication accepted' "$RUNTIME_DIR/m3-ami-transcript.txt" 2>/dev/null \
+            && return
+        sleep 0.05
+    done
+    fail "authenticated AMI subscriber did not become live"
+}
+
+stop_m3_sink_receivers() {
+    touch "$RUNTIME_DIR/m3-ami.stop" "$RUNTIME_DIR/m3-sip-capture.stop"
+    wait "$AMI_SUBSCRIBER_PID" || fail "AMI subscriber failed"
+    wait "$SIP_CAPTURE_PID" || fail "SIP-only capture failed"
+    AMI_SUBSCRIBER_PID=""
+    SIP_CAPTURE_PID=""
+
+    grep -q 'Event: Newexten' "$RUNTIME_DIR/m3-ami-transcript.txt" \
+        || fail "AMI subscriber saw no Newexten events"
+    grep -q 'Application: PinGate' "$RUNTIME_DIR/m3-ami-transcript.txt" \
+        || fail "AMI subscriber did not observe PinGate Newexten"
+    grep -q 'Event: VarSet' "$RUNTIME_DIR/m3-ami-transcript.txt" \
+        || fail "AMI subscriber saw no VarSet events"
+    grep -q 'Variable: PINGATESTATUS' "$RUNTIME_DIR/m3-ami-transcript.txt" \
+        || fail "AMI subscriber did not observe the non-secret gate status"
+    grep -Eq 'SIPOnlyPackets=[1-9][0-9]*' "$RUNTIME_DIR/m3-sip-capture-proof.txt" \
+        || fail "SIP-only pcap captured no packets"
+    printf 'AMI_SUBSCRIBER: PASS (authenticated, default read perms, Newexten+VarSet observed)\n'
+    printf 'SIP_ONLY_CAPTURE: PASS (%s)\n' \
+        "$(tr -d '\r\n' <"$RUNTIME_DIR/m3-sip-capture-proof.txt")"
+}
+
+assert_m3_zero_hit_audit() {
+    local hits=""
+    local file
+    local pattern
+
+    rm -rf "$RUNTIME_DIR/freeswitch-artifacts"
+    docker cp "$FS_CONTAINER:/var/log/freeswitch" \
+        "$RUNTIME_DIR/freeswitch-artifacts" >/dev/null
+    {
+        printf 'Rustisk CDR/CEL wiring: no files emitted by current runtime.\n'
+        printf 'FreeSWITCH CDR/CEL files copied under freeswitch-artifacts:\n'
+        find "$RUNTIME_DIR/freeswitch-artifacts" -type f \
+            \( -iname '*cdr*' -o -iname '*cel*' -o -name '*.csv' \) -print
+    } >"$RUNTIME_DIR/cdr-cel-manifest.txt"
+
+    for pattern in "$GRANTED_TEST_PIN" "$WRONG_TEST_PIN"; do
+        while IFS= read -r -d '' file; do
+            if grep -aFq -- "$pattern" "$file"; then
+                hits+="$file"$'\n'
+            fi
+        done < <(find "$RUNTIME_DIR" -type f -print0)
+    done
+    [[ -z "$hits" ]] || fail "secret audit found a test PIN in artifacts: $hits"
+
+    {
+        printf 'GrantedPatternHits=0\n'
+        printf 'RejectedPatternHits=0\n'
+        printf 'ArtifactClasses=rustisk-trace-log,freeswitch-logs,sip-only-pcap,ami-transcript,cdr-cel,audio,stats\n'
+        printf 'AMIObserved=Newexten,VarSet,PINGATESTATUS\n'
+        printf 'SecretInputArtifact=false (mounted input lived outside artifact tree)\n'
+    } >"$RUNTIME_DIR/m3-zero-hit-proof.txt"
+    printf 'ZERO_HIT_SECRET_AUDIT: PASS (both test patterns; every runtime artifact; AMI live)\n'
+}
+
 run_outbound_listen_only_case() {
     local destination="9100@$FS_CONTAINER_IP:5060"
     local response
     local action
-    # The two PIN calls consume the first two process-global channel suffixes.
+    # The two PIN inbound calls, the granted call's B leg, and the no-input
+    # deadline call consume the first four process-global channel suffixes.
     # The harness is serial and starts a fresh rustisk process for every run.
-    local channel="PJSIP/$destination-00000003"
+    local channel="PJSIP/$destination-00000005"
     local stats
     local capture="$RUNTIME_DIR/m1-listen-only.wav"
     local hangup_observed_ms
@@ -1142,6 +1366,17 @@ require_command cargo
 require_command docker
 require_command python3
 
+AGENT_TMP="${AGENT_TMP:-/mnt/data/herodevs-agents}"
+[[ "$AGENT_TMP" == /mnt/data/herodevs-agents* ]] \
+    || fail "AGENT_TMP must stay under /mnt/data/herodevs-agents"
+SECRET_DIR="$(mktemp -d "$AGENT_TMP/m3-pin-secret.XXXXXX")"
+printf -v GRANTED_TEST_PIN '%06d' "$(( (RANDOM * 32768 + RANDOM) % 1000000 ))"
+last_digit="${GRANTED_TEST_PIN: -1}"
+WRONG_TEST_PIN="${GRANTED_TEST_PIN:0:5}$(( (10#$last_digit + 1) % 10 ))"
+umask 077
+printf '%s\n' "$GRANTED_TEST_PIN" >"$SECRET_DIR/pin"
+printf 'invalid\n' >"$SECRET_DIR/invalid"
+
 rm -rf "$RUNTIME_DIR"
 mkdir -p "$CONFIG_DIR" "$RUN_DIR" "$PROMPT_DIR"
 python3 "$HARNESS_DIR/generate_wavs.py" "$PROMPT_DIR"
@@ -1174,9 +1409,12 @@ sed \
     -e "s|bind = 0.0.0.0:15060|bind = $FS_HOST_IP:15060|" \
     "$HARNESS_DIR/config/pjsip.conf" >"$CONFIG_DIR/pjsip.conf"
 cp "$HARNESS_DIR/config/rtp.conf" "$CONFIG_DIR/rtp.conf"
+printf '[general]\nsecret_file = /run/secrets/rustisk/pin\n' \
+    >"$CONFIG_DIR/pin_gate.conf"
 
 printf 'Building rustisk with Rust 1.97.0...\n'
 (cd "$REPO_DIR" && cargo +1.97.0 build -p rustisk-cli)
+prove_startup_secret_fail_closed
 
 printf 'Starting pinned FreeSWITCH carrier container...\n'
 docker network create --internal --subnet "$FS_SUBNET" "$FS_NETWORK" >/dev/null
@@ -1218,12 +1456,15 @@ printf 'Starting isolated rustisk...\n'
 docker run --rm --name "$RUSTISK_CONTAINER" \
     --network "$FS_NETWORK" \
     --ip "$FS_HOST_IP" \
+    --ulimit nofile=65536:65536 \
     --user "$(id -u):$(id -g)" \
     --entrypoint /rustisk \
     --mount "type=bind,src=$REPO_DIR/target/debug/rustisk,dst=/rustisk,readonly" \
     --mount "type=bind,src=$HARNESS_DIR/ami_client.py,dst=/ami_client.py,readonly" \
+    --mount "type=bind,src=$HARNESS_DIR/ami_subscriber.py,dst=/ami_subscriber.py,readonly" \
     --mount "type=bind,src=$RUNTIME_DIR,dst=$RUNTIME_DIR" \
-    "$RUSTISK_IMAGE" -f -vv -C "$CONFIG_DIR/asterisk.conf" >"$RUSTISK_LOG" 2>&1 &
+    --mount "type=bind,src=$SECRET_DIR/pin,dst=/run/secrets/rustisk/pin,readonly" \
+    "$RUSTISK_IMAGE" -f -vvv -C "$CONFIG_DIR/asterisk.conf" >"$RUSTISK_LOG" 2>&1 &
 RUSTISK_PID=$!
 wait_for_ami
 BASELINE_RESOURCES="$(resource_snapshot)"
@@ -1238,8 +1479,19 @@ if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m4-timer-b" ]]; then
     exit 0
 fi
 
-run_case 1 123456 GRANTED
-run_case 2 123450 REJECTED
+start_m3_sink_receivers
+run_case 1 "$WRONG_TEST_PIN" REJECTED
+run_case 2 "$GRANTED_TEST_PIN" GRANTED
+run_m3_no_input_deadline_case
+stop_m3_sink_receivers
+
+if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m3" ]]; then
+    assert_m3_zero_hit_audit
+    printf '\nPASS: isolated M3 receiver-side and zero-hit acceptance.\n'
+    printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
+    exit 0
+fi
+
 run_outbound_listen_only_case
 run_dial_timeout_case
 run_m2_two_way_bye_case
@@ -1254,5 +1506,6 @@ run_m4_concurrency_case
 run_m4_abandon_200_race_case
 run_m4_bye_final_failure_cases
 
+assert_m3_zero_hit_audit
 printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN, M1, M2, and M4 impairment acceptance.\n'
 printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
