@@ -45,6 +45,8 @@ struct SipChannelPrivate {
     request_uri: String,
     /// Every address returned for the destination, in resolver order.
     remote_targets: Vec<SocketAddr>,
+    /// Endpoint-filtered codecs used to create and validate this dialog's SDP.
+    codecs: Vec<Codec>,
 }
 
 impl fmt::Debug for SipChannelPrivate {
@@ -218,6 +220,24 @@ impl SipChannelDriver {
         transport: Arc<dyn SipTransport>,
         rtp: RtpSession,
     ) {
+        self.attach_inbound_media_with_codecs(
+            channel_name,
+            session,
+            transport,
+            rtp,
+            self.codecs.clone(),
+        );
+    }
+
+    /// Attach inbound media with the codec policy of the identified endpoint.
+    pub fn attach_inbound_media_with_codecs(
+        &self,
+        channel_name: &str,
+        session: SipSession,
+        transport: Arc<dyn SipTransport>,
+        rtp: RtpSession,
+        codecs: Vec<Codec>,
+    ) {
         let remote_addr = session.remote_addr;
         let stats = rtp.stats.clone();
         let priv_data = Arc::new(SipChannelPrivate {
@@ -226,6 +246,7 @@ impl SipChannelDriver {
             transport,
             request_uri: String::new(),
             remote_targets: vec![remote_addr],
+            codecs,
         });
         self.channels.write().insert(channel_name.to_string(), priv_data);
         let unique_id = asterisk_core::channel_store::find_by_name(channel_name)
@@ -272,6 +293,11 @@ impl SipChannelDriver {
         rtp.dtmf_payload_type()
     }
 
+    /// Codecs permitted by the endpoint policy for this dialog.
+    pub fn channel_codecs(&self, channel_name: &str) -> Option<Vec<Codec>> {
+        Some(self.get_private(channel_name)?.codecs.clone())
+    }
+
     /// Apply an outbound INVITE answer to the driver-owned dialog and media
     /// session used by `hangup`, `write_frame`, and RTP.
     pub(crate) async fn apply_outbound_answer(
@@ -291,10 +317,15 @@ impl SipChannelDriver {
         };
 
         let payload_type = crate::sdp_rtp::negotiated_audio_payload_type(
-            &remote_sdp, &self.codecs,
+            &remote_sdp, &priv_data.codecs,
         ).ok_or_else(|| {
             AsteriskError::InvalidArgument("SDP answer has no common audio codec".into())
         })?;
+        if !matches!(payload_type, 0 | 8) {
+            return Err(AsteriskError::InvalidArgument(format!(
+                "SDP answer selected non-G.711 payload type {payload_type}"
+            )));
+        }
         let remote_addr = crate::sdp_rtp::remote_rtp_endpoint(&remote_sdp)
             .ok_or_else(|| {
                 AsteriskError::InvalidArgument(
@@ -308,7 +339,7 @@ impl SipChannelDriver {
         rtp.set_payload_type(payload_type);
 
         let dtmf = crate::sdp_rtp::negotiated_dtmf_payload_type(
-            &remote_sdp, &self.codecs,
+            &remote_sdp, &priv_data.codecs,
         );
         if let Some(dtmf_payload_type) = dtmf {
             rtp.set_dtmf_payload_type(dtmf_payload_type);
@@ -419,10 +450,23 @@ impl ChannelDriver for SipChannelDriver {
             ))
         })?;
 
+        let channel_codecs = endpoint_config
+            .as_ref()
+            .and_then(|config| config.find_endpoint(dest))
+            .map(|endpoint| endpoint.media_codecs(&self.codecs))
+            .unwrap_or_else(|| self.codecs.clone());
+        if !channel_codecs.iter().any(|codec| {
+            codec.name.eq_ignore_ascii_case("PCMU")
+                || codec.name.eq_ignore_ascii_case("PCMA")
+        }) {
+            return Err(AsteriskError::InvalidArgument(format!(
+                "Endpoint '{dest}' permits no G.711 audio codec"
+            )));
+        }
+
         // Create RTP session
         let rtp_session = self.allocate_rtp_session(self.local_addr.ip()).await?;
-        if let Some(codec) = self
-            .codecs
+        if let Some(codec) = channel_codecs
             .iter()
             .find(|codec| codec.name.eq_ignore_ascii_case("telephone-event"))
         {
@@ -439,7 +483,7 @@ impl ChannelDriver for SipChannelDriver {
         let sdp = SessionDescription::create_offer(
             &crate::sdp::advertised_media_ip(self.local_addr, remote_addr),
             rtp_port,
-            &self.codecs,
+            &channel_codecs,
         );
         sip_session.local_sdp = Some(sdp);
 
@@ -463,6 +507,7 @@ impl ChannelDriver for SipChannelDriver {
             transport,
             request_uri,
             remote_targets,
+            codecs: channel_codecs,
         });
 
         self.channels.write().insert(channel_name.clone(), priv_data);
