@@ -33,10 +33,20 @@ struct CallState {
     remote_addr: SocketAddr,
     /// Channel name for correlation.
     channel_name: String,
+    /// Dial abandoned this leg while its INVITE was still pending. Retain
+    /// signaling state long enough to resolve a crossing 2xx with ACK+BYE.
+    abandoned: bool,
     /// Bounded socket reservation used only by signaling-only handlers that
     /// were constructed without a channel driver (primarily unit tests).
     _rtp_reservation: Option<RtpSession>,
 }
+
+#[cfg(not(test))]
+const ABANDONED_SIGNALING_GRACE: std::time::Duration =
+    crate::transaction::timers::TIMER_B;
+#[cfg(test)]
+const ABANDONED_SIGNALING_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 /// Exact live-resource counts for SIP call teardown verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,6 +694,7 @@ impl SipEventHandler {
             session,
             remote_addr,
             channel_name: channel_name.clone(),
+            abandoned: false,
             _rtp_reservation: rtp_reservation,
         }));
         {
@@ -990,6 +1001,7 @@ impl SipEventHandler {
             session,
             remote_addr,
             channel_name: channel_name.to_string(),
+            abandoned: false,
             _rtp_reservation: None,
         }));
         self.call_states.write().insert(call_id.to_string(), call_state);
@@ -1040,96 +1052,113 @@ impl SipEventHandler {
             return;
         }
 
-        if let Some(channel) = store::find_by_name(&channel_name) {
-            // Handle channel state update only for INVITE responses
-            if cseq_method == "INVITE" {
-                let cs_arc = {
-                    let states = self.call_states.read();
-                    states.get(&call_id).cloned()
-                };
-                if let Some(cs_arc) = cs_arc {
-                    cs_arc.lock().await.session.on_response(response);
+        if cseq_method != "INVITE" {
+            return;
+        }
+
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(&call_id).cloned()
+        };
+        let Some(cs_arc) = cs_arc else {
+            return;
+        };
+
+        // This mutex is the serialization point between response handling
+        // and Dial abandonment. It deliberately remains held across the
+        // signaling awaits: either the 2xx path sends ACK before abandonment
+        // observes Established, or abandonment marks the leg first and this
+        // path performs the mandatory ACK-then-BYE recovery.
+        let mut cs = cs_arc.lock().await;
+        if !cs.session.is_outbound {
+            return;
+        }
+        cs.session.on_response(response);
+
+        if let Some(to_tag) = response.get_header("To")
+            .and_then(crate::parser::extract_tag) {
+            crate::notify_service::global_notify_service()
+                .update_remote_tag(&channel_name, &to_tag);
+        }
+
+        if (200..300).contains(&status_code) {
+            if let Some(ack) = cs.session.build_ack() {
+                if let Err(error) = self.transport.send(&ack, remote_addr).await {
+                    warn!(call_id = %call_id, %error, "Failed to send ACK");
+                } else {
+                    debug!(call_id = %call_id, "Sent ACK for 200 OK");
                 }
-                let mut ch = channel.lock();
-                match status_code {
-                    180 | 183 => {
-                        ch.set_state(ChannelState::Ringing);
+            } else {
+                warn!(call_id = %call_id, "Failed to build ACK for 200 OK");
+            }
+
+            if cs.abandoned {
+                if let Some(bye) = cs.session.build_bye() {
+                    if let Err(error) = self.transport.send(&bye, cs.remote_addr).await {
+                        warn!(call_id = %call_id, %error,
+                            "Failed to send BYE after abandoned INVITE received 200");
+                    } else {
+                        info!(call_id = %call_id,
+                            "Resolved abandoned INVITE/200 crossing with ACK then BYE");
                     }
-                    486 => {
-                        ch.set_state(ChannelState::Busy);
-                        ch.hangup_cause = HangupCause::UserBusy;
+                }
+                drop(cs);
+                self.release_outbound_leg(&channel_name);
+                return;
+            }
+
+            let answer_result = match self.channel_driver.get() {
+                Some(driver) => driver.apply_outbound_answer(
+                    &channel_name, response,
+                ).await.map_err(|error| error.to_string()),
+                None => Err("SIP channel driver is not attached".to_string()),
+            };
+
+            match answer_result {
+                Ok(()) => {
+                    if let Some(channel) = store::find_by_name(&channel_name) {
+                        channel.lock().set_state(ChannelState::Up);
                     }
-                    _ if status_code >= 400 => {
-                        ch.hangup_cause = HangupCause::NormalClearing;
+                }
+                Err(error) => {
+                    warn!(call_id = %call_id, channel = %channel_name, %error,
+                        "Rejecting unusable outbound SDP answer");
+                    if let Some(bye) = cs.session.build_bye() {
+                        if let Err(send_error) = self.transport.send(&bye, remote_addr).await {
+                            warn!(call_id = %call_id,
+                                "Failed to send BYE after rejecting answer: {}", send_error);
+                        }
+                    }
+                    if let Some(channel) = store::find_by_name(&channel_name) {
+                        let mut ch = channel.lock();
+                        ch.hangup_cause = HangupCause::BearerCapNotAvail;
                         ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
                     }
-                    _ => {}
                 }
             }
-            // Update NOTIFY service with remote tag from response
-            if let Some(to_tag) = response.get_header("To")
-                .and_then(crate::parser::extract_tag) {
-                let notify_svc = crate::notify_service::global_notify_service();
-                notify_svc.update_remote_tag(&channel_name, &to_tag);
-            }
-            // Send ACK for 200 OK on outbound INVITE only (not NOTIFY 200 OK)
-            let cseq_is_invite = response.get_header("CSeq")
-                .map(|c| c.to_uppercase().contains("INVITE"))
-                .unwrap_or(false);
-            if status_code == 200 && cseq_is_invite {
-                let cs_arc = {
-                    let states = self.call_states.read();
-                    states.get(&call_id).cloned()
-                };
-                if let Some(cs_arc) = cs_arc {
-                    let ack = {
-                        let cs = cs_arc.lock().await;
-                        if !cs.session.is_outbound {
-                            return;
-                        }
-                        cs.session.build_ack()
-                    };
-                    if let Some(ack) = ack {
-                        if let Err(e) = self.transport.send(&ack, remote_addr).await {
-                            warn!(call_id = %call_id, "Failed to send ACK: {}", e);
-                        } else {
-                            debug!(call_id = %call_id, "Sent ACK for 200 OK");
-                        }
-                    } else {
-                        warn!(call_id = %call_id, "Failed to build ACK for 200 OK");
-                    }
+            return;
+        }
 
-                    let answer_result = match self.channel_driver.get() {
-                        Some(driver) => driver.apply_outbound_answer(
-                            &channel_name, response,
-                        ).await.map_err(|error| error.to_string()),
-                        None => Err("SIP channel driver is not attached".to_string()),
-                    };
+        let abandoned = cs.abandoned;
+        drop(cs);
+        if abandoned && status_code >= 300 {
+            self.release_outbound_leg(&channel_name);
+            return;
+        }
 
-                    match answer_result {
-                        Ok(()) => channel.lock().set_state(ChannelState::Up),
-                        Err(error) => {
-                            warn!(call_id = %call_id, channel = %channel_name, %error,
-                                "Rejecting unusable outbound SDP answer");
-                            let bye = {
-                                let mut cs = cs_arc.lock().await;
-                                cs.session.build_bye()
-                            };
-                            if let Some(bye) = bye {
-                                if let Err(send_error) =
-                                    self.transport.send(&bye, remote_addr).await
-                                {
-                                    warn!(call_id = %call_id,
-                                        "Failed to send BYE after rejecting answer: {}",
-                                        send_error);
-                                }
-                            }
-                            let mut ch = channel.lock();
-                            ch.hangup_cause = HangupCause::BearerCapNotAvail;
-                            ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
-                        }
-                    }
+        if let Some(channel) = store::find_by_name(&channel_name) {
+            let mut ch = channel.lock();
+            match status_code {
+                180 | 183 => ch.set_state(ChannelState::Ringing),
+                486 => {
+                    ch.set_state(ChannelState::Busy);
+                    ch.hangup_cause = HangupCause::UserBusy;
                 }
+                _ if status_code >= 400 => {
+                    ch.hangup_cause = HangupCause::NormalClearing;
+                    ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                }
+                _ => {}
             }
         }
     }
@@ -1672,26 +1701,31 @@ impl SipEventHandler {
             map.iter().find(|(_, name)| name.as_str() == channel_name)
                 .map(|(call_id, _)| call_id.clone())
         };
+        let mut preserve_signaling = None;
+        let mut released = false;
         if let Some(ref call_id) = call_id {
             let cs_arc = {
                 let states = self.call_states.read();
                 states.get(call_id).cloned()
             };
             if let Some(cs_arc) = cs_arc {
-                let (request, remote_addr) = {
-                    let mut cs = cs_arc.lock().await;
-                    let request = match cs.session.state {
-                        crate::session::SessionState::Initiated
-                        | crate::session::SessionState::Early => cs.session.build_cancel(),
-                        crate::session::SessionState::Established => cs.session.build_bye(),
-                        crate::session::SessionState::Terminating
-                        | crate::session::SessionState::Terminated => None,
-                    };
-                    (request, cs.remote_addr)
+                let mut cs = cs_arc.lock().await;
+                let pending = matches!(
+                    cs.session.state,
+                    crate::session::SessionState::Initiated
+                        | crate::session::SessionState::Early
+                );
+                cs.abandoned = true;
+                let request = match cs.session.state {
+                    crate::session::SessionState::Initiated
+                    | crate::session::SessionState::Early => cs.session.build_cancel(),
+                    crate::session::SessionState::Established => cs.session.build_bye(),
+                    crate::session::SessionState::Terminating
+                    | crate::session::SessionState::Terminated => None,
                 };
                 if let Some(request) = request {
                     let method = request.method();
-                    if let Err(error) = self.transport.send(&request, remote_addr).await {
+                    if let Err(error) = self.transport.send(&request, cs.remote_addr).await {
                         warn!(call_id = %call_id, channel = channel_name,
                             ?method, %error, "Failed to signal abandoned Dial leg");
                     } else {
@@ -1699,9 +1733,59 @@ impl SipEventHandler {
                             ?method, "Signaled abandoned Dial leg");
                     }
                 }
+                if pending {
+                    preserve_signaling = Some((call_id.clone(), cs_arc.clone()));
+                } else {
+                    // Keep the per-call mutex held through final release so
+                    // a response that already cloned this state can only run
+                    // afterward and will observe `abandoned = true`.
+                    self.release_outbound_leg(channel_name);
+                    released = true;
+                }
             }
         }
-        self.release_outbound_leg(channel_name);
+        if let Some((call_id, call_state)) = preserve_signaling {
+            self.release_outbound_media(channel_name);
+            self.schedule_abandoned_signaling_reap(call_id, call_state);
+        } else if !released {
+            self.release_outbound_leg(channel_name);
+        }
+    }
+
+    fn schedule_abandoned_signaling_reap(
+        &self,
+        call_id: String,
+        call_state: Arc<tokio::sync::Mutex<CallState>>,
+    ) {
+        let callid_map = self.callid_map.clone();
+        let call_states = self.call_states.clone();
+        tokio::spawn(async move {
+            // A final response may legitimately arrive until the INVITE client
+            // transaction's Timer B expires. Keep just the routing tombstone
+            // for that full window so a late crossing 2xx still gets ACK+BYE.
+            tokio::time::sleep(ABANDONED_SIGNALING_GRACE).await;
+            let still_current = call_states
+                .read()
+                .get(&call_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &call_state));
+            if still_current {
+                call_states.write().remove(&call_id);
+                callid_map.write().remove(&call_id);
+                debug!(call_id = %call_id,
+                    "Reaped abandoned INVITE after final-response grace period");
+            }
+        });
+    }
+
+    fn release_outbound_media(&self, channel_name: &str) {
+        crate::notify_service::global_notify_service().unregister_channel(channel_name);
+        if let Some(driver) = self.channel_driver.get() {
+            driver.remove_channel(channel_name);
+        }
+        if let Some(channel) = store::find_by_name(channel_name) {
+            let unique_id = channel.lock().unique_id.0.clone();
+            store::deregister(&unique_id);
+        }
     }
 
     /// Release an outbound leg's local resources — its global store channel,
@@ -1723,14 +1807,7 @@ impl SipEventHandler {
             self.callid_map.write().remove(&call_id);
             self.call_states.write().remove(&call_id);
         }
-        crate::notify_service::global_notify_service().unregister_channel(channel_name);
-        if let Some(driver) = self.channel_driver.get() {
-            driver.remove_channel(channel_name);
-        }
-        if let Some(channel) = store::find_by_name(channel_name) {
-            let unique_id = channel.lock().unique_id.0.clone();
-            store::deregister(&unique_id);
-        }
+        self.release_outbound_media(channel_name);
     }
 
     /// Get the remote SDP for an active call (the SDP from the initial INVITE offer).
@@ -2025,6 +2102,34 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BlockingCancelTransport {
+        local_addr: SocketAddr,
+        sent: std::sync::Mutex<Vec<SipMessage>>,
+        cancel_started: tokio::sync::Notify,
+        release_cancel: tokio::sync::Notify,
+    }
+
+    impl BlockingCancelTransport {
+        fn new() -> Self {
+            Self {
+                local_addr: "127.0.0.1:5060".parse().unwrap(),
+                sent: std::sync::Mutex::new(Vec::new()),
+                cancel_started: tokio::sync::Notify::new(),
+                release_cancel: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn methods(&self) -> Vec<crate::parser::SipMethod> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(SipMessage::method)
+                .collect()
+        }
+    }
+
     #[async_trait::async_trait]
     impl SipTransport for RecordingTransport {
         async fn send(
@@ -2033,6 +2138,30 @@ mod tests {
             _addr: SocketAddr,
         ) -> Result<(), crate::transport::TransportError> {
             self.sent.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr, crate::transport::TransportError> {
+            Ok(self.local_addr)
+        }
+
+        fn protocol(&self) -> &str {
+            "UDP"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SipTransport for BlockingCancelTransport {
+        async fn send(
+            &self,
+            msg: &SipMessage,
+            _addr: SocketAddr,
+        ) -> Result<(), crate::transport::TransportError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            if msg.method() == Some(crate::parser::SipMethod::Cancel) {
+                self.cancel_started.notify_one();
+                self.release_cancel.notified().await;
+            }
             Ok(())
         }
 
@@ -2457,6 +2586,12 @@ mod tests {
             let session = outbound_session_ready_for_cancel(
                 transport.local_addr, remote, state,
             );
+            let failure = session
+                .invite
+                .as_ref()
+                .unwrap()
+                .create_response(487, "Request Terminated")
+                .unwrap();
             let call_id = session.call_id.clone();
             let channel_name = format!("PJSIP/cancel-{index}");
             handler.register_outbound_callid(&call_id, &channel_name);
@@ -2464,12 +2599,97 @@ mod tests {
                 &call_id, &channel_name, session, remote,
             );
             handler.cancel_or_bye_outbound_leg(&channel_name).await;
+            handler.handle_response(&failure, remote).await;
         }
 
         assert_eq!(transport.methods(), vec![
             crate::parser::SipMethod::Cancel,
             crate::parser::SipMethod::Cancel,
         ]);
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(handler.call_states.read().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_200_crossing_is_serialized_as_cancel_ack_bye() {
+        let transport = Arc::new(BlockingCancelTransport::new());
+        let handler = Arc::new(SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        ));
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let session = outbound_session_ready_for_cancel(
+            transport.local_addr,
+            remote,
+            crate::session::SessionState::Early,
+        );
+        let invite = session.invite.clone().unwrap();
+        let mut answer = invite.create_response(200, "OK").unwrap();
+        answer
+            .headers
+            .iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case("To"))
+            .unwrap()
+            .value
+            .push_str(";tag=peer-tag");
+        answer.add_header("Contact", "<sip:peer@127.0.0.1:5060>");
+
+        let call_id = session.call_id.clone();
+        let channel_name = "PJSIP/cancel-200-race";
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(&call_id, channel_name, session, remote);
+
+        let abandon = {
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                handler.cancel_or_bye_outbound_leg(channel_name).await;
+            })
+        };
+        transport.cancel_started.notified().await;
+
+        let response = {
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                handler.handle_response(&answer, remote).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        transport.release_cancel.notify_one();
+        abandon.await.unwrap();
+        response.await.unwrap();
+
+        assert_eq!(
+            transport.methods(),
+            vec![
+                crate::parser::SipMethod::Cancel,
+                crate::parser::SipMethod::Ack,
+                crate::parser::SipMethod::Bye,
+            ],
+            "a crossing 2xx must be acknowledged before the abandoned dialog is terminated"
+        );
+        assert_eq!(handler.active_calls(), 0);
+        assert_eq!(handler.call_states.read().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_invite_signaling_state_has_bounded_fallback_reap() {
+        let transport = Arc::new(RecordingTransport::new());
+        let handler = SipEventHandler::new(
+            Arc::new(Dialplan::new()), transport.clone(),
+        );
+        let remote: SocketAddr = "127.0.0.1:5060".parse().unwrap();
+        let session = outbound_session_ready_for_cancel(
+            transport.local_addr,
+            remote,
+            crate::session::SessionState::Early,
+        );
+        let call_id = session.call_id.clone();
+        let channel_name = "PJSIP/abandon-fallback";
+        handler.register_outbound_callid(&call_id, channel_name);
+        handler.register_outbound_session(&call_id, channel_name, session, remote);
+
+        handler.cancel_or_bye_outbound_leg(channel_name).await;
+        assert_eq!(handler.active_calls(), 1, "crossing-final grace must retain routing");
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         assert_eq!(handler.active_calls(), 0);
         assert_eq!(handler.call_states.read().len(), 0);
     }
