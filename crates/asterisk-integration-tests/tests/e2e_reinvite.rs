@@ -28,7 +28,7 @@ use asterisk_sip::event_handler::SipEventHandler;
 use asterisk_sip::parser::SipMessage;
 use asterisk_sip::pjsip_config::{set_global_pjsip_config, EndpointConfig, PjsipConfig};
 use asterisk_sip::rtp::{build_rtp_packet, parse_rtp_header, RtpHeader};
-use asterisk_sip::sdp::SessionDescription;
+use asterisk_sip::sdp::{MediaDirection, SessionDescription};
 use asterisk_sip::session::SipSession;
 use asterisk_sip::transport::UdpTransport;
 use tokio::net::UdpSocket;
@@ -276,11 +276,27 @@ async fn reinvite_renegotiates_media_and_holds_receiver_side() {
     )
     .await;
     assert_eq!(ok3.status_code(), Some(200), "hold re-INVITE must be answered 200");
+    // RFC 3264 §6.1 (M5 review MAJOR-2): a `sendonly` hold offer MUST be
+    // answered `recvonly` or `inactive`, never `sendrecv`. Assert the wire SDP
+    // direction of the hold 200 — the receiver-side pump-pause proof below is
+    // necessary but not sufficient; the negotiated wire contract must be valid.
+    let hold_answer = SessionDescription::parse(&ok3.body).expect("hold 200 must carry SDP");
+    let hold_dir = hold_answer
+        .media_descriptions
+        .iter()
+        .find(|m| m.media_type == "audio")
+        .expect("audio stream in hold answer")
+        .direction;
+    assert!(
+        matches!(hold_dir, MediaDirection::RecvOnly | MediaDirection::Inactive),
+        "RFC 3264 §6.1: a sendonly hold offer must be answered recvonly or inactive, \
+         got {hold_dir:?}"
+    );
     assert!(
         !echo_ok(&rtp_b, rustisk_rtp2, 8, Duration::from_secs(1)).await,
         "hold: the media pump must be paused (no echo returns while on hold)"
     );
-    println!("[E2E] hold: media pump paused, far side receives silence");
+    println!("[E2E] hold: 200 answered recvonly/inactive (RFC 3264 §6.1); media pump paused");
 
     // ---- Un-hold: sendrecv re-INVITE resumes the pump ---------------------
     let unhold_offer =
