@@ -864,10 +864,16 @@ pub fn extract_tag(header_value: &str) -> Option<String> {
 pub fn extract_uri(header_value: &str) -> Option<String> {
     if let Some(start) = header_value.find('<') {
         if let Some(end) = header_value.find('>') {
-            return Some(header_value[start + 1..end].to_string());
+            // A malformed header where '>' precedes '<' gives start > end;
+            // slicing `header_value[start + 1..end]` on a reversed range
+            // panics ("byte range starts at N but ends at M") — a remotely
+            // triggerable crash. Only extract when the brackets are ordered.
+            if start < end {
+                return Some(header_value[start + 1..end].to_string());
+            }
         }
     }
-    // No angle brackets -- the whole value (minus params) is the URI
+    // No (usable) angle brackets -- the whole value (minus params) is the URI
     Some(header_value.split(';').next()?.trim().to_string())
 }
 
@@ -1343,5 +1349,26 @@ Content-Length: 1\r\n\
 ab";
         let parsed = SipMessage::parse(raw.as_bytes()).expect("must parse");
         assert_eq!(parsed.body, "a");
+    }
+
+    /// Regression: a From/To header value where '>' precedes '<' must NOT
+    /// panic. `header_value[start + 1..end]` used to abort with "byte range
+    /// starts at N but ends at M" on the reversed range — a remote DoS since
+    /// extract_uri runs on attacker-supplied From/To/Contact values inside the
+    /// main SIP event loop.
+    #[test]
+    fn test_extract_uri_reversed_brackets_does_not_panic() {
+        // '>' at index 0, '<' at index 6 -> reversed range if sliced blindly.
+        assert_eq!(extract_uri(">sip:x<"), Some(">sip:x<".to_string()));
+        // Well-formed angle brackets still extract the inner URI.
+        assert_eq!(
+            extract_uri("\"Bob\" <sip:bob@h>;tag=1"),
+            Some("sip:bob@h".to_string())
+        );
+        // No brackets: value minus params.
+        assert_eq!(
+            extract_uri("sip:carol@h;tag=2"),
+            Some("sip:carol@h".to_string())
+        );
     }
 }
