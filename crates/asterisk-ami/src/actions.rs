@@ -113,6 +113,9 @@ pub type ActionHandler = Box<
 pub struct ActionContext {
     /// Registry of configured AMI users.
     pub user_registry: Arc<UserRegistry>,
+    /// Per-source failed-`Login` rate limiter (issue #130). Shared across all
+    /// connections of a server so guess volume is bounded per source address.
+    pub login_rate_limiter: Arc<crate::rate_limit::LoginRateLimiter>,
 }
 
 /// Registry of AMI action handlers.
@@ -341,6 +344,20 @@ fn handle_login(
     session: &mut AmiSession,
     context: &ActionContext,
 ) -> AmiResponse {
+    // Login rate limiting (issue #130): throttle guess VOLUME per source before
+    // touching credentials, so an attacker cannot grind unlimited online
+    // password guesses. Keyed by source address, not username, so rotating the
+    // username does not evade the block.
+    let source_ip = session.addr.ip();
+    if let Err(retry_after) = context.login_rate_limiter.check(source_ip) {
+        warn!(
+            "AMI Login: throttled from {} ({}s remaining)",
+            source_ip,
+            retry_after.as_secs()
+        );
+        return AmiResponse::error("Login rate exceeded, try again later");
+    }
+
     let username = match action.get_header("Username") {
         Some(u) => u,
         None => {
@@ -352,6 +369,7 @@ fn handle_login(
         Some(u) => u,
         None => {
             warn!("AMI Login: unknown user '{}'", username);
+            context.login_rate_limiter.record_failure(source_ip);
             return AmiResponse::error("Authentication failed");
         }
     };
@@ -368,12 +386,15 @@ fn handle_login(
         // an attacker could grind guesses against one stable nonce.
         if let Some(challenge) = session.challenge.take() {
             if auth::verify_md5_response(&challenge, &user.secret, key) {
+                context.login_rate_limiter.record_success(source_ip);
                 session.authenticate(&user);
                 return AmiResponse::success("Authentication accepted");
             } else {
+                context.login_rate_limiter.record_failure(source_ip);
                 return AmiResponse::error("Authentication failed");
             }
         } else {
+            context.login_rate_limiter.record_failure(source_ip);
             return AmiResponse::error("No challenge sent");
         }
     }
@@ -387,9 +408,11 @@ fn handle_login(
     };
 
     if auth::verify_plaintext(&user, secret) {
+        context.login_rate_limiter.record_success(source_ip);
         session.authenticate(&user);
         AmiResponse::success("Authentication accepted")
     } else {
+        context.login_rate_limiter.record_failure(source_ip);
         AmiResponse::error("Authentication failed")
     }
 }
@@ -2585,6 +2608,7 @@ mod tests {
         registry.add_user(AmiUser::new("admin", "secret"));
         let ctx = ActionContext {
             user_registry: registry.clone(),
+            login_rate_limiter: Arc::new(crate::rate_limit::LoginRateLimiter::new()),
         };
         (ctx, registry)
     }
