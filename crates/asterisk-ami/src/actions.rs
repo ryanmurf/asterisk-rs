@@ -50,10 +50,15 @@ pub enum ActionAuthority {
 /// - `Command` (CLI execution) → `COMMAND`
 /// - `UpdateConfig` → `CONFIG`
 /// - `Originate` / `PJSIPNotify` / `PJSIPQualify` → `SYSTEM`
-///   (Asterisk lets `Originate` use `system` OR `call`; we require the stricter
-///   `SYSTEM` and document it.)
+///   (Asterisk lets `Originate` use `system` OR `call`; per the coordinator
+///   decision we require the stricter `SYSTEM` and document it. This crate has
+///   no dedicated `originate` privilege category, so `ListCommands` advertises
+///   `system` for Originate to match this enforcement.)
+/// - `QueueAdd` / `QueueRemove` / `QueuePause` → `AGENT` (queue-membership
+///   administration, matching Asterisk `app_queue` and this crate's
+///   `ListCommands`-advertised `agent` privilege).
 /// - `Redirect` / `Hangup` / `Bridge` / `Park` / `SetVar` / `Atxfer` /
-///   `SendText` / `Queue*` / `ConfBridgeKick` / `ConfBridgeMute` → `CALL`
+///   `SendText` / `ConfBridgeKick` / `ConfBridgeMute` → `CALL`
 pub fn action_authority(name_lower: &str) -> Option<ActionAuthority> {
     use ActionAuthority::{Preauth, ReadOnly, Write};
     let authority = match name_lower {
@@ -69,11 +74,12 @@ pub fn action_authority(name_lower: &str) -> Option<ActionAuthority> {
         // SYSTEM: origination and system-level signaling.
         "originate" | "pjsipnotify" | "pjsipqualify" => Write(EventCategory::SYSTEM),
 
-        // CALL: call control, dialplan-variable writes, queue and conf-bridge ops.
+        // AGENT: queue-membership administration.
+        "queueadd" | "queueremove" | "queuepause" => Write(EventCategory::AGENT),
+
+        // CALL: call control, dialplan-variable writes, conf-bridge participant ops.
         "redirect" | "hangup" | "bridge" | "park" | "setvar" | "atxfer" | "sendtext"
-        | "queueadd" | "queueremove" | "queuepause" | "confbridgekick" | "confbridgemute" => {
-            Write(EventCategory::CALL)
-        }
+        | "confbridgekick" | "confbridgemute" => Write(EventCategory::CALL),
 
         // Read-only status / list / show / session-control actions: any
         // authenticated session may run them (must not be over-gated).
@@ -175,6 +181,21 @@ impl ActionRegistry {
 
         match handler {
             Some(handler) => {
+                // Runtime fail-closed backstop for issue #126: a REGISTERED
+                // handler with no authority classification must NOT execute for
+                // an authenticated no-perm session. This can only happen if a
+                // new handler was registered without being added to
+                // `action_authority` — the `test_every_registered_action_is_classified`
+                // drift test fails first at CI, but deny here too so a slipped
+                // classification is fail-closed at runtime, not a free pass.
+                if authority.is_none() {
+                    warn!(
+                        "AMI: registered action '{}' has no authority classification; denying (fail-closed)",
+                        action.name
+                    );
+                    return AmiResponse::error("Permission denied")
+                        .with_action_id(action.action_id.clone());
+                }
                 let resp = handler(action, session, context);
                 resp.with_action_id(action.action_id.clone())
             }
@@ -1436,7 +1457,7 @@ fn handle_list_commands(
         .with_header("Hangup", "Hangup channel (Privilege: system,call)")
         .with_header("Status", "Lists channel status (Privilege: system,call)")
         .with_header("RTPStats", "Show per-call RTP proof counters (Privilege: call)")
-        .with_header("Originate", "Originate a call (Privilege: originate)")
+        .with_header("Originate", "Originate a call (Privilege: system)")
         .with_header("Redirect", "Redirect (transfer) a call (Privilege: call)")
         .with_header("Command", "Execute Asterisk CLI Command (Privilege: command)")
         .with_header("Events", "Control Event Flow (Privilege: <none>)")
@@ -3160,6 +3181,22 @@ mod tests {
     }
 
     #[test]
+    fn test_authz_queue_admin_requires_agent_not_call() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+
+        // A call-control user must NOT gain queue-membership administration.
+        let (mut call_user, _rx1) = authed_session_with(EventCategory::ALL, EventCategory::CALL);
+        let denied = dispatch_named(&registry, &ctx, &mut call_user, "QueueAdd");
+        assert_eq!(denied.message, "Permission denied", "write=call must be denied QueueAdd (needs AGENT)");
+
+        // An agent user IS allowed (reaches the handler's arg validation).
+        let (mut agent_user, _rx2) = authed_session_with(EventCategory::ALL, EventCategory::AGENT);
+        let allowed = dispatch_named(&registry, &ctx, &mut agent_user, "QueueAdd");
+        assert_ne!(allowed.message, "Permission denied", "write=agent must pass the QueueAdd gate");
+    }
+
+    #[test]
     fn test_authz_empty_write_user_denied_all_state_changing_actions() {
         let (ctx, _reg) = make_context();
         let registry = ActionRegistry::new(ctx.user_registry.clone());
@@ -3256,6 +3293,9 @@ mod tests {
         assert_eq!(action_authority("hangup"), Some(Write(EventCategory::CALL)));
         assert_eq!(action_authority("setvar"), Some(Write(EventCategory::CALL)));
         assert_eq!(action_authority("confbridgekick"), Some(Write(EventCategory::CALL)));
+        // Queue membership admin is AGENT (matches ListCommands + Asterisk), NOT CALL.
+        assert_eq!(action_authority("queueadd"), Some(Write(EventCategory::AGENT)));
+        assert_eq!(action_authority("queuepause"), Some(Write(EventCategory::AGENT)));
         assert_eq!(action_authority("ping"), Some(ReadOnly));
         assert_eq!(action_authority("coreshowchannels"), Some(ReadOnly));
         assert_eq!(action_authority("nonexistentaction"), None);

@@ -12,6 +12,7 @@ silence cannot masquerade as a pass.
 import argparse
 import os
 import socket
+import sys
 
 
 def main() -> None:
@@ -35,7 +36,17 @@ def main() -> None:
             except TimeoutError:
                 continue
             if not chunk:
-                break
+                # EOF before the harness signaled stop. The subscriber died
+                # mid-run, so it may have MISSED later (possibly PIN-bearing)
+                # events while the greps and zero-hit audit still "pass" against
+                # the partial transcript — a subscriber-sees-nothing false pass.
+                # Fail loudly instead: `wait "$AMI_SUBSCRIBER_PID"` in run.sh
+                # then errors out rather than silently accepting truncation.
+                sys.stderr.write(
+                    "ami_subscriber: connection closed before stop file existed "
+                    "(subscriber died early; audit transcript is truncated)\n"
+                )
+                sys.exit(1)
             os.write(1, chunk)
 
 
