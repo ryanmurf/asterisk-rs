@@ -248,6 +248,11 @@ async fn external_signaling_address_and_port_scoped_by_local_net() {
     let (v_host, v_port) = via_hostport(bye.get_header("Via").expect("BYE Via"));
     assert_eq!(v_host, "127.0.0.1", "local_net peer must see the internal address in the BYE Via");
     assert_eq!(v_port, Some(sip_local.port()), "local_net peer must see the internal port in the BYE Via");
+
+    let (f_host, f_port) = uri_hostport(bye.get_header("From").expect("BYE From"));
+    assert_eq!(f_host, "127.0.0.1", "local_net peer must see the internal address in the BYE From URI");
+    assert_eq!(f_port, Some(sip_local.port()), "local_net peer must see the internal port in the BYE From URI");
+    assert_ne!(f_port, Some(EXT_PORT), "the external port override must NOT reach a local_net peer's From");
     println!("[E2E] local_net peer: Contact/Via/From carry the internal bind 127.0.0.1:{}", sip_local.port());
 
     set_global_pjsip_config(PjsipConfig::default());

@@ -964,19 +964,22 @@ pub fn advertised_signaling_hostport(
     let (external, external_port, local_net) = match crate::pjsip_config::get_global_pjsip_config()
     {
         Some(cfg) => {
-            // Same bind-coverage lookup as advertised_media_ip: the transport
-            // whose bind covers `local` — exact ip+port, then exact ip, then a
-            // wildcard bind. A transport bound to a DIFFERENT concrete address
-            // never donates its NAT config.
-            let with_ext = |pred: &dyn Fn(&crate::pjsip_config::TransportConfig) -> bool| {
-                cfg.transports
-                    .iter()
-                    .find(|t| t.external_signaling_address.is_some() && pred(t))
-            };
-            let transport =
-                with_ext(&|t| t.bind.ip() == local.ip() && t.bind.port() == local.port())
-                    .or_else(|| with_ext(&|t| t.bind.ip() == local.ip()))
-                    .or_else(|| with_ext(&|t| t.bind.ip().is_unspecified()));
+            // Select the transport whose bind COVERS `local` first — exact
+            // ip+port, then exact ip, then a wildcard bind — and only THEN read
+            // its NAT config. Selecting by bind coverage (not by "has an
+            // external address") stops a same-ip/wildcard transport that
+            // happens to set an external address from donating it to a covering
+            // transport that deliberately set none (codex CP2 F1). A transport
+            // bound to a DIFFERENT concrete address never covers `local`.
+            // (Transport identity is not yet carried on the dialog; when it is,
+            // that binding should replace this bind-coverage lookup — protocol
+            // is likewise not distinguished here because only UDP is bound.)
+            let transport = cfg
+                .transports
+                .iter()
+                .find(|t| t.bind == local)
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip() == local.ip()))
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip().is_unspecified()));
             match transport {
                 Some(t) => (
                     t.external_signaling_address.clone(),
@@ -1295,6 +1298,41 @@ mod tests {
         // Local bind 127.0.0.1 is NOT covered by the 192.0.2.50 transport.
         let hp = advertised_signaling_hostport(sa("127.0.0.1:5060"), sa("198.51.100.7:5062"));
         assert_eq!(hp, "127.0.0.1:5060");
+        set_global_pjsip_config(PjsipConfig::default());
+    }
+
+    /// codex CP2 F1: the transport that COVERS `local` is selected first, even
+    /// when it sets no external address. A same-ip / wildcard transport that
+    /// happens to configure an external address must NOT donate it to the
+    /// covering transport that deliberately set none.
+    #[test]
+    fn test_signaling_covering_transport_without_external_wins() {
+        use crate::pjsip_config::{set_global_pjsip_config, PjsipConfig, TransportConfig};
+        let base = |bind: &str, ext: Option<&str>| TransportConfig {
+            name: format!("t-{bind}"),
+            protocol: "udp".to_string(),
+            bind: bind.parse().unwrap(),
+            external_media_address: None,
+            external_signaling_address: ext.map(|s| s.to_string()),
+            external_signaling_port: ext.map(|_| 6666),
+            cert_file: None,
+            priv_key_file: None,
+            local_net: vec![],
+        };
+        let cfg = PjsipConfig {
+            transports: vec![
+                // The covering transport (exact ip 192.0.2.10) sets NO external.
+                base("192.0.2.10:5060", None),
+                // A wildcard transport DOES set an external address.
+                base("0.0.0.0:5062", Some("203.0.113.99")),
+            ],
+            ..Default::default()
+        };
+        set_global_pjsip_config(cfg);
+        // local is covered by the exact-ip transport (no external) -> internal
+        // bind must be advertised, NOT the wildcard transport's external.
+        let hp = advertised_signaling_hostport(sa("192.0.2.10:5060"), sa("198.51.100.7:5062"));
+        assert_eq!(hp, "192.0.2.10:5060", "covering transport (no external) must not inherit the wildcard's external");
         set_global_pjsip_config(PjsipConfig::default());
     }
 
