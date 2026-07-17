@@ -151,7 +151,10 @@ def do_register(sock, aor, registrar_ip, username, password, own, status_path):
     while time.time() < deadline:
         attempt += 1
         call_id = "%s-%d" % (rand_hex(10), attempt)
-        # 1. unauthenticated REGISTER -> expect 401
+        # 1. unauthenticated REGISTER -> MUST be challenged 401. A 200 here means
+        #    rustisk bound an UNAUTHENTICATED contact — an auth regression that
+        #    would otherwise false-green the whole "digest-authenticated REGISTER"
+        #    proof. Fail hard.
         sock.sendto(build_register(aor, registrar_ip, own, call_id, 1), dst)
         ch = None
         t = time.time() + 2
@@ -169,9 +172,9 @@ def do_register(sock, aor, registrar_ip, username, password, own, status_path):
                     ch = parse_challenge(www)
                 break
             if st == 200:
-                # already bound (rare); treat as success
-                _mark_registered(status_path, own)
-                return True
+                log("FATAL: unauthenticated REGISTER was accepted (200) without a "
+                    "digest challenge — auth regression")
+                sys.exit(3)
         if ch is None:
             time.sleep(1.0)
             continue

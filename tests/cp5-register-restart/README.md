@@ -36,12 +36,13 @@ bridge a new IP.** The harness watches the INVITE *arrive* on the bridge/sentine
    route.
 4. **RED (captured negative control).** Routing is defeated by a **static
    contact pinned to A** (`bridge_pinned`, whose AoR carries `contact =
-   sip:bridge@A:5060` and never re-registers). `Dial(PJSIP/bridge_pinned)`
-   misroutes to stale A; the sentinel catches the INVITE and the follow-to-B
-   assertion goes **RED**. This proves the A-detection is real — the harness can
-   fail — so a green GREEN-B is meaningful. (The complementary
-   `best_contact` oldest-wins RED is covered directly in-process by
-   `e2e_dynamic_register.rs`.)
+   sip:pinned@A:5060` — a distinct user-part — and never re-registers).
+   `Dial(PJSIP/bridge_pinned)` misroutes to stale A; the sentinel catches the
+   INVITE (correlated by its `sip:pinned@A` Request-URI so no stray `bridge`
+   datagram can be mistaken for it) and the follow-to-B assertion goes **RED**.
+   This proves the A-detection is real — the harness can fail — so a green
+   GREEN-B is meaningful. (The complementary `best_contact` oldest-wins RED is
+   covered directly in-process by `e2e_dynamic_register.rs`.)
 
 A and B are **read at runtime** (`docker inspect`), never hardcoded. rustisk's
 own address is fixed and kept out of the dynamic IP pool via `--ip-range`.
@@ -65,7 +66,7 @@ own address is fixed and kept out of the dynamic IP pool via `--ip-range`.
 ## Notes / environment
 
 - rustisk fails closed without a mounted PIN secret, so the harness generates a
-  throwaway random six-digit **test** PIN, mounts it read-only, and shreds it on
+  throwaway random six-digit **test** PIN, mounts it read-only, and removes it on
   exit. No PIN value is logged or committed.
 - tron's docker is userns-remapped: the daemon cannot `SIGKILL` a container
   running as our uid (`docker stop`/`rm -f` hang). Containers run

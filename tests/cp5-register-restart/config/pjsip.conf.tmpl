@@ -52,4 +52,7 @@ aors = bridge_pinned_aor
 
 [bridge_pinned_aor]
 type = aor
-contact = sip:bridge@@PINNED_A@:5060
+; Distinct user-part ("pinned", not "bridge") so the RED INVITE's Request-URI is
+; unambiguously the pinned-static call and cannot be conflated with any stray
+; `bridge` datagram when the sentinel correlates the capture.
+contact = sip:pinned@@PINNED_A@:5060

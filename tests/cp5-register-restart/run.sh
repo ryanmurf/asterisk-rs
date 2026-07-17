@@ -20,7 +20,7 @@
 #
 # Isolated Docker only: it never touches the live voice stack, Helm, k8s, the
 # carrier trunk, or the real PIN. A throwaway six-digit TEST pin is generated,
-# mounted read-only (rustisk fails closed without one), and shredded on exit.
+# mounted read-only (rustisk fails closed without one), and removed on exit.
 #
 #   tests/cp5-register-restart/run.sh
 #
@@ -63,9 +63,15 @@ CASE="${CP5_CASE:-all}"
 # denied'). The containers run `--user $(id -u)`, so WE own their host PID and
 # can signal it. Reap = kill the host PID, then rm.
 reap_container() {
-    local c="$1" hp
+    local c="$1" hp i
     docker inspect "$c" >/dev/null 2>&1 || return 0
-    hp="$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null || true)"
+    # The host PID can read empty for a container still mid-start — retry.
+    hp=""
+    for i in 1 2 3 4 5; do
+        hp="$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null || true)"
+        [[ -n "$hp" && "$hp" != "0" ]] && break
+        sleep 0.3
+    done
     if [[ -n "$hp" && "$hp" != "0" ]]; then
         kill -TERM "$hp" 2>/dev/null || true
         timeout 3 docker wait "$c" >/dev/null 2>&1 || true
@@ -74,20 +80,29 @@ reap_container() {
             timeout 3 docker wait "$c" >/dev/null 2>&1 || true
         fi
     fi
-    docker rm -f "$c" >/dev/null 2>&1 || true
-    # Wait for the name/endpoint to be released.
+    timeout 10 docker rm -f "$c" >/dev/null 2>&1 || true
+    # Wait for the name/endpoint to be released; report a leak if it persists.
     for _ in $(seq 1 20); do docker inspect "$c" >/dev/null 2>&1 || return 0; sleep 0.25; done
+    return 1
 }
 
 cleanup() {
     # Snapshot rustisk logs before teardown (best-effort).
     docker logs "$RUSTISK_CONTAINER" >"$RUSTISK_LOG" 2>&1 || true
-    reap_container "$SENTINEL_CONTAINER"
-    reap_container "$BRIDGE_CONTAINER"
-    reap_container "$RUSTISK_CONTAINER"
-    docker network rm "$NET" >/dev/null 2>&1 || true
+    local leaked=0
+    reap_container "$SENTINEL_CONTAINER" || leaked=1
+    reap_container "$BRIDGE_CONTAINER" || leaked=1
+    reap_container "$RUSTISK_CONTAINER" || leaked=1
+    timeout 10 docker network rm "$NET" >/dev/null 2>&1 || true
     if [[ -n "$SECRET_DIR" && "$SECRET_DIR" == /mnt/data/herodevs-agents/cp5-pin-secret.* ]]; then
         rm -rf "$SECRET_DIR"
+    fi
+    # An EXIT trap cannot flip an already-set exit code, but a docker leak must
+    # be impossible to miss (it can wedge tron).
+    local still_net=""
+    docker network inspect "$NET" >/dev/null 2>&1 && still_net="$NET"
+    if (( leaked == 1 )) || [[ -n "$still_net" ]]; then
+        printf 'CLEANUP WARNING: leaked docker resources — reap by hand (kill host PID, docker rm -f, docker network rm %s)\n' "$NET" >&2
     fi
 }
 trap cleanup EXIT
@@ -169,13 +184,20 @@ require_command docker
 require_command python3
 require_command cargo
 
+# Reject an unknown case up front: an unvalidated selector would skip the case-
+# gated assertions and still exit 0 with a full-acceptance message (false pass).
+case "$CASE" in
+    all|green|red) ;;
+    *) fail "invalid CP5_CASE='$CASE' (expected: all|green|red)" ;;
+esac
+
 say '=== CP5 container-restart REGISTER harness ==='
 rm -rf "$RUNTIME_DIR"
 mkdir -p "$CONFIG_DIR" "$RUN_DIR"
 : >"$BRIDGE_CAPTURE"; : >"$SENTINEL_CAPTURE"; : >"$BRIDGE_STATUS"; : >"$SENTINEL_STATUS"
 
 # Throwaway random TEST pin (rustisk fails closed without a mounted secret).
-# Generated locally, mounted read-only, never logged, shredded on exit — a pure
+# Generated locally, mounted read-only, never logged, removed on exit — a pure
 # test value, unrelated to any production secret.
 SECRET_DIR="$(mktemp -d /mnt/data/herodevs-agents/cp5-pin-secret.XXXXXX)"
 chmod 700 "$SECRET_DIR"
@@ -326,7 +348,9 @@ if [[ "$CASE" == "all" || "$CASE" == "red" ]]; then
     bprev="$(count_lines "$BRIDGE_CAPTURE")"
     sprev="$(count_lines "$SENTINEL_CAPTURE")"
     originate bridge_pinned cp5-red >/dev/null || fail "AMI Originate (red) failed"
-    if red_line="$(wait_new_line "$SENTINEL_CAPTURE" "$sprev" "own=$A" 15)"; then
+    # Correlate on the pinned Request-URI so a stray `bridge` datagram at A cannot
+    # false-pass RED.
+    if red_line="$(wait_new_line "$SENTINEL_CAPTURE" "$sprev" "ruri=sip:pinned@$A" 15)"; then
         # Confirm the follow-to-B assertion would have FAILED: nothing reached B.
         bnow="$(count_lines "$BRIDGE_CAPTURE")"
         if (( bnow > bprev )); then

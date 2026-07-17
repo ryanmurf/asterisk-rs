@@ -53,7 +53,10 @@ def main():
 
     text = response.decode("utf-8", "replace")
     sys.stdout.write(text)
-    if "successfully queued" not in text and "Success" not in text:
+    # Require the Originate-specific queued message. A bare "Success" is NOT
+    # sufficient: the Login reply also carries "Success", so matching it would
+    # green-light a session whose Originate actually failed.
+    if "successfully queued" not in text:
         sys.stderr.write("Originate not queued\n")
         sys.exit(2)
 
