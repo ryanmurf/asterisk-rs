@@ -1934,7 +1934,29 @@ impl SipEventHandler {
             }
         };
 
-        let cs = cs_arc.lock().await;
+        let mut cs = cs_arc.lock().await;
+
+        // A 2xx to a locally initiated re-INVITE is itself a target refresh
+        // (RFC 3261 §12.2): the response Contact is the peer's current remote
+        // target. Apply it to the dialog remote target AND move the local
+        // in-dialog next hop to the resolved Contact, mirroring the re-INVITE
+        // REQUEST path (`handle_reinvite_request`) and the UPDATE path
+        // (`handle_update`). Without this a later BYE routes to the stale INVITE
+        // source port even though the 200 advertised a new Contact (M5 review
+        // MAJOR-F1). IP-literal only, via `remote_target_addr()`, so an
+        // unresolvable Contact keeps the prior working next hop rather than
+        // losing routing. This applies to BOTH inbound and outbound calls, so it
+        // runs before the outbound ACK short-circuit below.
+        if let Some(contact) = response
+            .get_header(crate::parser::header_names::CONTACT)
+            .and_then(crate::parser::extract_uri)
+        {
+            cs.session.update_remote_target(&contact);
+            if let Some(addr) = cs.session.remote_target_addr() {
+                cs.next_hop = addr;
+            }
+        }
+
         // Skip outbound calls — handle_response already sends their ACK
         if cs.session.is_outbound {
             return;
