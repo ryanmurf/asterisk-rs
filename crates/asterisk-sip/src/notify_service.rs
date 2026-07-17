@@ -155,7 +155,9 @@ impl NotifyService {
         template_name: &str,
         endpoint_name: &str,
     ) -> Result<(), String> {
-        eprintln!("[DEBUG] send_notify_to_endpoint: template={}, endpoint={}", template_name, endpoint_name);
+        // Issue #129: these were unconditional `eprintln!` debug prints that
+        // ignored the log filter; they are level-gated tracing events now.
+        debug!(template = template_name, endpoint = endpoint_name, "send_notify_to_endpoint");
         let template = self
             .notify_config
             .get_template(template_name)
@@ -203,13 +205,12 @@ impl NotifyService {
             "Sending NOTIFY to endpoint"
         );
 
-        eprintln!("[DEBUG] Spawning NOTIFY send to {} at {}", endpoint_name, remote_addr);
+        debug!(endpoint = %endpoint_name, remote = %remote_addr, "Spawning NOTIFY send");
         tokio::spawn(async move {
             if let Err(e) = transport.send(&notify, remote_addr).await {
                 warn!("Failed to send NOTIFY to {}: {}", endpoint_name, e);
-                eprintln!("[DEBUG] Failed to send NOTIFY: {}", e);
             } else {
-                eprintln!("[DEBUG] NOTIFY sent successfully to {}", endpoint_name);
+                debug!(endpoint = %endpoint_name, "NOTIFY sent successfully");
             }
         });
 

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, trace};
 
 use crate::channel_driver::SipChannelDriver;
 use crate::parser::SipMessage;
@@ -446,10 +446,17 @@ impl SipEventHandler {
 
         // 3. Extract Call-ID for tracking
         let call_id = request.call_id()?.to_string();
-        eprintln!("[DEBUG] handle_incoming_invite: call_id={}, exten={}, caller={}", call_id, exten, caller_num);
-        eprintln!("[DEBUG] All headers:");
+        // Issue #129: this used to be an unconditional `eprintln!` dump of the
+        // caller number and EVERY header value — including `Authorization`
+        // (digest credential material) and `From`/`Contact`/
+        // `P-Asserted-Identity` (caller PII) — on the normal call path at any
+        // verbosity. The summary and the header dump are now level-gated, the
+        // summary carries no caller number, and sensitive header VALUES are
+        // never printed (see `redact_invite_header_value`). Full traffic
+        // inspection belongs to the explicitly-enabled SIP logger, not here.
+        debug!(call_id = %call_id, exten = %exten, "handle_incoming_invite");
         for h in &request.headers {
-            eprintln!("[DEBUG]   {}: {}", h.name, h.value);
+            trace!(header = %h.name, value = %redact_invite_header_value(&h.name, &h.value), "INVITE header");
         }
 
         // 3b. Check if this is a re-INVITE (in-dialog INVITE for hold/unhold/media update).
@@ -462,7 +469,7 @@ impl SipEventHandler {
                 .is_some();
             let existing = self.call_states.read().contains_key(&call_id);
             if existing && has_to_tag {
-                eprintln!("[DEBUG] re-INVITE detected for call_id={}", call_id);
+                debug!(call_id = %call_id, "re-INVITE detected");
                 return self.handle_reinvite_request(request, remote_addr, session).await;
             }
         }
@@ -500,7 +507,7 @@ impl SipEventHandler {
                 let authenticator = crate::authenticator::InboundAuthenticator::new();
                 match authenticator.verify(request, &creds, false) {
                     Ok(()) => {
-                        eprintln!("[DEBUG] Auth succeeded for call_id={}", call_id);
+                        debug!(call_id = %call_id, "Auth succeeded");
                         // Auth succeeded -- identify the endpoint from the auth username.
                         // Extract username from the Authorization header to find the matching endpoint.
                         if let Some(auth_hdr) = request.get_header(crate::parser::header_names::AUTHORIZATION) {
@@ -519,7 +526,7 @@ impl SipEventHandler {
                         }
                     }
                     Err(challenge) => {
-                        eprintln!("[DEBUG] Auth failed, sending 401 for call_id={}", call_id);
+                        debug!(call_id = %call_id, "Auth failed, sending 401");
                         // Send 401 challenge
                         if self.may_send_invite_final(request, &challenge) {
                             if let Err(e) = self.transport.send(&challenge, remote_addr).await {
@@ -538,7 +545,7 @@ impl SipEventHandler {
         //    If the extension doesn't exist, respond with 484 or 404 depending
         //    on the allow_overlap setting.
         let extension_exists = self.dialplan.find_extension(&endpoint_context, &exten).is_some();
-        eprintln!("[DEBUG] Extension lookup: context={}, exten={}, exists={}, allow_overlap={}", endpoint_context, exten, extension_exists, allow_overlap);
+        debug!(context = %endpoint_context, exten = %exten, exists = extension_exists, allow_overlap, "Extension lookup");
         if !extension_exists {
             if allow_overlap && self.dialplan.could_match(&endpoint_context, &exten) {
                 // Overlap enabled and extension could match with more digits -> 484
@@ -1111,7 +1118,7 @@ impl SipEventHandler {
                         if let Err(e) = transport.send(&bye, cs.next_hop).await {
                             warn!(call_id = %call_id_for_task, "Failed to send BYE: {}", e);
                         } else {
-                            eprintln!("[DEBUG] Sent BYE for call_id={}", call_id_for_task);
+                            debug!(call_id = %call_id_for_task, "Sent BYE");
                         }
                     }
                 }
@@ -2104,7 +2111,7 @@ impl SipEventHandler {
             warn!(call_id = %call_id, "Failed to send 200 OK for re-INVITE: {}", e);
             return None;
         }
-        eprintln!("[DEBUG] Sent 200 OK for re-INVITE call_id={}", call_id);
+        debug!(call_id = %call_id, "Sent 200 OK for re-INVITE");
 
         // Emit Hold/Unhold AMI event
         let _channel_name = {
@@ -2112,7 +2119,7 @@ impl SipEventHandler {
             cs.channel_name.clone()
         };
         if is_hold {
-            eprintln!("[DEBUG] Hold detected on channel {}", _channel_name);
+            debug!(channel = %_channel_name, "Hold detected");
             // Find the bridged peer channel and emit DeviceStateChange for its endpoint
             if let Some(store_chan) = asterisk_core::channel_store::find_by_name(&_channel_name) {
                 let ch = store_chan.lock();
@@ -2121,7 +2128,7 @@ impl SipEventHandler {
                     let device = peer_name.rsplit_once('-')
                         .map(|(prefix, _)| prefix.to_string())
                         .unwrap_or_else(|| peer_name.clone());
-                    eprintln!("[DEBUG] Emitting DeviceStateChange for {} = ONHOLD", device);
+                    debug!(device = %device, "Emitting DeviceStateChange ONHOLD");
                     asterisk_core::channel::publish_channel_event("DeviceStateChange", &[
                         ("Device", &device),
                         ("State", "ONHOLD"),
@@ -2170,7 +2177,7 @@ impl SipEventHandler {
                     if let Err(e) = self.send_client_request(bye, cs.next_hop).await {
                         warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
                     } else {
-                        eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
+                        debug!(channel = %channel_name, call_id = %call_id, "Sent BYE");
                     }
                 }
             }
@@ -2617,6 +2624,40 @@ fn extract_user_from_header(header: &str) -> Option<String> {
         } else {
             Some(s.to_string())
         }
+    }
+}
+
+/// Allowlist filter for the trace-level INVITE header dump (issue #129).
+///
+/// `Authorization`/`Proxy-Authorization` carry digest credential material,
+/// `From`/`To`/`Contact`/`P-Asserted-Identity`/`P-Preferred-Identity`/
+/// `Remote-Party-ID`/... carry caller PII, and an unknown or custom header
+/// can carry anything — so the dump is default-deny: only structurally
+/// boring, non-identity headers print their raw value; every other header
+/// prints its NAME with a redacted placeholder. Full traffic inspection
+/// belongs to the explicitly-enabled SIP logger (`logger.rs`), never to an
+/// always-on debug trace.
+fn redact_invite_header_value<'a>(name: &str, value: &'a str) -> &'a str {
+    const VALUE_SAFE_HEADERS: &[&str] = &[
+        "accept",
+        "allow",
+        "call-id",
+        "content-length",
+        "content-type",
+        "cseq",
+        "expires",
+        "max-forwards",
+        "min-se",
+        "require",
+        "session-expires",
+        "supported",
+        "user-agent",
+        "via",
+    ];
+    if VALUE_SAFE_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        value
+    } else {
+        "<redacted>"
     }
 }
 
@@ -3765,5 +3806,38 @@ mod tests {
             store::find_by_name(name).is_none(),
             "store channel must be deregistered on teardown"
         );
+    }
+
+    #[test]
+    fn invite_header_dump_redacts_credentials_and_pii() {
+        // Issue #129: the header dump must never print credential material or
+        // caller PII. Default-deny — anything not on the allowlist is
+        // redacted, including unknown/custom headers.
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "authorization",
+            "From",
+            "To",
+            "Contact",
+            "P-Asserted-Identity",
+            "P-Preferred-Identity",
+            "Remote-Party-ID",
+            "X-Custom-Anything",
+        ] {
+            assert_eq!(
+                redact_invite_header_value(name, "Digest username=\"u\", response=\"deadbeef\""),
+                "<redacted>",
+                "{name} must be redacted"
+            );
+        }
+        // Structurally boring headers keep their value so the dump stays
+        // useful for signaling debugging.
+        assert_eq!(
+            redact_invite_header_value("Via", "SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK1"),
+            "SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK1"
+        );
+        assert_eq!(redact_invite_header_value("CSeq", "1 INVITE"), "1 INVITE");
+        assert_eq!(redact_invite_header_value("content-type", "application/sdp"), "application/sdp");
     }
 }

@@ -30,3 +30,4 @@ sha1 = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
