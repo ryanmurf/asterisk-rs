@@ -11,13 +11,31 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-# Minimal dependencies for standalone parsing
-thiserror = "2"
-bytes = "1"
+
+# Fuzz the REAL production parsers, not standalone reimplementations.
+# Every target below drives the same code the wire hits, so a crash the
+# fuzzer finds is a crash the running PBX would take. (Issues #108/#109 were
+# remote-crash panics that survived precisely because the old targets fuzzed
+# private copies of the parsers instead of these crates.)
+asterisk-sip = { path = "../crates/asterisk-sip" }
+asterisk-channels = { path = "../crates/asterisk-channels" }
+asterisk-ami = { path = "../crates/asterisk-ami" }
 
 [[bin]]
 name = "fuzz_sip_parse"
 path = "fuzz_targets/fuzz_sip_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sip_uri"
+path = "fuzz_targets/fuzz_sip_uri.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sip_headers"
+path = "fuzz_targets/fuzz_sip_headers.rs"
 test = false
 doc = false
 
@@ -36,5 +54,23 @@ doc = false
 [[bin]]
 name = "fuzz_stun_parse"
 path = "fuzz_targets/fuzz_stun_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ami_parse"
+path = "fuzz_targets/fuzz_ami_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_websocket_parse"
+path = "fuzz_targets/fuzz_websocket_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_srtp_unprotect"
+path = "fuzz_targets/fuzz_srtp_unprotect.rs"
 test = false
 doc = false

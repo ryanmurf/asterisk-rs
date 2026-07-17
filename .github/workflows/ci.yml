@@ -34,6 +34,15 @@ jobs:
       # a compile regression behind these features is caught (issue #15).
       - name: Check native codec features
         run: cargo check -p asterisk-codecs --features native-opus,native-gsm,native-speex
+      # The fuzz crate is its own workspace and drives the REAL production
+      # parsers via path deps. `cargo fuzz build` needs nightly + libFuzzer,
+      # but a plain `cargo check` on the pinned stable toolchain still type-
+      # checks every harness against the current parser signatures. This is
+      # the guard that keeps the targets wired to production code instead of
+      # silently drifting back into standalone copies (the gap that hid the
+      # #108/#109 remote-crash panics from fuzzing).
+      - name: Check fuzz targets compile against real parsers
+        run: cargo check --manifest-path fuzz/Cargo.toml
 
   build-release:
     runs-on: ubuntu-latest

@@ -1,13 +1,19 @@
 # Asterisk-RS Fuzz Testing
 
-This directory contains cargo-fuzz harnesses for testing the SIP and related parsers in the asterisk-rs project.
+This directory contains cargo-fuzz harnesses for the wire-facing parsers in
+the asterisk-rs project.
+
+**Every target drives the REAL production parser** — the same code the wire
+hits — via path dependencies on `asterisk-sip`, `asterisk-channels` and
+`asterisk-ami`. They are **not** standalone reimplementations. (The old targets
+were private copies of the parsers, which is why the remote-crash panics in
+issues #108 and #109 were never surfaced by fuzzing.)
 
 ## Setup
 
-1. Install nightly Rust toolchain (required for fuzzing):
+1. Install nightly Rust toolchain (required by cargo-fuzz / libFuzzer):
 ```bash
 rustup install nightly
-rustup default nightly
 ```
 
 2. Install cargo-fuzz:
@@ -17,10 +23,17 @@ cargo install cargo-fuzz
 
 ## Available Fuzz Targets
 
-- `fuzz_sip_parse` - Tests SIP message parsing (INVITE, REGISTER, responses, etc.)
-- `fuzz_sdp_parse` - Tests SDP (Session Description Protocol) parsing 
-- `fuzz_rtp_parse` - Tests RTP (Real-time Transport Protocol) header parsing
-- `fuzz_stun_parse` - Tests STUN (Session Traversal Utilities for NAT) message parsing
+| Target | Real parser exercised |
+|--------|-----------------------|
+| `fuzz_sip_parse` | `asterisk_sip::parser::SipMessage::parse` + the `extract_uri`/`extract_tag`/`parse_via` header helpers on parsed values |
+| `fuzz_sip_uri` | `asterisk_sip::parser::SipUri::parse` (+ `Display` round-trip) |
+| `fuzz_sip_headers` | `extract_uri` / `extract_tag` / `parse_via` on raw header strings |
+| `fuzz_sdp_parse` | `asterisk_sip::sdp::SessionDescription::parse` (+ ICE/DTLS/bandwidth sub-parsers) |
+| `fuzz_rtp_parse` | `asterisk_sip::rtp::{RtpHeader::parse, parse_rtp_header}` (CSRC/extension/padding) |
+| `fuzz_stun_parse` | `asterisk_sip::stun::{StunMessage::parse, RawAttribute::parse}` |
+| `fuzz_ami_parse` | `asterisk_ami::protocol::{read_message, AmiAction::parse, AmiEvent::parse}` |
+| `fuzz_websocket_parse` | `asterisk_channels::websocket::WebSocketFrame::parse` (SIP-over-WS framing) |
+| `fuzz_srtp_unprotect` | `asterisk_sip::srtp::SrtpCrypto::{unprotect_rtp, unprotect_rtcp}` (fixed non-secret test key) |
 
 ## Running the Fuzzers
 
@@ -34,54 +47,41 @@ Run a specific fuzzer:
 # Run indefinitely until crash or Ctrl-C
 cargo fuzz run fuzz_sip_parse
 
-# Run for limited time (5 seconds)
-cargo fuzz run fuzz_sip_parse -- -max_total_time=5
+# Run for a bounded time (60 seconds)
+cargo fuzz run fuzz_sip_parse -- -max_total_time=60
+```
 
-# Run with specific number of iterations
-cargo fuzz run fuzz_sip_parse -- -runs=10000
+## Compile check without nightly
+
+`cargo fuzz build` needs nightly, but the targets compile against the real
+crates on the pinned stable toolchain too, which is a fast way to catch API
+drift (a parser signature change that would otherwise silently bitrot a
+harness):
+```bash
+cargo check --manifest-path fuzz/Cargo.toml
 ```
 
 ## Corpus
 
-The `corpus/` directory contains seed inputs for the fuzzers:
-
-- `sip_*.txt` - Real SIP messages (INVITE, REGISTER, 200 OK response)
-- `sdp_*.txt` - Sample SDP session descriptions
-- `*.bin` - Binary files for RTP and STUN protocols
-
-These seed files help the fuzzer generate more realistic test cases by starting with valid protocol examples.
-
-## Implementation Notes
-
-The fuzz targets use minimal standalone implementations of the parsers to avoid complex dependency chains that were causing build issues. Each target:
-
-1. Receives arbitrary byte input from libfuzzer
-2. Attempts to parse the input using the respective protocol parser
-3. Ensures no panics occur (the main goal of fuzz testing)
-
-The parsers implement the core protocol logic:
-
-- **SIP**: Request/response lines, header folding, body separation
-- **SDP**: Version, origin, media descriptions, attributes 
-- **RTP**: Version validation, header fields, CSRC/extension parsing
-- **STUN**: Magic cookie validation, attribute parsing, padding
+The `corpus/` directory holds seed inputs (real SIP/SDP messages and binary
+RTP/STUN packets). libFuzzer starts from these and writes new coverage-
+increasing inputs back into the same directory.
 
 ## Finding Issues
 
-If a fuzzer finds a crash, it will save the crashing input to `artifacts/`. You can then:
-
-1. Examine the crashing input file
-2. Reproduce the crash by running the target with that input
-3. Fix the underlying parser issue
-4. Re-run the fuzzer to verify the fix
-
-## Continuous Fuzzing
-
-For continuous integration, you can run fuzzers for fixed periods:
-
+A crash is saved to `artifacts/`. Reproduce with:
 ```bash
-# Run each fuzzer for 1 minute
-for target in fuzz_sip_parse fuzz_sdp_parse fuzz_rtp_parse fuzz_stun_parse; do
-    cargo fuzz run $target -- -max_total_time=60
-done
+cargo fuzz run <target> artifacts/<target>/crash-<hash>
 ```
+Fix the underlying parser, add a regression test built from the crashing
+input, then re-run to confirm.
+
+## Deterministic coverage under `cargo test`
+
+Because `cargo fuzz` needs nightly, the same real parsers are *also* exercised
+by deterministic mutation/property tests that run on the pinned stable
+toolchain under `cargo test --workspace` (see `*_fuzz_regression.rs` in the
+`tests/` directories of `asterisk-sip`, `asterisk-channels` and `asterisk-ami`).
+Those feed a large battery of malformed + byte-mutated inputs to the production
+parsers and assert graceful `Err`/no-panic, so panic regressions are caught in
+CI even without a libFuzzer run.
