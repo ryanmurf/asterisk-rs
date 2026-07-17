@@ -18,6 +18,15 @@ use tracing::{debug, info};
 
 use crate::parser::SipMessage;
 
+/// Maximum SIP message body accepted on a stream transport, in bytes.
+///
+/// A stream peer declares the body size via `Content-Length`; without a cap
+/// the read loop would grow its buffer to whatever the attacker declares (and
+/// `body_start + content_length` could overflow `usize`). This mirrors the
+/// `MAX_CONTENT_LENGTH` bound the message parser already enforces on the UDP
+/// path, so the two transports reject oversized bodies identically.
+const MAX_STREAM_BODY_LENGTH: usize = 65536;
+
 /// Trait for SIP transports.
 #[async_trait]
 pub trait SipTransport: Send + Sync + std::fmt::Debug {
@@ -349,6 +358,16 @@ impl TcpTransport {
                     .map_err(|e| TransportError::Parse(e.to_string()))?;
 
                 let content_length = extract_content_length(header_text);
+                // Reject an oversized declared body before allocating for it.
+                // Without this cap a peer could drive unbounded buffer growth
+                // (and overflow `body_start + content_length`) by declaring a
+                // huge Content-Length. Matches the UDP/parser MAX_CONTENT_LENGTH.
+                if content_length > MAX_STREAM_BODY_LENGTH {
+                    return Err(TransportError::Parse(format!(
+                        "Content-Length {} exceeds maximum allowed ({})",
+                        content_length, MAX_STREAM_BODY_LENGTH
+                    )));
+                }
                 let body_start = sep_pos + 4; // Skip \r\n\r\n
                 let total_needed = body_start + content_length;
 
@@ -533,6 +552,63 @@ mod tests {
             alias: Some("abc123".to_string()),
         };
         assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn tcp_rejects_oversized_content_length_without_buffering_body() {
+        // A stream peer declares a body larger than the cap but sends only a
+        // few bytes and keeps the connection open. With the cap in place the
+        // server rejects the message as soon as it has the headers, before it
+        // waits for (or allocates for) the declared body. Without the cap, the
+        // body-read loop blocks waiting for the full declared length that never
+        // arrives, so `accept()` would never return -- the assertion below
+        // (accept resolves within the timeout, as an Err) is exactly the RED
+        // control: it times out on the unpatched code.
+        let server = TcpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let over = MAX_STREAM_BODY_LENGTH + 1;
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(server_addr).await.unwrap();
+            let header = format!(
+                "INVITE sip:bob@example.com SIP/2.0\r\n\
+                 Via: SIP/2.0/TCP 10.0.0.1;branch=z9hG4bK1\r\n\
+                 From: <sip:a@b>;tag=1\r\n\
+                 To: <sip:bob@example.com>\r\n\
+                 Call-ID: tcp-cap\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 Content-Length: {}\r\n\r\n",
+                over
+            );
+            sock.write_all(header.as_bytes()).await.unwrap();
+            // Send only a few body bytes and hold the connection open so the
+            // unpatched read loop would block waiting for the rest.
+            sock.write_all(b"partial").await.unwrap();
+            // Keep `sock` alive until the server side has decided.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            drop(sock);
+        });
+
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.accept(),
+        )
+        .await;
+
+        assert!(
+            accepted.is_ok(),
+            "accept() must resolve promptly (reject on headers), not block on the body"
+        );
+        let result = accepted.unwrap();
+        assert!(
+            matches!(result, Err(TransportError::Parse(_))),
+            "oversized Content-Length must be rejected as a parse error, got {:?}",
+            result.map(|_| "Ok")
+        );
+
+        client.abort();
     }
 
     #[tokio::test]
