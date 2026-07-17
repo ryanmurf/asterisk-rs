@@ -259,11 +259,12 @@ impl AppPlayback {
                     overall_status = PlaybackStatus::Failed;
                     // Continue trying other files (Asterisk behavior)
                 }
-                PlaybackStatus::Interrupted(digit) => {
-                    debug!(
-                        "Playback: interrupted by DTMF '{}' during file '{}'",
-                        digit, filename
-                    );
+                PlaybackStatus::Interrupted(_) => {
+                    // REVIEW-BUNDLEB: never log the digit value -- a digit
+                    // pressed during a prompt is PIN material once barge-in
+                    // lands (log that an interruption occurred, not which
+                    // digit caused it).
+                    debug!("Playback: interrupted by DTMF during file '{}'", filename);
                     // Stop playback on DTMF interrupt
                     break;
                 }

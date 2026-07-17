@@ -65,9 +65,15 @@ impl AppSendDtmf {
             return PbxExecResult::Failed;
         }
 
+        // REVIEW-BUNDLEB: never log the digit string -- defense-in-depth
+        // (dialplan-emitted, not caller PIN, but DTMF values stay out of
+        // logs everywhere; log the count instead).
         info!(
-            "SendDTMF: channel '{}' digits='{}' timeout={}ms duration={}ms",
-            channel.name, options.digits, options.timeout_ms, options.duration_ms,
+            "SendDTMF: channel '{}' digit_count={} timeout={}ms duration={}ms",
+            channel.name,
+            options.digits.len(),
+            options.timeout_ms,
+            options.duration_ms,
         );
 
         // In a real implementation:
