@@ -341,6 +341,7 @@ dependencies = [
  "rand 0.8.7",
  "sha1",
  "sha2",
+ "subtle",
  "thiserror",
  "tokio",
  "tracing",
