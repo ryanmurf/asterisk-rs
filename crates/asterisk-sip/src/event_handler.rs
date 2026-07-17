@@ -698,7 +698,22 @@ impl SipEventHandler {
             // offer address.
             let media_peer = crate::sdp_rtp::remote_rtp_endpoint(&remote_sdp)
                 .unwrap_or(remote_addr);
-            let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
+            // Fail closed (CP3): if a configured external_media_address FQDN does
+            // not resolve, do NOT answer with a bogus/internal c=/o= address —
+            // reject the INVITE (488) rather than leak or blackhole the media.
+            let Some(local_ip) = crate::sdp::advertised_media_ip(session.local_addr, media_peer)
+            else {
+                let unique_id = channel.lock().unique_id.0.clone();
+                store::deregister(&unique_id);
+                self.callid_map.write().remove(&call_id);
+                warn!(call_id = %call_id, "Fail-closed: external_media_address did not resolve; rejecting INVITE 488");
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    if self.may_send_invite_final(request, &resp) {
+                        let _ = self.transport.send(&resp, remote_addr).await;
+                    }
+                }
+                return None;
+            };
             let rtp_result = match self.channel_driver.get() {
                 Some(driver) => driver.allocate_rtp_session(session.local_addr.ip()).await,
                 None => self
@@ -1482,13 +1497,17 @@ impl SipEventHandler {
     /// advertises the channel's REAL bound RTP port and a routable connection
     /// address (never 0.0.0.0), with route/NAT selection targeting the offer's
     /// media endpoint and falling back to the signaling source.
+    /// Build the SDP answer for an in-dialog renegotiation (UPDATE/re-INVITE
+    /// with an offer). Returns `None` — fail closed (CP3) — if a configured
+    /// `external_media_address` FQDN does not resolve, so the caller rejects the
+    /// renegotiation rather than answering with a bogus/internal media address.
     async fn renegotiation_answer(
         &self,
         channel_name: &str,
         offer: &SessionDescription,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
-    ) -> SessionDescription {
+    ) -> Option<SessionDescription> {
         let channel_codecs = self
             .channel_driver
             .get()
@@ -1502,8 +1521,8 @@ impl SipEventHandler {
             None => 10000,
         };
         let media_peer = crate::sdp_rtp::remote_rtp_endpoint(offer).unwrap_or(remote_addr);
-        let local_ip = crate::sdp::advertised_media_ip(local_addr, media_peer);
-        SessionDescription::create_answer(offer, &local_ip, media_port, &channel_codecs)
+        let local_ip = crate::sdp::advertised_media_ip(local_addr, media_peer)?;
+        Some(SessionDescription::create_answer(offer, &local_ip, media_port, &channel_codecs))
     }
 
     /// Handle an in-dialog **UPDATE** (RFC 3311). Two shapes:
@@ -1617,9 +1636,19 @@ impl SipEventHandler {
                 }
             }
 
-            let answer = self
+            // Fail closed (CP3): if external_media_address does not resolve,
+            // reject the UPDATE renegotiation (488) rather than answer with a
+            // bogus/internal media address.
+            let Some(answer) = self
                 .renegotiation_answer(&channel_name, &offer, local_addr, remote_addr)
-                .await;
+                .await
+            else {
+                warn!(call_id = %call_id, "Fail-closed: external_media_address did not resolve; rejecting UPDATE 488");
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    let _ = self.send_server_response(&resp, remote_addr).await;
+                }
+                return;
+            };
             {
                 let mut cs = cs_arc.lock().await;
                 cs.session.remote_sdp = Some(offer);
@@ -2111,7 +2140,18 @@ impl SipEventHandler {
         let answer_sdp = if let Some(ref offer) = remote_sdp {
             let media_peer = crate::sdp_rtp::remote_rtp_endpoint(offer)
                 .unwrap_or(remote_addr);
-            let local_ip = crate::sdp::advertised_media_ip(session.local_addr, media_peer);
+            // Fail closed (CP3): reject the re-INVITE (488) if a configured
+            // external_media_address FQDN does not resolve, rather than answer
+            // with a bogus/internal media address.
+            let Some(local_ip) = crate::sdp::advertised_media_ip(session.local_addr, media_peer)
+            else {
+                warn!(call_id = %call_id, "Fail-closed: external_media_address did not resolve; rejecting re-INVITE 488");
+                let response = request.create_response(488, "Not Acceptable Here").ok()?;
+                if self.may_send_invite_final(request, &response) {
+                    let _ = self.transport.send(&response, remote_addr).await;
+                }
+                return None;
+            };
             let answer = SessionDescription::create_answer(
                 offer,
                 &local_ip,
