@@ -1845,10 +1845,15 @@ impl SipEventHandler {
         // Parse the re-INVITE's SDP offer
         let remote_sdp = session.remote_sdp.clone();
 
-        // Check if this is a hold (a=sendonly or a=inactive in the SDP)
+        // Check if this is a hold: a=sendonly / a=inactive, or the classic
+        // c=0.0.0.0 hold (RFC 2543 / 3264). A hold re-INVITE keeps the dialog
+        // but must pause the media pump so the bridged far side hears silence.
         let is_hold = if let Some(ref sdp) = remote_sdp {
             let sdp_str = sdp.to_string();
-            sdp_str.contains("a=sendonly") || sdp_str.contains("a=inactive")
+            sdp_str.contains("a=sendonly")
+                || sdp_str.contains("a=inactive")
+                || sdp_str.contains("c=IN IP4 0.0.0.0")
+                || sdp_str.contains("c=IN IP6 ::")
         } else {
             false
         };
@@ -1884,6 +1889,31 @@ impl SipEventHandler {
                 return None;
             }
         }
+
+        // ACTUALLY renegotiate the media plane (the load-bearing half of the
+        // re-INVITE — previously this handler answered but never touched the
+        // media session, so a codec/port change or hold was a sent-claim only):
+        //   * hold offer  -> pause the pump (far side hears silence), keep the
+        //                    existing remote so un-hold can resume.
+        //   * media offer -> un-hold and re-install the remote address +
+        //                    payload types from the offer, so the pump sends to
+        //                    the new endpoint and accepts the new codec.
+        if let (Some(offer), Some(driver)) = (remote_sdp.as_ref(), self.channel_driver.get()) {
+            if is_hold {
+                driver.set_channel_hold(&channel_name, true);
+            } else {
+                driver.set_channel_hold(&channel_name, false);
+                if let Err(error) = driver.apply_inbound_offer(&channel_name, offer).await {
+                    warn!(call_id = %call_id, %error, "re-INVITE media renegotiation failed");
+                    let response = request.create_response(488, "Not Acceptable Here").ok()?;
+                    if self.may_send_invite_final(request, &response) {
+                        let _ = self.transport.send(&response, remote_addr).await;
+                    }
+                    return None;
+                }
+            }
+        }
+
         let media_port = match self.channel_driver.get() {
             Some(driver) => driver
                 .channel_rtp_local_port(&channel_name)
@@ -1960,6 +1990,20 @@ impl SipEventHandler {
                         ("State", "ONHOLD"),
                     ]);
                 }
+            }
+        }
+
+        // Persist the renegotiated SDP so the stored session reflects the new
+        // offer/answer (later in-dialog requests, SFU, and a subsequent
+        // renegotiation all read from here). Previously the stored SDP kept the
+        // ORIGINAL INVITE's media even after a hold/unhold/codec change.
+        {
+            let mut cs = cs_arc.lock().await;
+            if let Some(offer) = remote_sdp {
+                cs.session.remote_sdp = Some(offer);
+            }
+            if let Some(answer) = answer_sdp {
+                cs.session.local_sdp = Some(answer);
             }
         }
 
