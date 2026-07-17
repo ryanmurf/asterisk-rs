@@ -1629,7 +1629,13 @@ impl SipEventHandler {
             let Ok(mut ok) = request.create_response(200, "OK") else {
                 return;
             };
-            ok.add_header("Contact", &format!("<sip:asterisk@{}>", local_addr));
+            ok.add_header(
+                "Contact",
+                &format!(
+                    "<sip:asterisk@{}>",
+                    crate::sdp::advertised_signaling_hostport(local_addr, remote_addr)
+                ),
+            );
             let sdp_str = answer.to_string();
             ok.add_header("Content-Type", "application/sdp");
             ok.add_header("Content-Length", &sdp_str.len().to_string());
@@ -1657,7 +1663,13 @@ impl SipEventHandler {
             let Ok(mut ok) = request.create_response(200, "OK") else {
                 return;
             };
-            ok.add_header("Contact", &format!("<sip:asterisk@{}>", local_addr));
+            ok.add_header(
+                "Contact",
+                &format!(
+                    "<sip:asterisk@{}>",
+                    crate::sdp::advertised_signaling_hostport(local_addr, remote_addr)
+                ),
+            );
             if let Some((interval, refresher)) = session_timer_response(request) {
                 ok.add_header(
                     "Session-Expires",
@@ -2116,8 +2128,14 @@ impl SipEventHandler {
         // Build 200 OK response
         let mut ok_resp = request.create_response(200, "OK").ok()?;
 
-        // Add Contact header
-        ok_resp.add_header("Contact", &format!("<sip:asterisk@{}>", session.local_addr));
+        // Add Contact header (NAT-scoped toward the peer — New-3).
+        ok_resp.add_header(
+            "Contact",
+            &format!(
+                "<sip:asterisk@{}>",
+                crate::sdp::advertised_signaling_hostport(session.local_addr, remote_addr)
+            ),
+        );
 
         // Add SDP body
         if let Some(ref sdp) = answer_sdp {

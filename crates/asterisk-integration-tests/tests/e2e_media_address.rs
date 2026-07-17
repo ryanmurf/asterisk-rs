@@ -87,6 +87,7 @@ fn endpoint_only_config(external: Option<&str>, local_net: Vec<String>) -> Pjsip
             bind: "0.0.0.0:5060".parse().unwrap(),
             external_media_address: external.map(|s| s.to_string()),
             external_signaling_address: None,
+            external_signaling_port: None,
             cert_file: None,
             priv_key_file: None,
             local_net,

@@ -206,6 +206,17 @@ impl SipSession {
         })
     }
 
+    /// The `host:port` to advertise in Via/Contact/From toward this session's
+    /// remote peer, applying the transport's `external_signaling_address` +
+    /// optional `external_signaling_port` (New-3), scoped by `local_net`
+    /// exactly like `advertised_media_ip` does for SDP. A peer inside
+    /// `local_net` sees the internal bind; an external peer sees the external
+    /// address and port. With no NAT config (or a local peer) this is the
+    /// unchanged bind `host:port`, so non-NAT deployments are unaffected.
+    pub fn signaling_hostport(&self) -> String {
+        crate::sdp::advertised_signaling_hostport(self.local_addr, self.remote_addr)
+    }
+
     /// Build an INVITE request for an outbound session.
     pub fn build_invite(&mut self, to_uri: &str) -> SipMessage {
         self.build_invite_with_uri(to_uri, to_uri)
@@ -215,8 +226,9 @@ impl SipSession {
     /// The request_uri is used as the actual SIP Request-URI (typically the
     /// contact address), while to_uri is used in the To header.
     pub fn build_invite_with_uri(&mut self, request_uri: &str, to_uri: &str) -> SipMessage {
-        let from_uri = format!("sip:asterisk@{}", self.local_addr);
-        let contact_uri = format!("sip:asterisk@{}", self.local_addr);
+        let sig = self.signaling_hostport();
+        let from_uri = format!("sip:asterisk@{sig}");
+        let contact_uri = format!("sip:asterisk@{sig}");
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
         let uri = SipUri::parse(request_uri).unwrap_or_else(|_| SipUri {
@@ -233,7 +245,7 @@ impl SipSession {
         let content_length = sdp_body.len();
 
         let mut headers = vec![
-            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: format!("<{}>;tag={}", from_uri, self.local_tag) },
             SipHeader { name: header_names::TO.to_string(), value: format!("<{}>", to_uri) },
@@ -335,8 +347,9 @@ impl SipSession {
         let invite = self.invite.as_ref()?;
         let mut response = invite.create_response(200, "OK").ok()?;
 
-        // Add Contact
-        let contact = format!("<sip:asterisk@{}>", self.local_addr);
+        // Add Contact (NAT-scoped toward the peer: external addr/port for a
+        // peer outside local_net, internal otherwise — New-3).
+        let contact = format!("<sip:asterisk@{}>", self.signaling_hostport());
         response.headers.push(SipHeader {
             name: header_names::CONTACT.to_string(),
             value: contact,
@@ -416,9 +429,10 @@ impl SipSession {
         };
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
+        let sig = self.signaling_hostport();
 
         let headers = vec![
-            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: invite.from_header()?.to_string() },
             SipHeader {
@@ -443,6 +457,7 @@ impl SipSession {
 
     /// Build a BYE request.
     pub fn build_bye(&mut self) -> Option<SipMessage> {
+        let sig = self.signaling_hostport();
         let dialog = self.dialog.as_mut()?;
         let cseq = dialog.next_cseq();
 
@@ -458,12 +473,12 @@ impl SipSession {
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
-        let from_value = format!("<sip:asterisk@{}>;tag={}", self.local_addr, dialog.local_tag);
+        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
 
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
         let headers = vec![
-            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: from_value },
             SipHeader { name: header_names::TO.to_string(), value: to_value },
@@ -545,6 +560,7 @@ impl SipSession {
     ///
     /// Used by the SFU ConfBridge to add/remove video streams for participants.
     pub fn build_reinvite(&mut self, sdp: &SessionDescription) -> Option<SipMessage> {
+        let sig = self.signaling_hostport();
         let dialog = self.dialog.as_mut()?;
         let cseq = dialog.next_cseq();
 
@@ -562,19 +578,19 @@ impl SipSession {
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
         // For UAS (inbound call), From = our local tag, To = remote tag.
-        let from_value = format!("<sip:asterisk@{}>;tag={}", self.local_addr, dialog.local_tag);
+        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
         let body = sdp.to_string();
 
         let headers = vec![
-            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: from_value },
             SipHeader { name: header_names::TO.to_string(), value: to_value },
             SipHeader { name: header_names::CALL_ID.to_string(), value: self.call_id.clone() },
             SipHeader { name: header_names::CSEQ.to_string(), value: format!("{} INVITE", cseq) },
-            SipHeader { name: header_names::CONTACT.to_string(), value: format!("<sip:asterisk@{}>", self.local_addr) },
+            SipHeader { name: header_names::CONTACT.to_string(), value: format!("<sip:asterisk@{}>", sig) },
             SipHeader { name: header_names::CONTENT_TYPE.to_string(), value: "application/sdp".to_string() },
             SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: body.len().to_string() },
         ];
@@ -608,8 +624,9 @@ impl SipSession {
         });
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
+        let sig = self.signaling_hostport();
 
-        let from_value = format!("<sip:asterisk@{}>;tag={}", self.local_addr, dialog.local_tag);
+        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
         // CSeq from the response we're ACKing.
@@ -619,7 +636,7 @@ impl SipSession {
             .unwrap_or(1);
 
         let headers = vec![
-            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch) },
+            SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: from_value },
             SipHeader { name: header_names::TO.to_string(), value: to_value },

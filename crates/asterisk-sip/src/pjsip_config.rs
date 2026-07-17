@@ -44,6 +44,12 @@ pub struct TransportConfig {
     pub external_media_address: Option<String>,
     /// External signaling address (NAT traversal).
     pub external_signaling_address: Option<String>,
+    /// External signaling port (New-3): the port advertised in Via/Contact/From
+    /// toward external peers, overriding the bind port for a NAT/forward that
+    /// maps an external port to the internal bind. `None` = advertise the bind
+    /// port. Only applied together with `external_signaling_address`, and only
+    /// for peers outside `local_net`.
+    pub external_signaling_port: Option<u16>,
     /// TLS certificate file.
     pub cert_file: Option<String>,
     /// TLS private key file.
@@ -517,6 +523,22 @@ fn parse_transport(cat: &asterisk_config::Category) -> Option<TransportConfig> {
         bind,
         external_media_address: get_last_variable(cat,"external_media_address").map(|s| s.to_string()),
         external_signaling_address: get_last_variable(cat,"external_signaling_address").map(|s| s.to_string()),
+        external_signaling_port: get_last_variable(cat,"external_signaling_port").and_then(|s| {
+            // Reject 0 and malformed values (codex CP2 F6): silently advertising
+            // port 0 would map the NAT target to an unusable port. Fall back to
+            // the bind port (None) and warn, rather than break the mapping.
+            match s.trim().parse::<u16>() {
+                Ok(0) => {
+                    warn!(name = %cat.name, "external_signaling_port=0 is invalid; ignoring (advertising the bind port)");
+                    None
+                }
+                Ok(p) => Some(p),
+                Err(_) => {
+                    warn!(name = %cat.name, value = %s.trim(), "invalid external_signaling_port; ignoring (advertising the bind port)");
+                    None
+                }
+            }
+        }),
         cert_file: get_last_variable(cat,"cert_file").map(|s| s.to_string()),
         priv_key_file: get_last_variable(cat,"priv_key_file").map(|s| s.to_string()),
         local_net,
