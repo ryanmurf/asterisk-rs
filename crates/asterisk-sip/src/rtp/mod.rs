@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
@@ -44,6 +44,49 @@ const NO_DTMF_PAYLOAD_TYPE: u8 = u8::MAX;
 /// Default inclusive RTP range used when `rtp.conf` is absent.
 pub const DEFAULT_RTP_PORT_START: u16 = 10000;
 pub const DEFAULT_RTP_PORT_END: u16 = 20000;
+
+/// Default RTP inactivity teardown, matching Asterisk's `rtptimeout` default of
+/// 300 s. A call that receives no accepted inbound RTP for this long is torn
+/// down fail-closed. `rtptimeout = 0` disables the reaper.
+pub const DEFAULT_RTP_TIMEOUT_SECS: u64 = 300;
+
+/// Parse Asterisk-compatible `[general] rtptimeout`. Absent → the 300 s
+/// default; `0` → disabled (`None`); any other value → that many seconds.
+///
+/// Kept separate from [`RtpPortRange::from_config`] so the port range and the
+/// inactivity policy can be loaded and reasoned about independently.
+pub fn rtp_timeout_from_config(
+    config: &asterisk_config::AsteriskConfig,
+) -> AsteriskResult<Option<Duration>> {
+    match config.get_variable("general", "rtptimeout") {
+        None => Ok(Some(Duration::from_secs(DEFAULT_RTP_TIMEOUT_SECS))),
+        Some(raw) => {
+            let secs = raw.trim().parse::<u64>().map_err(|_| {
+                AsteriskError::InvalidArgument(format!(
+                    "rtptimeout must be a non-negative integer number of seconds, got '{}'",
+                    raw
+                ))
+            })?;
+            Ok(if secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(secs))
+            })
+        }
+    }
+}
+
+/// Load `[general] rtptimeout` from an Asterisk-style `rtp.conf`. A missing
+/// file yields the 300 s default; an unreadable/invalid file is an error so a
+/// misconfiguration cannot silently disable the inactivity reaper.
+pub fn load_rtp_timeout(path: &Path) -> AsteriskResult<Option<Duration>> {
+    if !path.exists() {
+        return Ok(Some(Duration::from_secs(DEFAULT_RTP_TIMEOUT_SECS)));
+    }
+    let config = asterisk_config::AsteriskConfig::load(path)
+        .map_err(|e| AsteriskError::Parse(e.to_string()))?;
+    rtp_timeout_from_config(&config)
+}
 
 /// Validated inclusive RTP port range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +419,13 @@ pub struct RtpSession {
     pub samples_per_packet: u32,
     /// Statistics.
     pub stats: Arc<RtpStats>,
+    /// Instant of the last *accepted* inbound datagram (voice or RFC 4733),
+    /// updated only after every ingress check in [`Self::recv_frame`] passes.
+    /// Read by the `rtptimeout` inactivity watchdog. Discarded datagrams
+    /// (wrong source / payload type / malformed / unstable SSRC) deliberately
+    /// do NOT refresh it, so a hostile or stale packet stream cannot keep a
+    /// media-silent call alive.
+    last_inbound: RwLock<Instant>,
 }
 
 /// RTP session statistics.
@@ -473,7 +523,22 @@ impl RtpSession {
             outbound_timing: Mutex::new(None),
             samples_per_packet: 160,
             stats: Arc::new(RtpStats::default()),
+            last_inbound: RwLock::new(Instant::now()),
         }
+    }
+
+    /// Time since the last *accepted* inbound datagram. On a session that has
+    /// never received one this is the time since the session was bound, which
+    /// is what the `rtptimeout` watchdog wants: a call whose peer never sends
+    /// any media is reaped just like one whose media went silent mid-call.
+    pub fn inbound_idle(&self) -> Duration {
+        self.last_inbound.read().elapsed()
+    }
+
+    /// Reset the inactivity clock to now. Used when media is (re)attached so
+    /// the watchdog measures silence from that point, not from socket bind.
+    pub fn mark_inbound_active(&self) {
+        *self.last_inbound.write() = Instant::now();
     }
 
     /// Get the local address.
@@ -690,6 +755,12 @@ impl RtpSession {
             // Symmetric RTP may learn a source only after every ingress check
             // above succeeds. A rejected datagram can neither latch nor move it.
             self.latch_remote(src);
+
+            // Refresh the inactivity clock only for datagrams that survived
+            // every ingress check. This is the single source of truth for the
+            // `rtptimeout` watchdog (RtpStats counters are snapshot-copyable and
+            // deliberately do not carry an Instant).
+            *self.last_inbound.write() = Instant::now();
 
             self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
             self.stats
@@ -1220,6 +1291,89 @@ mod tests {
         assert!(RtpPortRange::new(0, 10000).is_err());
         assert!(RtpPortRange::new(10000, 0).is_err());
         assert!(RtpPortRange::new(20000, 19999).is_err());
+    }
+
+    #[test]
+    fn rtp_timeout_config_default_disable_and_explicit() {
+        // Absent -> the 300 s default.
+        let none = asterisk_config::AsteriskConfig::from_str("[general]\n", "rtp.conf").unwrap();
+        assert_eq!(
+            rtp_timeout_from_config(&none).unwrap(),
+            Some(Duration::from_secs(DEFAULT_RTP_TIMEOUT_SECS))
+        );
+        // 0 -> disabled.
+        let zero = asterisk_config::AsteriskConfig::from_str(
+            "[general]\nrtptimeout=0\n",
+            "rtp.conf",
+        )
+        .unwrap();
+        assert_eq!(rtp_timeout_from_config(&zero).unwrap(), None);
+        // Explicit -> that many seconds.
+        let five = asterisk_config::AsteriskConfig::from_str(
+            "[general]\nrtptimeout=5\n",
+            "rtp.conf",
+        )
+        .unwrap();
+        assert_eq!(
+            rtp_timeout_from_config(&five).unwrap(),
+            Some(Duration::from_secs(5))
+        );
+        // Non-numeric -> a startup error, never a silent disable.
+        let bad = asterisk_config::AsteriskConfig::from_str(
+            "[general]\nrtptimeout=off\n",
+            "rtp.conf",
+        )
+        .unwrap();
+        assert!(rtp_timeout_from_config(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn inbound_idle_resets_only_on_accepted_media() {
+        let session = RtpSession::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let local = session.local_addr().unwrap();
+        // Pin the remote + payload type so recv_frame accepts our datagram.
+        session.set_remote_addr("127.0.0.1:0".parse().unwrap());
+        session.set_payload_type(0);
+
+        // Idle grows with no traffic.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(session.inbound_idle() >= Duration::from_millis(50));
+
+        // A malformed datagram is discarded and must NOT reset the clock.
+        let src = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        session.set_remote_addr(src.local_addr().unwrap());
+        src.send_to(&[0u8; 3], local).await.unwrap();
+        // Give the session a chance to see it via one recv attempt.
+        let session = Arc::new(session);
+        let s2 = session.clone();
+        let reader = tokio::spawn(async move { s2.recv_frame().await });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            session.inbound_idle() >= Duration::from_millis(30),
+            "a discarded datagram must not refresh the inactivity clock"
+        );
+
+        // A well-formed PCMU datagram is accepted and resets the clock.
+        let header = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 0,
+            marker: true,
+            payload_type: 0,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 0x1234_5678,
+        };
+        let packet = build_rtp_packet(&header, &[0x7F; 160]);
+        src.send_to(&packet[..], local).await.unwrap();
+        reader.await.unwrap().unwrap();
+        assert!(
+            session.inbound_idle() < Duration::from_millis(30),
+            "an accepted datagram must refresh the inactivity clock"
+        );
     }
 
     #[tokio::test]

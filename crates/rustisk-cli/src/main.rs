@@ -1959,6 +1959,23 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
         rtp_port_range.end()
     );
 
+    // RTP inactivity teardown (`rtptimeout`, default 300 s). An established
+    // inbound call that receives no accepted RTP for this long is torn down
+    // fail-closed. A missing rtp.conf keeps the default; an invalid one is a
+    // startup error (same contract as the port range).
+    let rtp_timeout = if rtp_path.exists() {
+        asterisk_sip::rtp::load_rtp_timeout(&rtp_path)
+            .map_err(|e| format!("Failed to load {}: {}", rtp_path.display(), e))?
+    } else {
+        Some(std::time::Duration::from_secs(
+            asterisk_sip::rtp::DEFAULT_RTP_TIMEOUT_SECS,
+        ))
+    };
+    match rtp_timeout {
+        Some(d) => info!("Configured RTP inactivity timeout: {}s", d.as_secs()),
+        None => info!("RTP inactivity timeout disabled (rtptimeout = 0)"),
+    }
+
     info!("Registering channel technologies...");
     use asterisk_core::channel::tech_registry::TECH_REGISTRY;
     TECH_REGISTRY.register(Arc::new(asterisk_channels::local::LocalChannelDriver::new()));
@@ -2056,6 +2073,8 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                     // Give the handler the SIP channel driver so inbound calls
                     // bind an RTP session and carry media (mirrors outbound).
                     event_handler.set_channel_driver(sip_driver_ref.clone());
+                    // Arm the RTP inactivity teardown for answered inbound calls.
+                    event_handler.set_rtp_timeout(rtp_timeout);
                     // Give the handler the stack so its final INVITE
                     // responses are recorded in the transaction layer:
                     // answers racing a CANCEL-sent 487 are suppressed and

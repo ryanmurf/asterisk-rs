@@ -297,6 +297,16 @@ impl SipChannelDriver {
             .map(|a| a.port())
     }
 
+    /// Time since this channel last received accepted inbound RTP, if the
+    /// channel exists and has an RTP session attached. `None` means there is
+    /// no media plane to police (so the `rtptimeout` watchdog must not reap on
+    /// its behalf — absence of a session is not the same as silence).
+    pub async fn channel_rtp_idle(&self, channel_name: &str) -> Option<std::time::Duration> {
+        let priv_data = self.channels.read().get(channel_name)?.clone();
+        let rtp = priv_data.rtp.lock().await;
+        rtp.as_ref().map(|r| r.inbound_idle())
+    }
+
     /// Return the channel's negotiated telephone-event payload type.
     pub async fn channel_rtp_dtmf_payload_type(&self, channel_name: &str) -> Option<u8> {
         let priv_data = self.get_private(channel_name)?;
