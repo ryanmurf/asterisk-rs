@@ -535,6 +535,10 @@ impl SessionDescription {
     /// receiver would mislabel as voice and echo back with the audio payload
     /// type, corrupting both streams (issue #31). Per-stream transports/ports
     /// are future work.
+    ///
+    /// The accepted stream's answer direction is derived from the offer per
+    /// RFC 3264 §6.1 (see [`answer_direction`]); a `sendonly` hold offer is
+    /// answered `recvonly`, never `sendrecv`.
     pub fn create_answer(
         offer: &SessionDescription,
         addr: &str,
@@ -625,7 +629,13 @@ impl SessionDescription {
                         )),
                     ));
                 }
-                attributes.push(("sendrecv".to_string(), None));
+                // RFC 3264 §6.1: the answer's direction is derived from the
+                // offer's — a directional/hold offer must NOT be answered
+                // `sendrecv`. (M5 hold-answer defect: a `sendonly` hold offer
+                // was answered `sendrecv`, claiming to send into a stream the
+                // peer will not receive.)
+                let answer_dir = answer_direction(offer_media, offer.connection.as_ref());
+                attributes.push((direction_attr(answer_dir).to_string(), None));
 
                 answer.media_descriptions.push(MediaDescription {
                     media_type: offer_media.media_type.clone(),
@@ -634,7 +644,7 @@ impl SessionDescription {
                     formats,
                     connection: None,
                     attributes,
-                    direction: MediaDirection::SendRecv,
+                    direction: answer_dir,
                     fingerprint: offer_media.fingerprint.clone(),
                     setup: offer_media.setup.map(|s| {
                         // Answer flips the setup role.
@@ -769,6 +779,53 @@ impl SessionDescription {
             }
         }
         self.ice_pwd()
+    }
+}
+
+/// RFC 3264 §6.1: derive the answer's direction for a unicast stream from the
+/// offer's direction. We reflect the offer so we never advertise a direction
+/// the peer did not agree to receive:
+///
+/// | offer      | answer     |
+/// |------------|------------|
+/// | `sendrecv` | `sendrecv` |
+/// | `sendonly` | `recvonly` | (peer put us on hold; we only receive)
+/// | `recvonly` | `sendonly` |
+/// | `inactive` | `inactive` |
+///
+/// A stream whose (media- or, absent that, session-level) connection address is
+/// zeroed — `c=…0.0.0.0` / `c=…::`, the RFC 2543 legacy hold — is treated as a
+/// `sendonly` hold, so the answer is `recvonly`. Emitting `a=sendrecv` for a
+/// directional or held offer violates RFC 3264 §6.1.
+fn answer_direction(
+    offer_media: &MediaDescription,
+    session_connection: Option<&ConnectionData>,
+) -> MediaDirection {
+    let is_zeroed = |c: &ConnectionData| c.addr == "0.0.0.0" || c.addr == "::";
+    let held_by_zeroed_connection = match offer_media.connection.as_ref() {
+        Some(conn) => is_zeroed(conn),
+        None => session_connection.map(is_zeroed).unwrap_or(false),
+    };
+    let effective = if held_by_zeroed_connection {
+        MediaDirection::SendOnly
+    } else {
+        offer_media.direction
+    };
+    match effective {
+        MediaDirection::SendRecv => MediaDirection::SendRecv,
+        MediaDirection::SendOnly => MediaDirection::RecvOnly,
+        MediaDirection::RecvOnly => MediaDirection::SendOnly,
+        MediaDirection::Inactive => MediaDirection::Inactive,
+    }
+}
+
+/// The SDP `a=` attribute name for a media direction.
+fn direction_attr(dir: MediaDirection) -> &'static str {
+    match dir {
+        MediaDirection::SendRecv => "sendrecv",
+        MediaDirection::SendOnly => "sendonly",
+        MediaDirection::RecvOnly => "recvonly",
+        MediaDirection::Inactive => "inactive",
     }
 }
 
@@ -1488,5 +1545,93 @@ a=ice-ufrag:media_ufrag\r\n";
 
         assert_eq!(answer.media_descriptions.len(), 1);
         assert_eq!(answer.media_descriptions[0].port, 55555);
+    }
+
+    /// Build a single-audio (PCMU) offer with the given media-level direction
+    /// attribute (`None` = omit it), connection `10.0.0.1`.
+    fn audio_offer_with_direction(dir: Option<&str>) -> SessionDescription {
+        let mut sdp = String::from(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        );
+        if let Some(d) = dir {
+            sdp.push_str(&format!("a={d}\r\n"));
+        }
+        SessionDescription::parse(&sdp).unwrap()
+    }
+
+    fn answered_audio_direction(offer: &SessionDescription) -> MediaDirection {
+        let answer =
+            SessionDescription::create_answer(offer, "127.0.0.1", 55555, &[codecs_pcmu()]);
+        let audio = answer
+            .media_descriptions
+            .iter()
+            .find(|m| m.media_type == "audio")
+            .expect("audio accepted");
+        assert_eq!(audio.port, 55555, "audio stream must be accepted");
+        // The wire form must also carry the matching a= attribute (Display
+        // renders from `attributes`, not the `direction` field), and it must
+        // round-trip back to the same direction on re-parse.
+        let reparsed = SessionDescription::parse(&answer.to_string()).unwrap();
+        let reparsed_dir = reparsed
+            .media_descriptions
+            .iter()
+            .find(|m| m.media_type == "audio")
+            .unwrap()
+            .direction;
+        assert_eq!(
+            reparsed_dir, audio.direction,
+            "answer direction must survive serialization round-trip"
+        );
+        audio.direction
+    }
+
+    #[test]
+    fn answer_direction_follows_offer_rfc3264_6_1() {
+        // RFC 3264 §6.1: the answer direction is derived from the offer.
+        assert_eq!(
+            answered_audio_direction(&audio_offer_with_direction(Some("sendrecv"))),
+            MediaDirection::SendRecv,
+        );
+        assert_eq!(
+            answered_audio_direction(&audio_offer_with_direction(None)),
+            MediaDirection::SendRecv,
+            "no direction attribute defaults to sendrecv -> sendrecv"
+        );
+        // The hold case the M5 review flagged: sendonly MUST NOT be sendrecv.
+        assert_eq!(
+            answered_audio_direction(&audio_offer_with_direction(Some("sendonly"))),
+            MediaDirection::RecvOnly,
+        );
+        assert_eq!(
+            answered_audio_direction(&audio_offer_with_direction(Some("recvonly"))),
+            MediaDirection::SendOnly,
+        );
+        assert_eq!(
+            answered_audio_direction(&audio_offer_with_direction(Some("inactive"))),
+            MediaDirection::Inactive,
+        );
+    }
+
+    #[test]
+    fn answer_direction_treats_zeroed_connection_as_hold() {
+        // RFC 2543 legacy hold: c=0.0.0.0 with no direction attribute is a
+        // sendonly hold, so the answer must be recvonly (never sendrecv).
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=x\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        )
+        .unwrap();
+        assert_eq!(answered_audio_direction(&offer), MediaDirection::RecvOnly);
     }
 }
