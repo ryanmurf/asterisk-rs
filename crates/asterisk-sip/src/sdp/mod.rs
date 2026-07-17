@@ -942,6 +942,96 @@ pub fn advertised_media_ip(local: std::net::SocketAddr, remote: std::net::Socket
     advertised_media_ip_with(external.as_deref(), &local_net, local, remote)
 }
 
+/// Pick the `host:port` string to advertise in SIP Via/Contact/From toward
+/// `remote` (New-3), transport-scoped by `local_net` exactly like
+/// [`advertised_media_ip`].
+///
+/// Selection order:
+/// 1. a transport's configured `external_signaling_address` (with its optional
+///    `external_signaling_port`, else the bind port), unless the peer falls
+///    inside that transport's `local_net` CIDRs;
+/// 2. otherwise the concrete local bind `host:port`, unchanged.
+///
+/// A peer inside `local_net` therefore sees the internal bind address/port; an
+/// external peer sees the external address AND the external port. This lets a
+/// NAT/forward map an external port to a different internal bind port without
+/// breaking the first in-dialog request (which is targeted by the Contact this
+/// produces).
+pub fn advertised_signaling_hostport(
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> String {
+    let (external, external_port, local_net) = match crate::pjsip_config::get_global_pjsip_config()
+    {
+        Some(cfg) => {
+            // Same bind-coverage lookup as advertised_media_ip: the transport
+            // whose bind covers `local` — exact ip+port, then exact ip, then a
+            // wildcard bind. A transport bound to a DIFFERENT concrete address
+            // never donates its NAT config.
+            let with_ext = |pred: &dyn Fn(&crate::pjsip_config::TransportConfig) -> bool| {
+                cfg.transports
+                    .iter()
+                    .find(|t| t.external_signaling_address.is_some() && pred(t))
+            };
+            let transport =
+                with_ext(&|t| t.bind.ip() == local.ip() && t.bind.port() == local.port())
+                    .or_else(|| with_ext(&|t| t.bind.ip() == local.ip()))
+                    .or_else(|| with_ext(&|t| t.bind.ip().is_unspecified()));
+            match transport {
+                Some(t) => (
+                    t.external_signaling_address.clone(),
+                    t.external_signaling_port,
+                    t.local_net.clone(),
+                ),
+                None => (None, None, Vec::new()),
+            }
+        }
+        None => (None, None, Vec::new()),
+    };
+    advertised_signaling_hostport_with(
+        external.as_deref(),
+        external_port,
+        &local_net,
+        local,
+        remote,
+    )
+}
+
+/// Testable core of [`advertised_signaling_hostport`] (config plumbed in
+/// explicitly).
+fn advertised_signaling_hostport_with(
+    external: Option<&str>,
+    external_port: Option<u16>,
+    local_net: &[String],
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> String {
+    // A configured external signaling address wins for peers outside local_net.
+    if let Some(ext) = external.filter(|e| !e.is_empty()) {
+        let peer_is_local = local_net.iter().any(|cidr| {
+            crate::acl::AclRule::permit(cidr)
+                .map(|rule| rule.matches(&remote.ip()))
+                .unwrap_or(false)
+        });
+        if !peer_is_local {
+            let port = external_port.unwrap_or_else(|| local.port());
+            return format_hostport(ext, port);
+        }
+    }
+    // Otherwise advertise the concrete bind host:port, unchanged.
+    local.to_string()
+}
+
+/// Format `host:port` for a SIP sent-by / URI host, bracketing a bare IPv6
+/// literal (`::1` -> `[::1]:5060`). An FQDN or IPv4 literal is emitted as-is.
+fn format_hostport(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Testable core of [`advertised_media_ip`] (config plumbed in explicitly).
 fn advertised_media_ip_with(
     external: Option<&str>,
@@ -1076,6 +1166,7 @@ mod tests {
                 bind: "192.0.2.50:5060".parse().unwrap(),
                 external_media_address: Some("203.0.113.99".to_string()),
                 external_signaling_address: None,
+                external_signaling_port: None,
                 cert_file: None,
                 priv_key_file: None,
                 local_net: vec![],
@@ -1088,6 +1179,122 @@ mod tests {
         let ip = advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062"));
         assert_eq!(ip, "127.0.0.1");
         // Reset the process-global config for other tests in this binary.
+        set_global_pjsip_config(PjsipConfig::default());
+    }
+
+    // ---- advertised_signaling_hostport (New-3) --------------------------
+
+    /// No external signaling address: the bind host:port is advertised as-is.
+    #[test]
+    fn test_signaling_no_external_passes_through_bind() {
+        assert_eq!(
+            advertised_signaling_hostport_with(None, None, &[], sa("192.0.2.10:5060"), sa("198.51.100.7:5062")),
+            "192.0.2.10:5060"
+        );
+    }
+
+    /// A configured external signaling address wins for a peer outside
+    /// local_net; with no port override the BIND port is advertised.
+    #[test]
+    fn test_signaling_external_applies_to_nonlocal_peer_default_port() {
+        assert_eq!(
+            advertised_signaling_hostport_with(
+                Some("203.0.113.99"),
+                None,
+                &[],
+                sa("10.1.2.3:5060"),
+                sa("198.51.100.7:5062"),
+            ),
+            "203.0.113.99:5060"
+        );
+    }
+
+    /// The external signaling PORT override (New-3) replaces the bind port in
+    /// the advertised host:port for an external peer — independent of the bind.
+    #[test]
+    fn test_signaling_external_port_override_applies() {
+        assert_eq!(
+            advertised_signaling_hostport_with(
+                Some("203.0.113.99"),
+                Some(6666),
+                &[],
+                sa("10.1.2.3:5060"),
+                sa("198.51.100.7:5062"),
+            ),
+            "203.0.113.99:6666"
+        );
+    }
+
+    /// A peer inside local_net bypasses the external address/port and gets the
+    /// internal bind host:port — even when an external port override is set.
+    #[test]
+    fn test_signaling_local_net_peer_bypasses_external() {
+        assert_eq!(
+            advertised_signaling_hostport_with(
+                Some("203.0.113.99"),
+                Some(6666),
+                &["10.0.0.0/8".to_string()],
+                sa("10.1.2.3:5060"),
+                sa("10.9.9.9:5062"),
+            ),
+            "10.1.2.3:5060"
+        );
+    }
+
+    /// A bare IPv6 external literal is bracketed in the advertised host:port.
+    #[test]
+    fn test_signaling_external_ipv6_is_bracketed() {
+        assert_eq!(
+            advertised_signaling_hostport_with(
+                Some("2001:db8::1"),
+                Some(5080),
+                &[],
+                sa("192.0.2.10:5060"),
+                sa("198.51.100.7:5062"),
+            ),
+            "[2001:db8::1]:5080"
+        );
+    }
+
+    /// An FQDN external signaling address is emitted as-is (legal in a SIP
+    /// sent-by / URI host); resolution is the peer's job.
+    #[test]
+    fn test_signaling_external_fqdn_passes_through() {
+        assert_eq!(
+            advertised_signaling_hostport_with(
+                Some("pbx.example.com"),
+                Some(5090),
+                &[],
+                sa("192.0.2.10:5060"),
+                sa("198.51.100.7:5062"),
+            ),
+            "pbx.example.com:5090"
+        );
+    }
+
+    /// End-to-end through the config lookup: a transport bound to a DIFFERENT
+    /// concrete address must not donate its external signaling address.
+    #[test]
+    fn test_signaling_foreign_transport_does_not_donate_external() {
+        use crate::pjsip_config::{set_global_pjsip_config, PjsipConfig, TransportConfig};
+        let cfg = PjsipConfig {
+            transports: vec![TransportConfig {
+                name: "other".to_string(),
+                protocol: "udp".to_string(),
+                bind: "192.0.2.50:5060".parse().unwrap(),
+                external_media_address: None,
+                external_signaling_address: Some("203.0.113.99".to_string()),
+                external_signaling_port: Some(6666),
+                cert_file: None,
+                priv_key_file: None,
+                local_net: vec![],
+            }],
+            ..Default::default()
+        };
+        set_global_pjsip_config(cfg);
+        // Local bind 127.0.0.1 is NOT covered by the 192.0.2.50 transport.
+        let hp = advertised_signaling_hostport(sa("127.0.0.1:5060"), sa("198.51.100.7:5062"));
+        assert_eq!(hp, "127.0.0.1:5060");
         set_global_pjsip_config(PjsipConfig::default());
     }
 
