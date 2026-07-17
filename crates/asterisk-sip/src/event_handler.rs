@@ -25,6 +25,65 @@ use asterisk_core::channel::softhangup;
 use asterisk_core::pbx::Dialplan;
 use asterisk_types::{ChannelState, HangupCause};
 
+/// Methods this UA supports, advertised in the initial-INVITE 2xx `Allow`
+/// (RFC 3311 §5.1) and in the OPTIONS 200 `Allow` (RFC 3261 §11 / RFC 3311
+/// §5.2). `UPDATE` is included because the stack answers in-dialog UPDATE
+/// (`handle_update`); omitting it told peers UPDATE was unsupported even though
+/// the handler existed (M5 review MAJOR-3).
+pub const SUPPORTED_METHODS: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY, UPDATE";
+
+/// Build the 200 OK for an OPTIONS ping. Advertises [`SUPPORTED_METHODS`] in
+/// `Allow` (which now includes UPDATE) plus `Accept`/`Server`. Centralising the
+/// Allow list here keeps the OPTIONS advertisement and the initial-2xx Allow in
+/// lockstep and makes the wire contract unit-testable.
+pub fn build_options_ok(request: &SipMessage) -> Option<SipMessage> {
+    let mut ok = request.create_response(200, "OK").ok()?;
+    ok.add_header(crate::parser::header_names::ALLOW, SUPPORTED_METHODS);
+    ok.add_header("Accept", "application/sdp");
+    ok.add_header("Server", "Rustisk/0.1.0");
+    Some(ok)
+}
+
+/// RFC 4028 §9 responder-only session-timer policy for an in-dialog request
+/// carrying `Session-Expires`.
+///
+/// rustisk answers UAC-driven refreshes (re-INVITE / UPDATE) but does not yet
+/// schedule its own, so it only ever acts as a *responder* with the UAC as the
+/// refresher:
+///
+/// * `refresher=uac`    → echo `uac` (honour the peer's explicit choice).
+/// * no refresher param → select `uac` (our policy: the peer refreshes).
+/// * `refresher=uas`    → the peer asked us to refresh, which we do NOT
+///   implement. RFC 4028 forbids overriding the peer's explicit choice, and we
+///   must not claim a role we don't perform (that would let a healthy long call
+///   drop at the timer). So the timer is *declined*: return `None`, emit no
+///   `Session-Expires`. UAS-side refresh SCHEDULING is deferred to M7.
+///
+/// Returns `Some((interval, "uac"))` to advertise in the response, or `None` to
+/// omit the session timer entirely.
+fn session_timer_response(request: &SipMessage) -> Option<(String, &'static str)> {
+    let se = request.get_header(crate::parser::header_names::SESSION_EXPIRES)?;
+    let mut parts = se.split(';');
+    let interval = parts.next()?.trim().to_string();
+    // A Session-Expires without a positive integer interval is malformed; do
+    // not engage a timer for it.
+    if interval.parse::<u32>().is_err() {
+        return None;
+    }
+    let mut refresher = None;
+    for p in parts {
+        if let Some(v) = p.trim().strip_prefix("refresher=") {
+            refresher = Some(v.trim().to_ascii_lowercase());
+        }
+    }
+    match refresher.as_deref() {
+        // Never claim the uas role we don't schedule (deferred to M7).
+        Some("uas") => None,
+        // `uac` explicitly, or unspecified (we select uac): the peer refreshes.
+        _ => Some((interval, "uac")),
+    }
+}
+
 /// Per-call state stored by the event handler for SIP signaling.
 struct CallState {
     /// The SIP session (holds INVITE, dialog, SDP, etc.).
@@ -1432,8 +1491,14 @@ impl SipEventHandler {
     ///   sent-claim: the pump immediately sends to the new address and accepts
     ///   the new payload type.
     /// * **Without SDP** — a session-timer refresh / connected-line update. A
-    ///   200 OK is returned, echoing `Session-Expires;refresher=uas` when the
-    ///   peer armed a session timer.
+    ///   200 OK is returned; when the peer armed a session timer we advertise
+    ///   the refresher we actually implement — the UAC — per
+    ///   [`session_timer_response`] (RFC 4028 §9). We never claim `refresher=uas`.
+    ///
+    /// Both shapes are **target-refresh** requests (RFC 3261 §12.2 / RFC 3311):
+    /// the request's Contact is applied to the dialog so later local in-dialog
+    /// requests (BYE, re-INVITE) use the refreshed target, not the stale INVITE
+    /// Contact.
     ///
     /// Previously this was silently answered `501 Not Implemented`, dropping any
     /// mid-call media change or session refresh (`main.rs` UPDATE dispatch).
@@ -1460,6 +1525,18 @@ impl SipEventHandler {
             let cs = cs_arc.lock().await;
             (cs.channel_name.clone(), cs.session.local_addr)
         };
+
+        // RFC 3261 §12.2 / RFC 3311: UPDATE is a target-refresh request. Apply
+        // its Contact to the dialog's remote target so subsequent local
+        // in-dialog requests (BYE, re-INVITE) address the refreshed target
+        // instead of the stale INVITE Contact. (M5 review MAJOR-3.)
+        if let Some(contact) = request
+            .get_header(crate::parser::header_names::CONTACT)
+            .and_then(crate::parser::extract_uri)
+        {
+            let mut cs = cs_arc.lock().await;
+            cs.session.update_remote_target(&contact);
+        }
 
         let carries_sdp = request
             .get_header(crate::parser::header_names::CONTENT_TYPE)
@@ -1524,26 +1601,36 @@ impl SipEventHandler {
             ok.add_header("Content-Type", "application/sdp");
             ok.add_header("Content-Length", &sdp_str.len().to_string());
             ok.body = sdp_str;
+            // A media UPDATE may also carry a session timer; honour the same
+            // responder-only (uac) refresher policy as the no-SDP branch.
+            if let Some((interval, refresher)) = session_timer_response(request) {
+                ok.add_header(
+                    "Session-Expires",
+                    &format!("{};refresher={}", interval, refresher),
+                );
+                ok.add_header("Require", "timer");
+            }
             if let Err(e) = self.send_server_response(&ok, remote_addr).await {
                 warn!(call_id = %call_id, "Failed to send 200 OK for UPDATE: {}", e);
             } else {
                 info!(call_id = %call_id, "Answered in-dialog UPDATE (media renegotiated)");
             }
         } else {
-            // Session-timer refresh / connected-line update: answer 200 and
-            // echo the session interval as the refresher when a timer was armed.
+            // Session-timer refresh / connected-line update: answer 200 and, per
+            // RFC 4028 §9, advertise the refresher we actually implement (the
+            // UAC). We NEVER emit refresher=uas — UAS-side refresh scheduling is
+            // deferred to M7, and claiming that role would let a healthy long
+            // call drop at the timer (M5 review MAJOR-3).
             let Ok(mut ok) = request.create_response(200, "OK") else {
                 return;
             };
             ok.add_header("Contact", &format!("<sip:asterisk@{}>", local_addr));
-            if let Some(se) =
-                request.get_header(crate::parser::header_names::SESSION_EXPIRES)
-            {
-                let interval = se.split(';').next().unwrap_or(se).trim();
-                if !interval.is_empty() {
-                    ok.add_header("Session-Expires", &format!("{};refresher=uas", interval));
-                    ok.add_header("Require", "timer");
-                }
+            if let Some((interval, refresher)) = session_timer_response(request) {
+                ok.add_header(
+                    "Session-Expires",
+                    &format!("{};refresher={}", interval, refresher),
+                );
+                ok.add_header("Require", "timer");
             }
             if let Err(e) = self.send_server_response(&ok, remote_addr).await {
                 warn!(call_id = %call_id, "Failed to send 200 OK for UPDATE refresh: {}", e);
