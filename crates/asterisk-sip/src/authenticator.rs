@@ -7,6 +7,7 @@
 //! Outbound: responds to 401/407 challenges from remote servers by
 //! computing digest credentials and attaching Authorization headers.
 
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 use crate::auth::{
@@ -104,7 +105,6 @@ impl InboundAuthenticator {
 
         // Look for an Authorization header in the request.
         let auth_hdr = request.get_header(auth_header_name);
-        eprintln!("[DEBUG] Auth header name={}, present={}", auth_header_name, auth_hdr.is_some());
 
         if auth_hdr.is_none() {
             // No credentials provided -- send a challenge.
@@ -204,7 +204,16 @@ impl InboundAuthenticator {
             )
         };
 
-        if expected_response == parsed.response {
+        // Constant-time comparison of the digest response. A plain `==` on the
+        // hex strings short-circuits on the first differing byte, which leaks
+        // through response timing how many leading hex digits of a forged
+        // `response=` value were correct -- a byte-at-a-time oracle against the
+        // expected digest. Compare over the raw bytes with `ConstantTimeEq`.
+        let matches: bool = expected_response
+            .as_bytes()
+            .ct_eq(parsed.response.as_bytes())
+            .into();
+        if matches {
             debug!(username = %cred.username, "Authentication successful");
             Ok(())
         } else {
@@ -678,6 +687,80 @@ mod tests {
         let result = auth.verify(&request, &creds, false);
         assert!(result.is_err(), "wrong password must not authenticate");
         assert_eq!(result.unwrap_err().status_code(), Some(401));
+    }
+
+    /// The constant-time digest comparison must keep the exact accept/reject
+    /// contract: the genuine response authenticates, but a response that differs
+    /// only in its FIRST hex digit, only in its LAST hex digit, or that is
+    /// truncated, must all be rejected. (Locks the boundary the `ct_eq`-based
+    /// compare replaced the old `==` with; the timing property itself is
+    /// guaranteed by `subtle::ConstantTimeEq`.)
+    #[test]
+    fn test_verify_constant_time_compare_rejects_tampered_response() {
+        let auth = InboundAuthenticator::new();
+        let creds = vec![AuthCredentials::new("100", "1234", "asterisk")];
+
+        let realm = "asterisk";
+        let nonce = "3ba9f7d8c0e14a2b";
+        let cnonce = "557b3a1e";
+        let nc = "00000001";
+        let uri = "sip:asterisk";
+
+        let challenge = DigestChallenge {
+            realm: realm.to_string(),
+            nonce: nonce.to_string(),
+            algorithm: DigestAlgorithm::Md5,
+            qop: Some("auth".to_string()),
+            opaque: None,
+            stale: false,
+            domain: None,
+        };
+        let digest_creds = crate::auth::DigestCredentials {
+            username: "100".to_string(),
+            password: "1234".to_string(),
+            realm: realm.to_string(),
+        };
+        let good = crate::auth::compute_digest_response_hash(
+            &challenge, &digest_creds, "REGISTER", uri, cnonce, nc,
+        );
+
+        let build = |response: &str| {
+            let header = format!(
+                "Digest username=\"100\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", \
+                 response=\"{response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc={nc}"
+            );
+            let raw = format!(
+                "REGISTER sip:asterisk SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 10.0.0.2;branch=z9hG4bKct1\r\n\
+                 From: <sip:100@asterisk>;tag=ct\r\n\
+                 To: <sip:100@asterisk>\r\n\
+                 Call-ID: ct-call-1\r\n\
+                 CSeq: 2 REGISTER\r\n\
+                 Authorization: {header}\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            );
+            SipMessage::parse(raw.as_bytes()).unwrap()
+        };
+
+        // Genuine response authenticates.
+        assert!(auth.verify(&build(&good), &creds, false).is_ok());
+
+        // Flip the first hex digit.
+        let mut first = good.clone();
+        let f0 = if good.starts_with('0') { '1' } else { '0' };
+        first.replace_range(0..1, &f0.to_string());
+        assert!(auth.verify(&build(&first), &creds, false).is_err());
+
+        // Flip the last hex digit.
+        let mut last = good.clone();
+        let l0 = if good.ends_with('0') { '1' } else { '0' };
+        let n = last.len();
+        last.replace_range(n - 1..n, &l0.to_string());
+        assert!(auth.verify(&build(&last), &creds, false).is_err());
+
+        // Truncated (correct prefix, wrong length) must be rejected.
+        assert!(auth.verify(&build(&good[..good.len() - 4]), &creds, false).is_err());
     }
 
     /// The legacy RFC 2069 (no qop) path must still authenticate.

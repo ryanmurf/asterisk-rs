@@ -27,6 +27,7 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+subtle = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }
 dashmap = { workspace = true }
