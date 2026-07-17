@@ -58,4 +58,15 @@
       <action application="sleep" data="45000"/>
     </condition>
   </extension>
+
+  <!-- M5 soak far-side: answer, hold media briefly, then hang up so the whole
+       bridged call establishes and tears down fast (no tones/DTMF). -->
+  <extension name="rustisk-m5-soak-receiver">
+    <condition field="destination_number" expression="^9501$">
+      <action application="set" data="suppress_cng=true" inline="true"/>
+      <action application="answer"/>
+      <action application="sleep" data="150"/>
+      <action application="hangup"/>
+    </condition>
+  </extension>
 </include>

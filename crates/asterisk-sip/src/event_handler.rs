@@ -65,6 +65,15 @@ pub struct SipResourceCounts {
     pub invite_server_transactions: usize,
     pub non_invite_client_transactions: usize,
     pub non_invite_server_transactions: usize,
+    /// Live RTP sessions (bound UDP ports) — a true gauge of RTP port
+    /// allocations, independent of the driver map.
+    pub rtp_sessions: usize,
+    /// Total contact bindings across every AoR in the registrar.
+    pub registrar_bindings: usize,
+    /// Scoped channel hangup-callback registrations (issue #121/#122).
+    pub hangup_callbacks: usize,
+    /// Scoped channel answer-callback registrations (issue #121/#122).
+    pub answer_callbacks: usize,
 }
 
 /// SIP event handler -- bridges the SIP stack to the Asterisk channel model.
@@ -2321,6 +2330,10 @@ impl SipEventHandler {
             invite_server_transactions: transaction_counts.invite_server,
             non_invite_client_transactions: transaction_counts.non_invite_client,
             non_invite_server_transactions: transaction_counts.non_invite_server,
+            rtp_sessions: crate::rtp::active_rtp_sessions(),
+            registrar_bindings: self.registrar.total_bindings(),
+            hangup_callbacks: asterisk_core::channel::registered_hangup_callbacks(),
+            answer_callbacks: asterisk_core::channel::registered_answer_callbacks(),
         }
     }
 }

@@ -50,6 +50,19 @@ pub const DEFAULT_RTP_PORT_END: u16 = 20000;
 /// down fail-closed. `rtptimeout = 0` disables the reaper.
 pub const DEFAULT_RTP_TIMEOUT_SECS: u64 = 300;
 
+/// Process-global count of live RTP sessions (each owns one bound UDP port).
+/// Incremented when a session binds its socket and decremented on drop, so it
+/// is a true gauge of RTP port allocations independent of any driver map —
+/// exactly what the soak's exact-baseline assertion needs to catch a leaked
+/// socket that outlives its channel-map entry.
+static ACTIVE_RTP_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of RTP sessions (bound UDP ports) currently alive.
+pub fn active_rtp_sessions() -> usize {
+    ACTIVE_RTP_SESSIONS.load(Ordering::Relaxed)
+}
+
 /// Parse Asterisk-compatible `[general] rtptimeout`. Absent → the 300 s
 /// default; `0` → disabled (`None`); any other value → that many seconds.
 ///
@@ -428,6 +441,12 @@ pub struct RtpSession {
     last_inbound: RwLock<Instant>,
 }
 
+impl Drop for RtpSession {
+    fn drop(&mut self) {
+        ACTIVE_RTP_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// RTP session statistics.
 #[derive(Debug, Default)]
 pub struct RtpStats {
@@ -511,6 +530,7 @@ impl RtpSession {
 
     fn from_socket(socket: UdpSocket) -> Self {
         let ssrc = generate_ssrc();
+        ACTIVE_RTP_SESSIONS.fetch_add(1, Ordering::Relaxed);
         Self {
             socket: Arc::new(socket),
             ssrc,
