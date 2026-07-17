@@ -313,8 +313,9 @@ async fn fail_closed_scenarios() {
     );
     let codes = collect_status_codes(&sock, Duration::from_secs(2)).await;
     assert!(
-        codes.contains(&403) || codes.contains(&401),
-        "unresolvable matched auth must be rejected (403/401), not accepted; saw {codes:?}"
+        codes.contains(&403),
+        "unresolvable matched auth must be rejected with a hard 403 (fail closed, \
+         not a 401 challenge inviting a retry); saw {codes:?}"
     );
 
     // (b) identify names a non-existent endpoint -> reject.

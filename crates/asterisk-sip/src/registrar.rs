@@ -598,6 +598,57 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_before_expiry_keeps_contact_live() {
+        // A REGISTER refresh arriving BEFORE the binding expires must replace
+        // the binding IN PLACE with a fresh `registered_at` (register() finds
+        // the existing contact_uri and overwrites it): the contact stays live
+        // with a restored TTL and is never duplicated.
+        let registrar = Registrar::new();
+        registrar.add_aor("alice", AorConfig::default());
+
+        // Seed a binding that is close to expiry: registered 50s ago, 60s TTL.
+        registrar.register(Registration {
+            aor: "alice".to_string(),
+            contact_uri: "sip:alice@10.0.0.1".to_string(),
+            expiration: 60,
+            registered_at: Instant::now() - Duration::from_secs(50),
+            user_agent: "aging".to_string(),
+            path: None,
+            call_id: "reg-test-123".to_string(),
+            cseq: 1,
+        });
+        let before = registrar.get_contacts("alice");
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0].remaining_seconds() <= 10,
+            "precondition: the seeded binding must be near expiry"
+        );
+
+        // Refresh through the real REGISTER path before it expires.
+        let refresh = make_register("<sip:alice@10.0.0.1>", Some(60));
+        let resp = registrar.handle_register(&refresh);
+        assert_eq!(resp.status_code(), Some(200));
+
+        let after = registrar.get_contacts("alice");
+        assert_eq!(
+            after.len(),
+            1,
+            "a refresh must replace the binding in place, never duplicate it"
+        );
+        assert!(!after[0].is_expired(), "the refreshed binding must be live");
+        assert!(
+            after[0].remaining_seconds() > 50,
+            "the refresh must reset registered_at (TTL restored, got {}s)",
+            after[0].remaining_seconds()
+        );
+        assert_eq!(
+            registrar.best_contact("alice"),
+            Some("sip:alice@10.0.0.1".to_string()),
+            "the refreshed contact must remain routable"
+        );
+    }
+
+    #[test]
     fn test_best_contact_skips_expired() {
         let registrar = Registrar::new();
         // Only binding is already expired (registered 100s ago, 50s TTL).

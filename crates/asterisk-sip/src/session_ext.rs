@@ -1,22 +1,20 @@
 //! Extended session handling (port of res_pjsip_session.c extensions).
 //!
-//! Adds session supplements (pre/post request processing hooks),
-//! re-INVITE handling for mid-call media changes, session timers
-//! (RFC 4028), and connected-line updates via re-INVITE/UPDATE.
+//! Adds session supplements (pre/post request processing hooks) and
+//! session timers (RFC 4028). Mid-call re-INVITEs are built by
+//! [`SipSession::build_reinvite`] (external-signaling-scoped); the
+//! unscoped free-function variants that used to live here (and a
+//! connected-line UPDATE builder) had no callers and were removed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tracing::{debug, warn};
-use uuid::Uuid;
+use tracing::warn;
 
-use crate::parser::{
-    header_names, RequestLine, SipHeader, SipMessage, SipMethod, SipUri, StartLine,
-};
-use crate::sdp::SessionDescription;
-use crate::session::{SessionState, SipSession};
+use crate::parser::{SipHeader, SipMessage, SipMethod};
+use crate::session::SipSession;
 
 // ---------------------------------------------------------------------------
 // Session supplement (pre/post processing hooks)
@@ -182,139 +180,6 @@ impl std::fmt::Debug for SupplementRegistry {
             .field("count", &count)
             .finish()
     }
-}
-
-// ---------------------------------------------------------------------------
-// Re-INVITE handling
-// ---------------------------------------------------------------------------
-
-/// Reason for a re-INVITE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReinviteReason {
-    /// Media change (codec renegotiation, hold/unhold).
-    MediaChange,
-    /// Connected line update (caller-ID update mid-call).
-    ConnectedLineUpdate,
-    /// Session timer refresh.
-    SessionTimerRefresh,
-    /// T.38 fax switchover.
-    FaxSwitchover,
-    /// Direct media negotiation.
-    DirectMedia,
-}
-
-/// Build a re-INVITE request for an established session.
-pub fn build_reinvite(
-    session: &mut SipSession,
-    new_sdp: Option<SessionDescription>,
-    reason: ReinviteReason,
-) -> Option<SipMessage> {
-    let dialog = session.dialog.as_mut()?;
-
-    if session.state != SessionState::Established {
-        warn!("Cannot send re-INVITE: session not established");
-        return None;
-    }
-
-    let cseq = dialog.next_cseq();
-    let branch = format!(
-        "z9hG4bK{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..16]
-    );
-
-    let target_uri = SipUri::parse(&dialog.remote_target).ok().unwrap_or(SipUri {
-        scheme: "sip".to_string(),
-        user: None,
-        password: None,
-        host: session.remote_addr.ip().to_string(),
-        port: Some(session.remote_addr.port()),
-        parameters: Default::default(),
-        headers: Default::default(),
-    });
-
-    let sdp_body = new_sdp
-        .as_ref()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    if new_sdp.is_some() {
-        session.local_sdp = new_sdp;
-    }
-
-    let from_value = format!(
-        "<sip:asterisk@{}>;tag={}",
-        session.local_addr, dialog.local_tag
-    );
-    let to_value = format!(
-        "<{}>;tag={}",
-        dialog.remote_uri, dialog.remote_tag
-    );
-
-    let mut headers = vec![
-        SipHeader {
-            name: header_names::VIA.to_string(),
-            value: format!("SIP/2.0/UDP {};branch={}", session.local_addr, branch),
-        },
-        SipHeader {
-            name: header_names::MAX_FORWARDS.to_string(),
-            value: "70".to_string(),
-        },
-        SipHeader {
-            name: header_names::FROM.to_string(),
-            value: from_value,
-        },
-        SipHeader {
-            name: header_names::TO.to_string(),
-            value: to_value,
-        },
-        SipHeader {
-            name: header_names::CALL_ID.to_string(),
-            value: session.call_id.clone(),
-        },
-        SipHeader {
-            name: header_names::CSEQ.to_string(),
-            value: format!("{} INVITE", cseq),
-        },
-        SipHeader {
-            name: header_names::CONTACT.to_string(),
-            value: format!("<sip:asterisk@{}>", session.local_addr),
-        },
-        SipHeader {
-            name: header_names::USER_AGENT.to_string(),
-            value: "Rustisk/0.1.0".to_string(),
-        },
-        SipHeader {
-            name: header_names::ALLOW.to_string(),
-            value: "INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY, UPDATE".to_string(),
-        },
-    ];
-
-    if !sdp_body.is_empty() {
-        headers.push(SipHeader {
-            name: header_names::CONTENT_TYPE.to_string(),
-            value: "application/sdp".to_string(),
-        });
-    }
-    headers.push(SipHeader {
-        name: header_names::CONTENT_LENGTH.to_string(),
-        value: sdp_body.len().to_string(),
-    });
-
-    debug!(
-        call_id = %session.call_id,
-        reason = ?reason,
-        "Building re-INVITE"
-    );
-
-    Some(SipMessage {
-        start_line: StartLine::Request(RequestLine {
-            method: SipMethod::Invite,
-            uri: target_uri,
-            version: "SIP/2.0".to_string(),
-        }),
-        headers,
-        body: sdp_body,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -554,117 +419,6 @@ pub fn build_session_timeout_bye(session: &mut SipSession) -> Option<SipMessage>
         "Session timer expired -- sending BYE"
     );
     session.build_bye()
-}
-
-// ---------------------------------------------------------------------------
-// Connected line updates
-// ---------------------------------------------------------------------------
-
-/// Connected line information for display updates.
-#[derive(Debug, Clone)]
-pub struct ConnectedLineInfo {
-    /// Display name.
-    pub name: Option<String>,
-    /// SIP URI.
-    pub uri: String,
-    /// Privacy flag.
-    pub privacy: bool,
-}
-
-/// Build an UPDATE request for a connected-line update.
-pub fn build_update_connected_line(
-    session: &mut SipSession,
-    connected: &ConnectedLineInfo,
-) -> Option<SipMessage> {
-    let dialog = session.dialog.as_mut()?;
-
-    if session.state != SessionState::Established {
-        return None;
-    }
-
-    let cseq = dialog.next_cseq();
-    let branch = format!(
-        "z9hG4bK{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..16]
-    );
-
-    let target_uri = SipUri::parse(&dialog.remote_target).ok().unwrap_or(SipUri {
-        scheme: "sip".to_string(),
-        user: None,
-        password: None,
-        host: session.remote_addr.ip().to_string(),
-        port: Some(session.remote_addr.port()),
-        parameters: Default::default(),
-        headers: Default::default(),
-    });
-
-    let from_display = connected
-        .name
-        .as_deref()
-        .map(|n| format!("\"{}\" ", n))
-        .unwrap_or_default();
-
-    let from_value = format!(
-        "{}<sip:asterisk@{}>;tag={}",
-        from_display, session.local_addr, dialog.local_tag
-    );
-
-    let to_value = format!(
-        "<{}>;tag={}",
-        dialog.remote_uri, dialog.remote_tag
-    );
-
-    let mut headers = vec![
-        SipHeader {
-            name: header_names::VIA.to_string(),
-            value: format!("SIP/2.0/UDP {};branch={}", session.local_addr, branch),
-        },
-        SipHeader {
-            name: header_names::MAX_FORWARDS.to_string(),
-            value: "70".to_string(),
-        },
-        SipHeader {
-            name: header_names::FROM.to_string(),
-            value: from_value,
-        },
-        SipHeader {
-            name: header_names::TO.to_string(),
-            value: to_value,
-        },
-        SipHeader {
-            name: header_names::CALL_ID.to_string(),
-            value: session.call_id.clone(),
-        },
-        SipHeader {
-            name: header_names::CSEQ.to_string(),
-            value: format!("{} UPDATE", cseq),
-        },
-        SipHeader {
-            name: header_names::CONTACT.to_string(),
-            value: format!("<{}>", connected.uri),
-        },
-        SipHeader {
-            name: header_names::CONTENT_LENGTH.to_string(),
-            value: "0".to_string(),
-        },
-    ];
-
-    if connected.privacy {
-        headers.push(SipHeader {
-            name: "Privacy".to_string(),
-            value: "id".to_string(),
-        });
-    }
-
-    Some(SipMessage {
-        start_line: StartLine::Request(RequestLine {
-            method: SipMethod::Update,
-            uri: target_uri,
-            version: "SIP/2.0".to_string(),
-        }),
-        headers,
-        body: String::new(),
-    })
 }
 
 // ---------------------------------------------------------------------------
