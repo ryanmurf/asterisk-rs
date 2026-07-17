@@ -21,7 +21,7 @@ RUN apt-get update \
 WORKDIR /m8a
 COPY listener.py sender.py burst.py assert_boundary.py cutover_lib.sh \
      apply-fs-to-rustisk.sh rollback-rustisk-to-fs.sh red-stateful-variant.sh \
-     detector-selftest.sh in-container-proof.sh /m8a/
+     detector-selftest.sh in-container-proof.sh safety-tests.sh /m8a/
 RUN chmod +x /m8a/*.sh /m8a/*.py
 
 # The container just sleeps; the driver drives it via `docker exec`.

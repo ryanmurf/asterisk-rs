@@ -11,7 +11,7 @@ windows vary a few ms run to run. Reproduced cleanly across repeated runs.
 | Direction | Mechanism-floor window | Receiver-observed delivery gap |
 |---|---|---|
 | **FS → rustisk** (apply) | **~47–53 ms** | ~26–28 ms (12–13 datagrams @ 2 ms) |
-| **rustisk → FS** (rollback) | **~49–52 ms** | ~28–30 ms (13–14 datagrams @ 2 ms) |
+| **rustisk → FS** (rollback) | **~38–52 ms** | ~28–30 ms (13–14 datagrams @ 2 ms) |
 
 The **mechanism-floor** window is nft-drop-toggle + socket close + socket bind +
 IPC/status-poll, measured in an isolated netns. It is the *floor*: the **live M9

@@ -51,9 +51,9 @@ independently deletable (`nft delete table inet cutover`).
 
 | File | Role |
 |---|---|
-| `cutover_lib.sh` | the nft primitives: `cutover_table_up/down`, `handover_drop_on/off`. **Filter-only table.** The only host-networking surface. |
-| `apply-fs-to-rustisk.sh` | **APPLY** (FS→rustisk): drop-on → stop FS → wait released → bind rustisk → wait bound → drop-off. Measures + prints the window. |
-| `rollback-rustisk-to-fs.sh` | **ROLLBACK** (rustisk→FS): the exact mirror; `START_NEW_CMD` is the watchdog's `sofia profile start`. |
+| `cutover_lib.sh` | the nft primitives: `cutover_table_up/down`, `handover_drop_on/off`. **Filter-only table.** The only host-networking surface. `cutover_table_down` is **guarded** — it deletes only a table this tool created (owner-marker + protected-name denylist); `handover_drop_on/off` are **idempotent** (double-on is a no-op, off removes ALL handover rules). |
+| `apply-fs-to-rustisk.sh` | **APPLY** (FS→rustisk): drop-on → stop FS → wait released → bind rustisk → wait bound → drop-off. Measures + prints the window. An **EXIT trap** clears the handover drop on any mid-sequence failure (never leaves the port blocked). |
+| `rollback-rustisk-to-fs.sh` | **ROLLBACK** (rustisk→FS): the exact mirror; `START_NEW_CMD` is the watchdog's `sofia profile start`. Same **EXIT trap** as apply. |
 
 Both scripts inject the FS/rustisk specifics as commands, so the orchestration
 is **identical** in this synthetic proof and in the live M9 cutover — only the
@@ -64,20 +64,35 @@ hooks differ:
 STOP_OLD_CMD="kill -USR2 $FS_PID"          # release the port from the stand-in
 START_NEW_CMD="kill -USR1 $RUSTISK_PID"    # bind the port on the stand-in
 
-# M9 live (substitute):
-PORT=45070 NFT_TABLE=voicefw \
+# M9 live (substitute) — uses the DEFAULT, SEPARATE `cutover` table.
+# NFT_TABLE defaults to `cutover`; it coexists with the live `voicefw` firewall
+# (both input-hook priority -10, both policy accept). The transient handover drop
+# lands in `cutover`; voicefw's persistent source allowlist is never touched.
+#
+# NEVER set NFT_TABLE=voicefw: cutover_table_down deletes its table by name, and
+# tearing down would take the live allowlist + SIP-45070 + RTP-20000-20100 drops
+# with it. (The guard now REFUSES a foreign/protected table, but the operating
+# rule is to keep the tool pointed at its own `cutover` table.)
+
+PORT=45070 ./cutover_lib.sh up      # create the SEPARATE `cutover` table (+ owner marker)
+
+PORT=45070 \
 STOP_OLD_CMD="fs_cli -x 'sofia profile <trunk> stop'" \
 WAIT_RELEASED_CMD="<poll until 45070 free>" \
 START_NEW_CMD="<start rustisk / claim 45070>" \
 WAIT_BOUND_CMD="<poll until rustisk holds 45070>" \
   ./apply-fs-to-rustisk.sh
 # rollback: STOP_OLD_CMD stops rustisk; START_NEW_CMD = fs_cli -x 'sofia profile <trunk> start'
+
+PORT=45070 ./cutover_lib.sh down    # remove the cutover table (GUARDED: only a table THIS tool created)
 ```
 
-In M9 the source-drops are the **existing** `voice-trunk.nft` allowlist (already
-protecting dport 45070) — the cutover adds no new firewall rules. The
-`UNTRUSTED_V4/V6` knobs here exist only to *prove* the drop holds across the
-handover.
+In M9 the persistent **source-drops stay in the existing `voice-trunk.nft`
+allowlist** (already protecting dport 45070, in the `voicefw` table) — the
+cutover adds no new *source* firewall rules. The separate `cutover` table only
+ever holds the transient handover drop, and is created/removed as a unit around
+the switch. The `UNTRUSTED_V4/V6` knobs here exist only to *prove* the drop
+holds across the handover in the synthetic proof.
 
 ## The proof harness
 
