@@ -505,17 +505,49 @@ impl SipEventHandler {
             // than the old union, which accepted any configured credential).
             let creds_with_names: Vec<(String, AuthCredentials)> =
                 match matched_endpoint_name.as_deref() {
-                    Some(name) => cfg
-                        .find_endpoint(name)
-                        .and_then(|ep| ep.auth.as_ref())
-                        .and_then(|auth_name| cfg.find_auth(auth_name))
-                        .map(|auth| {
-                            vec![(
-                                name.to_string(),
-                                AuthCredentials::new(&auth.username, &auth.password, ""),
-                            )]
-                        })
-                        .unwrap_or_default(),
+                    Some(name) => match cfg.find_endpoint(name) {
+                        // A type=identify matched the source to an endpoint that
+                        // does NOT exist (dangling `endpoint=` reference). Fail
+                        // CLOSED — never accept an unauthenticated call under a
+                        // phantom endpoint (adversarial review).
+                        None => {
+                            warn!(call_id = %call_id, endpoint = %name,
+                                "Rejecting INVITE: identify matched a non-existent endpoint");
+                            if let Ok(resp) = request.create_response(403, "Forbidden") {
+                                if self.may_send_invite_final(request, &resp) {
+                                    let _ = self.transport.send(&resp, remote_addr).await;
+                                }
+                            }
+                            return None;
+                        }
+                        Some(ep) => match ep.auth.as_deref() {
+                            // Matched endpoint has NO auth section -> no
+                            // challenge (the unauthenticated trunk).
+                            None => Vec::new(),
+                            Some(auth_name) => match cfg.find_auth(auth_name) {
+                                Some(auth) => vec![(
+                                    name.to_string(),
+                                    AuthCredentials::new(&auth.username, &auth.password, ""),
+                                )],
+                                // The endpoint REQUIRES auth but its auth section
+                                // is missing/unresolvable. Fail CLOSED rather
+                                // than collapse to an empty credential set and
+                                // accept a credential-less caller (adversarial
+                                // review — the exact fail-open the old
+                                // `unwrap_or_default()` introduced).
+                                None => {
+                                    warn!(call_id = %call_id, endpoint = %name, auth = %auth_name,
+                                        "Rejecting INVITE: matched endpoint's auth section is unresolvable");
+                                    if let Ok(resp) = request.create_response(403, "Forbidden") {
+                                        if self.may_send_invite_final(request, &resp) {
+                                            let _ = self.transport.send(&resp, remote_addr).await;
+                                        }
+                                    }
+                                    return None;
+                                }
+                            },
+                        },
+                    },
                     None => cfg
                         .endpoints
                         .iter()

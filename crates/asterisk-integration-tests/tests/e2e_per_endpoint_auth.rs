@@ -246,5 +246,93 @@ async fn unauth_trunk_and_authed_bridge_coexist() {
     );
     println!("[E2E] (c) authed bridge WITH valid creds -> accepted, not re-challenged");
 
+    // Runs sequentially in the same test — this binary shares process-global
+    // pjsip config + tech registry, so a second #[tokio::test] would race it.
+    fail_closed_scenarios().await;
+
+    set_global_pjsip_config(PjsipConfig::default());
+}
+
+/// Fail-CLOSED regression (adversarial review): a source matched (via identify)
+/// to an endpoint that REQUIRES auth whose auth section is missing/unresolvable
+/// must be REJECTED, not silently accepted with no challenge. Same for an
+/// identify that names a non-existent endpoint.
+async fn fail_closed_scenarios() {
+    register_all_apps();
+
+    // Endpoint "bridge" references auth "ghost-auth" which does NOT exist; an
+    // identify "id-ghost" names endpoint "nonexistent" which does NOT exist.
+    set_global_pjsip_config(PjsipConfig {
+        endpoints: vec![EndpointConfig {
+            name: "bridge".to_string(),
+            context: "default".to_string(),
+            auth: Some("ghost-auth".to_string()),
+            ..Default::default()
+        }],
+        auths: vec![],
+        identifies: vec![
+            IdentifyConfig {
+                name: "id-bridge".to_string(),
+                endpoint: "bridge".to_string(),
+                matches: vec!["127.0.0.4/32".to_string()],
+                match_header: None,
+            },
+            IdentifyConfig {
+                name: "id-ghost".to_string(),
+                endpoint: "nonexistent".to_string(),
+                matches: vec!["127.0.0.5/32".to_string()],
+                match_header: None,
+            },
+        ],
+        ..Default::default()
+    });
+
+    let handler_transport: Arc<dyn asterisk_sip::transport::SipTransport> = Arc::new(
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap(),
+    );
+    let sip_local: SocketAddr = handler_transport.local_addr().unwrap();
+    let driver = Arc::new(SipChannelDriver::new(sip_local));
+    driver.set_transport(handler_transport.clone());
+    TECH_REGISTRY.register(driver.clone());
+    let handler = Arc::new(SipEventHandler::new(Arc::new(dialplan()), handler_transport));
+    handler.set_channel_driver(driver.clone());
+
+    let offer = SessionDescription::create_offer("127.0.0.1", 40000, &[codecs::pcmu()]);
+
+    // (a) endpoint requires auth but its auth section is unresolvable -> reject.
+    let sock = UdpSocket::bind("127.0.0.4:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let inv = invite_request("cp4-dangling-auth", addr.port(), &offer.to_string(), None);
+    let session = SipSession::new_inbound(&inv, sip_local, addr).expect("session");
+    let accepted = handler.handle_incoming_invite(&inv, addr, session).await;
+    assert_eq!(
+        accepted, None,
+        "an endpoint whose auth section is unresolvable must fail closed, not accept"
+    );
+    let codes = collect_status_codes(&sock, Duration::from_secs(2)).await;
+    assert!(
+        codes.contains(&403) || codes.contains(&401),
+        "unresolvable matched auth must be rejected (403/401), not accepted; saw {codes:?}"
+    );
+
+    // (b) identify names a non-existent endpoint -> reject.
+    let sock = UdpSocket::bind("127.0.0.5:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let inv = invite_request("cp4-ghost-ep", addr.port(), &offer.to_string(), None);
+    let session = SipSession::new_inbound(&inv, sip_local, addr).expect("session");
+    let accepted = handler.handle_incoming_invite(&inv, addr, session).await;
+    assert_eq!(
+        accepted, None,
+        "an identify pointing at a non-existent endpoint must fail closed"
+    );
+    let codes = collect_status_codes(&sock, Duration::from_secs(2)).await;
+    assert!(
+        codes.contains(&403),
+        "a phantom-endpoint identify match must be rejected 403; saw {codes:?}"
+    );
+    println!("[E2E] fail-closed: unresolvable matched auth + phantom endpoint both rejected");
+
     set_global_pjsip_config(PjsipConfig::default());
 }
