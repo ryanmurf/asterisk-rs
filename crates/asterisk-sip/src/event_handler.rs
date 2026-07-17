@@ -489,30 +489,59 @@ impl SipEventHandler {
             .unwrap_or(true);
 
         if let Some(ref cfg) = pjsip_config {
-            // Collect all auth credentials and their associated endpoint names
-            let mut all_creds: Vec<(String, AuthCredentials)> = Vec::new();
-            for ep in &cfg.endpoints {
-                if let Some(ref auth_name) = ep.auth {
-                    if let Some(auth) = cfg.find_auth(auth_name) {
-                        all_creds.push((
-                            ep.name.clone(),
-                            AuthCredentials::new(&auth.username, &auth.password, ""),
-                        ));
-                    }
-                }
-            }
+            // Per-endpoint auth SELECTION (M6 CP4). Challenge against the
+            // credential of the endpoint the request was MATCHED to (via
+            // type=identify), NOT the union of every configured credential.
+            // This lets an UNAUTHENTICATED trunk (matched, no auth section) and
+            // an AUTHENTICATED bridge (matched, auth section) coexist on one
+            // transport:
+            //   * matched a specific endpoint -> challenge ONLY if THAT endpoint
+            //     has an auth section; no auth section => no challenge, proceed.
+            //   * no identify match (no type=identify configured) -> fall back
+            //     to the union of all authed endpoints' credentials, preserving
+            //     the pre-CP4 default and still challenging a digest endpoint.
+            // An authed endpoint is never weakened: it still requires a valid
+            // digest against its OWN credential (selection is strictly narrower
+            // than the old union, which accepted any configured credential).
+            let creds_with_names: Vec<(String, AuthCredentials)> =
+                match matched_endpoint_name.as_deref() {
+                    Some(name) => cfg
+                        .find_endpoint(name)
+                        .and_then(|ep| ep.auth.as_ref())
+                        .and_then(|auth_name| cfg.find_auth(auth_name))
+                        .map(|auth| {
+                            vec![(
+                                name.to_string(),
+                                AuthCredentials::new(&auth.username, &auth.password, ""),
+                            )]
+                        })
+                        .unwrap_or_default(),
+                    None => cfg
+                        .endpoints
+                        .iter()
+                        .filter_map(|ep| {
+                            let auth = cfg.find_auth(ep.auth.as_ref()?)?;
+                            Some((
+                                ep.name.clone(),
+                                AuthCredentials::new(&auth.username, &auth.password, ""),
+                            ))
+                        })
+                        .collect(),
+                };
 
-            if !all_creds.is_empty() {
-                let creds: Vec<AuthCredentials> = all_creds.iter().map(|(_, c)| c.clone()).collect();
+            if !creds_with_names.is_empty() {
+                let creds: Vec<AuthCredentials> =
+                    creds_with_names.iter().map(|(_, c)| c.clone()).collect();
                 let authenticator = crate::authenticator::InboundAuthenticator::new();
                 match authenticator.verify(request, &creds, false) {
                     Ok(()) => {
                         debug!(call_id = %call_id, "Auth succeeded");
-                        // Auth succeeded -- identify the endpoint from the auth username.
-                        // Extract username from the Authorization header to find the matching endpoint.
+                        // Identify the endpoint from the auth username. For the
+                        // matched case this re-confirms the same endpoint; for
+                        // the union fallback it selects the authenticated one.
                         if let Some(auth_hdr) = request.get_header(crate::parser::header_names::AUTHORIZATION) {
                             if let Some(parsed) = crate::authenticator::parse_authorization(auth_hdr) {
-                                for (ep_name, cred) in &all_creds {
+                                for (ep_name, cred) in &creds_with_names {
                                     if cred.username == parsed.username {
                                         if let Some(ep) = cfg.find_endpoint(ep_name) {
                                             identified_endpoint_name = Some(ep_name.clone());
