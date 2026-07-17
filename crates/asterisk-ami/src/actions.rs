@@ -663,7 +663,7 @@ fn handle_originate(
         .get_header("Priority")
         .and_then(|p| p.parse::<i32>().ok())
         .unwrap_or(1);
-    let _timeout = action
+    let timeout_ms = action
         .get_header("Timeout")
         .and_then(|t| t.parse::<u64>().ok())
         .unwrap_or(30000);
@@ -800,6 +800,63 @@ fn handle_originate(
         {
             let mut ch = store_chan.lock();
             ch.state = call_channel.state;
+        }
+
+        // CP3: a PJSIP origination must NOT run its dialplan app/exten until the
+        // far end ANSWERS (200 OK). driver.call() only PUTS THE INVITE ON THE
+        // WIRE; the answer arrives asynchronously (handle_response's 2xx path
+        // flips the store channel to Up). Running the app now would emit SIP/RTP
+        // before answer. Wait up to the Originate Timeout for Up; on
+        // hangup/rejection/timeout, abandon the leg (CANCEL a still-pending
+        // INVITE) WITHOUT running the app, and report failure.
+        if tech.eq_ignore_ascii_case("PJSIP") {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(timeout_ms.max(1));
+            let mut answered = false;
+            loop {
+                let (state, hung) = {
+                    let ch = store_chan.lock();
+                    (ch.state, ch.check_hangup())
+                };
+                if state == asterisk_types::ChannelState::Up {
+                    answered = true;
+                    break;
+                }
+                // A rejection/failure softhangs-up the leg (or drops it to Down/
+                // Busy) before answer — stop waiting and do not run the app.
+                if hung
+                    || state == asterisk_types::ChannelState::Down
+                    || state == asterisk_types::ChannelState::Busy
+                {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if !answered {
+                warn!(
+                    "Originate: PJSIP channel {} not answered within {}ms; abandoning before app",
+                    chan_name, timeout_ms
+                );
+                // Put the correct request on the wire for the unanswered leg (a
+                // CANCEL for a still-pending INVITE) and release its resources.
+                if let Some(handler) = asterisk_sip::get_global_event_handler() {
+                    handler.cancel_or_bye_outbound_leg(&chan_name).await;
+                } else {
+                    let _ = driver.hangup(&mut call_channel).await;
+                }
+                release_originate_leg(&tech, &chan_name, &chan_uid);
+                crate::event_bus::publish_event(
+                    crate::protocol::AmiEvent::new("OriginateResponse", 0x02)
+                        .with_header("Response", "Failure")
+                        .with_header("Reason", "3") // no answer
+                        .with_header("Channel", &chan_name)
+                        .with_header("Uniqueid", &chan_uid),
+                );
+                return;
+            }
         }
 
         // Create a tokio::sync::Mutex copy for execution on ;1
