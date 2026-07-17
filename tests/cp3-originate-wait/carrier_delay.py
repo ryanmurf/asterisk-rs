@@ -12,6 +12,15 @@ RED (app run immediately, before answer): the app runs and tears the unanswered
 leg down before the delayed 200; the 200 is never ACKed and no post-answer BYE
 appears.
 
+--early-media (M7 follow-up, WIRE-MINOR-1): the carrier additionally sends a
+183 Session Progress WITH SDP immediately (before its delayed 200), so a
+pre-answer media path EXISTS — the caller knows the carrier's RTP address from
+the 183. This gives the `RTP phase=pre == 0` guard independent teeth: if the
+Originate wait were defeated so the app ran on the 183, the app's DTMF RTP
+would arrive pre-answer and that guard alone REDs (instead of the defeat only
+ever surfacing as an orphaned-200). The 183 and the 200 carry the SAME To tag
+(one early dialog, confirmed by the 200).
+
 Captures SIP on :5060 and RTP on :40000 (the SDP-answered media port).
 """
 
@@ -100,10 +109,18 @@ def main():
     ap.add_argument("--caller", required=True)
     ap.add_argument("--capture", required=True)
     ap.add_argument("--answer-delay", type=float, default=3.0)
+    ap.add_argument("--early-media", action="store_true",
+                    help="send 183 Session Progress WITH SDP before the delayed 200")
     args = ap.parse_args()
 
     own = own_ip_toward(args.caller)
     t0 = time.time()
+
+    # In early-media mode the 183 opens an early dialog; the 200 (and a 487 on
+    # CANCEL) must carry the SAME To tag or the caller rightly treats the final
+    # as a stray from a different dialog.
+    tag_200 = "cp3del183" if args.early_media else "cp3del200"
+    tag_487 = "cp3del183" if args.early_media else "cp3del487"
 
     def cap(line):
         with open(args.capture, "a") as f:
@@ -131,7 +148,7 @@ def main():
         if pending_200 is not None and time.time() >= pending_200[0]:
             send_at, inv, src = pending_200
             pending_200 = None
-            ok = build_response(inv, 200, "OK", own, to_tag="cp3del200", sdp=carrier_sdp(own))
+            ok = build_response(inv, 200, "OK", own, to_tag=tag_200, sdp=carrier_sdp(own))
             sip.sendto(ok, src)
             answered = True
             cap("SENT-200 own=%s rel=%.3f" % (own, time.time() - t0))
@@ -157,6 +174,12 @@ def main():
                     phase(), own, src[0], src[1], cseq_of(text), rel))
                 # 100 Trying immediately; 200 OK is DELAYED.
                 sip.sendto(build_response(text, 100, "Trying", own), src)
+                if args.early_media and not answered:
+                    # Early media: 183 WITH SDP before the delayed 200 — the
+                    # pre-answer media path now exists (RTP-guard teeth).
+                    sip.sendto(build_response(text, 183, "Session Progress", own,
+                                              to_tag=tag_200, sdp=carrier_sdp(own)), src)
+                    cap("SENT-183 own=%s rel=%.3f" % (own, time.time() - t0))
                 if pending_200 is None and not answered:
                     pending_200 = (time.time() + args.answer_delay, text, src)
             elif first.startswith("ACK "):
@@ -174,7 +197,7 @@ def main():
                 if pending_200 is not None:
                     _, inv, isrc = pending_200
                     pending_200 = None
-                    sip.sendto(build_response(inv, 487, "Request Terminated", own, to_tag="cp3del487"), isrc)
+                    sip.sendto(build_response(inv, 487, "Request Terminated", own, to_tag=tag_487), isrc)
 
 
 if __name__ == "__main__":

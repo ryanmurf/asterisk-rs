@@ -711,6 +711,10 @@ impl SipSession {
     /// Used by the SFU ConfBridge to add/remove video streams for participants.
     pub fn build_reinvite(&mut self, sdp: &SessionDescription) -> Option<SipMessage> {
         let sig = self.signaling_hostport();
+        // From identity must match the INVITE's (same user@domain + local tag)
+        // for the dialog's lifetime — a re-INVITE that reverts to the internal
+        // identity breaks carriers that key in-dialog requests on From.
+        let from_base = self.from_uri();
         let dialog = self.dialog.as_mut()?;
         let cseq = dialog.next_cseq();
 
@@ -727,8 +731,8 @@ impl SipSession {
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
-        // For UAS (inbound call), From = our local tag, To = remote tag.
-        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
+        // From = our identity + local tag, To = remote URI + remote tag.
+        let from_value = format!("<{}>;tag={}", from_base, dialog.local_tag);
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
         let body = sdp.to_string();
@@ -776,7 +780,8 @@ impl SipSession {
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
         let sig = self.signaling_hostport();
 
-        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
+        // Same From identity as the re-INVITE this ACKs (dialog-stable).
+        let from_value = format!("<{}>;tag={}", self.from_uri(), dialog.local_tag);
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
         // CSeq from the response we're ACKing.
@@ -1053,5 +1058,82 @@ mod cp2_tests {
         let from = bye.from_header().unwrap().to_string();
         assert!(from.contains("sip:+19995551234@carrier.example.net"), "BYE From wrong: {from}");
         assert!(!from.contains("asterisk@"), "BYE From still hardcodes asterisk: {from}");
+    }
+
+    #[test]
+    fn reinvite_and_its_ack_from_match_configured_identity() {
+        // M7 follow-up (CMD-MINOR): the in-dialog re-INVITE (ConfBridge SFU
+        // video renegotiation) and its ACK must carry the SAME From
+        // user@domain as the INVITE/BYE — the From identity is stable for the
+        // dialog's lifetime. A build_reinvite that reverts to the hardcoded
+        // internal `asterisk@<sig>` identity fails this.
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.from_user = Some("+19995551234".to_string());
+        s.from_domain = Some("carrier.example.net".to_string());
+        let invite = s.build_invite_with_uri("sip:+15550001111@10.0.0.2:5060", "sip:+15550001111@10.0.0.2");
+        let ok = SipMessage::parse(
+            format!(
+                "SIP/2.0 200 OK\r\n\
+                 Via: {via}\r\n\
+                 From: {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=c200\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 Contact: <sip:carrier@10.0.0.2:5060>\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = invite.get_header(header_names::VIA).unwrap(),
+                from = invite.from_header().unwrap(),
+                cid = s.call_id,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        s.on_response(&ok);
+
+        let sdp = SessionDescription::parse(
+            "v=0\r\n\
+             o=rustisk 0 1 IN IP4 10.0.0.1\r\n\
+             s=-\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 30000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        )
+        .unwrap();
+        let reinvite = s.build_reinvite(&sdp).unwrap();
+        let from = reinvite.from_header().unwrap().to_string();
+        assert!(
+            from.contains("sip:+19995551234@carrier.example.net"),
+            "re-INVITE From must keep the configured identity, got: {from}"
+        );
+        assert!(!from.contains("asterisk@"), "re-INVITE From reverts to the internal identity: {from}");
+
+        // The ACK for the re-INVITE's 200 carries the same From identity.
+        let reinvite_cseq = reinvite.cseq().unwrap().to_string();
+        let reinvite_200 = SipMessage::parse(
+            format!(
+                "SIP/2.0 200 OK\r\n\
+                 Via: {via}\r\n\
+                 From: {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=c200\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: {cseq}\r\n\
+                 Contact: <sip:carrier@10.0.0.2:5060>\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = reinvite.get_header(header_names::VIA).unwrap(),
+                from = reinvite.from_header().unwrap(),
+                cid = s.call_id,
+                cseq = reinvite_cseq,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let ack = s.build_reinvite_ack(&reinvite_200).unwrap();
+        let from = ack.from_header().unwrap().to_string();
+        assert!(
+            from.contains("sip:+19995551234@carrier.example.net"),
+            "re-INVITE ACK From must keep the configured identity, got: {from}"
+        );
+        assert!(!from.contains("asterisk@"), "re-INVITE ACK From reverts to the internal identity: {from}");
     }
 }
