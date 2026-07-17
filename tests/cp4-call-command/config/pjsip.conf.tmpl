@@ -1,0 +1,18 @@
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:15060
+
+[carrier]
+type = endpoint
+context = default
+disallow = all
+allow = ulaw
+direct_media = no
+rtp_symmetric = yes
+dtmf_mode = rfc4733
+aors = carrier_aor
+
+[carrier_aor]
+type = aor
+contact = sip:carrier@@CORE_S@:5060
