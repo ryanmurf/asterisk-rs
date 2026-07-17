@@ -1928,6 +1928,85 @@ fn load_pjsip_notify_config(content: &str, config: &asterisk_sip::notify::Notify
     }
 }
 
+/// Collect the de-duplicated set of UDP SIP bind addresses from the pjsip
+/// config, falling back to `default_bind` when no transports are configured.
+/// Non-UDP transports (tls/tcp/ws) are not yet supported and are skipped.
+///
+/// Extracted so the collection + de-dup + [`single_udp_transport`] guard chain
+/// is testable at the config level (codex CP6 P2): two DISTINCT udp sections
+/// yield two binds (rejected by the guard), while two IDENTICAL sections dedup
+/// to one (accepted) — behaviour a direct-helper test alone would not pin.
+fn udp_transport_binds(
+    pjsip_config: Option<&asterisk_sip::pjsip_config::PjsipConfig>,
+    default_bind: SocketAddr,
+) -> Vec<SocketAddr> {
+    let collected: Vec<SocketAddr> = match pjsip_config {
+        Some(cfg) if !cfg.transports.is_empty() => {
+            let mut addrs = Vec::new();
+            for t in &cfg.transports {
+                if t.protocol.as_str() == "udp" {
+                    addrs.push(t.bind);
+                } else {
+                    info!("Transport {} ({}) not yet supported, skipping", t.name, t.protocol);
+                }
+            }
+            if addrs.is_empty() {
+                addrs.push(default_bind);
+            }
+            addrs
+        }
+        _ => vec![default_bind],
+    };
+    // De-duplicate, preserving order.
+    let mut unique = Vec::new();
+    for addr in collected {
+        if !unique.contains(&addr) {
+            unique.push(addr);
+        }
+    }
+    unique
+}
+
+/// Resolve the ONE UDP SIP bind to start (M6 CP6): collect + de-dup the
+/// configured UDP transports, then enforce the single-transport guard. This is
+/// the single entry point `startup_sequence` calls, so a test on it pins the
+/// whole chain — removing the guard here (the only path startup uses) fails the
+/// rejection tests RED.
+fn resolve_single_udp_bind(
+    pjsip_config: Option<&asterisk_sip::pjsip_config::PjsipConfig>,
+    default_bind: SocketAddr,
+) -> Result<SocketAddr, String> {
+    single_udp_transport(&udp_transport_binds(pjsip_config, default_bind))
+}
+
+/// Single-UDP-transport startup guard (M6 CP6).
+///
+/// rustisk wires the SIP transport through two passes that DISAGREE if more than
+/// one runs: the channel driver keeps the LAST transport it is handed
+/// (`set_transport` is last-wins) while the global event handler keeps the FIRST
+/// (`set_global_event_handler` is a first-wins `OnceLock`). With two transports,
+/// inbound would be handled on the first socket while outbound is sent on the
+/// second — a silent split-brain / race. rustisk supports exactly ONE UDP SIP
+/// transport, so assert that at startup and fail fast rather than binding two.
+///
+/// Returns the single bind address, or an `Err` describing the misconfiguration.
+fn single_udp_transport(addrs: &[SocketAddr]) -> Result<SocketAddr, String> {
+    match addrs {
+        [one] => Ok(*one),
+        [] => Err("no UDP SIP transport to bind (empty transport set)".to_string()),
+        many => Err(format!(
+            "{} UDP SIP transports configured ({}); rustisk supports exactly one — the channel \
+             driver keeps the last and the event handler the first, so two would race. Configure a \
+             single udp transport.",
+            many.len(),
+            many.iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// Perform the startup sequence.
 async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), String> {
     info!("Loading configuration from: {}", config_dir);
@@ -2103,41 +2182,13 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
         TECH_REGISTRY.list()
     );
 
-    // Start a SIP stack for each configured transport (or the default UDP)
-    let transports_to_start: Vec<SocketAddr> = if let Some(ref cfg) = pjsip_config {
-        if cfg.transports.is_empty() {
-            vec![sip_bind]
-        } else {
-            let mut addrs = Vec::new();
-            for t in &cfg.transports {
-                match t.protocol.as_str() {
-                    "udp" => addrs.push(t.bind),
-                    other => {
-                        info!(
-                            "Transport {} ({}) not yet supported, skipping",
-                            t.name, other
-                        );
-                    }
-                }
-            }
-            if addrs.is_empty() {
-                addrs.push(sip_bind);
-            }
-            addrs
-        }
-    } else {
-        vec![sip_bind]
-    };
+    // Single-UDP-transport startup guard (M6 CP6): collect + de-dup the
+    // configured UDP binds and reject a config that would bind two racing
+    // transports. Two DISTINCT udp binds fail fast here; two identical ones
+    // dedup to a single addr and pass.
+    let sip_bind_addr = resolve_single_udp_bind(pjsip_config.as_ref(), sip_bind)?;
 
-    // De-duplicate bind addresses
-    let mut unique_addrs: Vec<SocketAddr> = Vec::new();
-    for addr in &transports_to_start {
-        if !unique_addrs.contains(addr) {
-            unique_addrs.push(*addr);
-        }
-    }
-
-    for bind_addr in &unique_addrs {
+    for bind_addr in std::slice::from_ref(&sip_bind_addr) {
         match asterisk_sip::stack::SipStack::new(*bind_addr).await {
             Ok(mut sip_stack) => {
                 info!("SIP stack bound to {}", bind_addr);
@@ -2624,6 +2675,102 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// M6 CP6: exactly one UDP transport is accepted; the single bind is
+    /// returned unchanged.
+    #[test]
+    fn single_udp_transport_accepts_exactly_one() {
+        assert_eq!(
+            single_udp_transport(&[sa("0.0.0.0:5060")]).unwrap(),
+            sa("0.0.0.0:5060")
+        );
+    }
+
+    /// M6 CP6: two DISTINCT UDP transports (what a two-`type=transport-udp`
+    /// config produces after de-dup) are REJECTED at startup — the guard fails
+    /// fast rather than binding two racing transports. RED: remove the guard
+    /// (or make it return `Ok` for `>1`) and this assertion fails.
+    #[test]
+    fn single_udp_transport_rejects_two() {
+        let err = single_udp_transport(&[sa("0.0.0.0:5060"), sa("0.0.0.0:5062")])
+            .expect_err("two distinct UDP transports must be rejected");
+        assert!(err.contains("exactly one"), "error must explain the single-transport rule: {err}");
+    }
+
+    /// M6 CP6: an empty transport set is rejected (nothing to bind).
+    #[test]
+    fn single_udp_transport_rejects_empty() {
+        assert!(single_udp_transport(&[]).is_err());
+    }
+
+    fn udp_transport(name: &str, bind: &str) -> asterisk_sip::pjsip_config::TransportConfig {
+        asterisk_sip::pjsip_config::TransportConfig {
+            name: name.to_string(),
+            protocol: "udp".to_string(),
+            bind: bind.parse().unwrap(),
+            external_media_address: None,
+            external_signaling_address: None,
+            external_signaling_port: None,
+            cert_file: None,
+            priv_key_file: None,
+            local_net: vec![],
+        }
+    }
+
+    fn cfg_with(transports: Vec<asterisk_sip::pjsip_config::TransportConfig>) -> asterisk_sip::pjsip_config::PjsipConfig {
+        asterisk_sip::pjsip_config::PjsipConfig {
+            transports,
+            ..Default::default()
+        }
+    }
+
+    /// M6 CP6 (codex P2): the FULL config chain — collect + de-dup + guard —
+    /// rejects a config with TWO DISTINCT udp transports. This pins the
+    /// production wiring (dedup before guard), not just the helper: it fails RED
+    /// if the guard call is removed from startup OR if dedup is moved after the
+    /// guard.
+    #[test]
+    fn two_distinct_udp_transports_config_is_rejected() {
+        let cfg = cfg_with(vec![
+            udp_transport("t1", "0.0.0.0:5060"),
+            udp_transport("t2", "0.0.0.0:5062"),
+        ]);
+        // Through the exact entry point startup uses, so this fails RED if the
+        // guard is removed from that path OR dedup is reordered after it.
+        assert!(
+            resolve_single_udp_bind(Some(&cfg), sa("0.0.0.0:5060")).is_err(),
+            "a two-udp-transport config must be rejected at startup"
+        );
+    }
+
+    /// M6 CP6 (codex P2): two IDENTICAL udp transports dedup to one bind and are
+    /// ACCEPTED — the guard must not reject a redundant-but-consistent config
+    /// (pins that de-dup runs BEFORE the guard).
+    #[test]
+    fn two_identical_udp_transports_config_is_accepted() {
+        let cfg = cfg_with(vec![
+            udp_transport("t1", "0.0.0.0:5060"),
+            udp_transport("t2", "0.0.0.0:5060"),
+        ]);
+        assert_eq!(
+            resolve_single_udp_bind(Some(&cfg), sa("0.0.0.0:5062")).unwrap(),
+            sa("0.0.0.0:5060")
+        );
+    }
+
+    /// M6 CP6: no config (and no transports) falls back to the default bind —
+    /// exactly one, accepted.
+    #[test]
+    fn no_config_uses_default_bind() {
+        assert_eq!(
+            resolve_single_udp_bind(None, sa("0.0.0.0:5060")).unwrap(),
+            sa("0.0.0.0:5060")
+        );
+    }
 
     /// Create a unique empty temp directory for a test.
     fn test_dir(tag: &str) -> std::path::PathBuf {
