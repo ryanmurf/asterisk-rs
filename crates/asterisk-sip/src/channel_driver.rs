@@ -603,6 +603,15 @@ impl ChannelDriver for SipChannelDriver {
                 ))
             });
 
+        // Apply the endpoint's outbound caller identity (`from_user`/
+        // `from_domain`) to the origination From (CP2). A carrier that authorizes
+        // by caller ID (Chime rejects a From that is not a DID we own) needs a
+        // specific identity here rather than the internal `asterisk@<bind>`.
+        if let Some(ep) = endpoint_config.as_ref().and_then(|config| config.find_endpoint(dest)) {
+            sip_session.from_user = ep.from_user.clone();
+            sip_session.from_domain = ep.from_domain.clone();
+        }
+
         // Create SDP offer with a concrete, routable connection address
         // (external_media_address / routed interface — never 0.0.0.0,
         // issue #56). Fail closed (CP3): if a configured external_media_address
@@ -730,6 +739,8 @@ impl ChannelDriver for SipChannelDriver {
                 early_media_config: session.early_media_config.clone(),
                 outbound_auth: session.outbound_auth.clone(),
                 auth_attempts: session.auth_attempts,
+                from_user: session.from_user.clone(),
+                from_domain: session.from_domain.clone(),
             };
             handler.register_outbound_session(
                 &session.call_id,

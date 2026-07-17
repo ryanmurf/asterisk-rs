@@ -1,0 +1,25 @@
+; CP2 from-identity harness pjsip config. The `carrier` endpoint sets an
+; outbound caller identity (from_user/from_domain) that a carrier authorizes on;
+; the harness proves the outbound INVITE's From carries EXACTLY that identity,
+; not the internal asterisk@<bind>.
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:15060
+
+[carrier]
+type = endpoint
+context = default
+disallow = all
+allow = ulaw
+direct_media = no
+rtp_symmetric = yes
+dtmf_mode = rfc4733
+aors = carrier_aor
+from_user = +19709601891
+from_domain = carrier.example.net
+
+[carrier_aor]
+type = aor
+contact = sip:carrier@@CORE_S@:5060

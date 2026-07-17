@@ -149,6 +149,13 @@ pub struct SipSession {
     /// the challenge/response loop so a carrier that keeps challenging cannot
     /// drive an unbounded resend (M-f "bounded retries").
     pub auth_attempts: u32,
+    /// Outbound From user-part (`from_user`). A carrier that authorizes calls by
+    /// caller identity (e.g. Chime rejects a From that is not a DID we own)
+    /// requires a specific user here. `None` falls back to `asterisk`.
+    pub from_user: Option<String>,
+    /// Outbound From host-part (`from_domain`). `None` falls back to the
+    /// signalling host:port advertised toward the peer.
+    pub from_domain: Option<String>,
 }
 
 impl SipSession {
@@ -176,6 +183,8 @@ impl SipSession {
             early_media_config: EarlyMediaConfig::default(),
             outbound_auth: None,
             auth_attempts: 0,
+            from_user: None,
+            from_domain: None,
         }
     }
 
@@ -215,6 +224,8 @@ impl SipSession {
             early_media_config: EarlyMediaConfig::default(),
             outbound_auth: None,
             auth_attempts: 0,
+            from_user: None,
+            from_domain: None,
         })
     }
 
@@ -234,12 +245,25 @@ impl SipSession {
         self.build_invite_with_uri(to_uri, to_uri)
     }
 
+    /// The outbound From URI (`sip:user@domain`) this session presents. Honors
+    /// the endpoint's `from_user`/`from_domain` (a carrier expects a specific
+    /// caller identity — e.g. a DID it owns), falling back to `asterisk` @ the
+    /// signalling host:port. Used for the INVITE and every in-dialog request so
+    /// the From identity stays stable across the dialog.
+    pub fn from_uri(&self) -> String {
+        let user = self.from_user.as_deref().unwrap_or("asterisk");
+        match self.from_domain.as_deref() {
+            Some(domain) => format!("sip:{user}@{domain}"),
+            None => format!("sip:{user}@{}", self.signaling_hostport()),
+        }
+    }
+
     /// Build an INVITE with separate Request-URI and To header value.
     /// The request_uri is used as the actual SIP Request-URI (typically the
     /// contact address), while to_uri is used in the To header.
     pub fn build_invite_with_uri(&mut self, request_uri: &str, to_uri: &str) -> SipMessage {
         let sig = self.signaling_hostport();
-        let from_uri = format!("sip:asterisk@{sig}");
+        let from_uri = self.from_uri();
         let contact_uri = format!("sip:asterisk@{sig}");
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
@@ -568,6 +592,9 @@ impl SipSession {
 
     /// Build a BYE request.
     pub fn build_bye(&mut self) -> Option<SipMessage> {
+        // From identity must match the INVITE's (same user@domain + local tag)
+        // for the dialog's lifetime — carriers key in-dialog requests on it.
+        let from_base = self.from_uri();
         let sig = self.signaling_hostport();
         // Loose/strict routing per the established route set (Contact + Route),
         // so an in-dialog BYE follows the same proxy path as the ACK instead of
@@ -591,7 +618,7 @@ impl SipSession {
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
 
-        let from_value = format!("<sip:asterisk@{}>;tag={}", sig, dialog.local_tag);
+        let from_value = format!("<{}>;tag={}", from_base, dialog.local_tag);
 
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
@@ -953,5 +980,78 @@ mod cp1_tests {
         .unwrap();
         assert!(s.build_auth_retry_invite(&challenge).is_none());
         assert_eq!(s.auth_attempts, 0);
+    }
+}
+
+#[cfg(test)]
+mod cp2_tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn from_user_domain_applied_to_invite_from() {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.from_user = Some("+19995551234".to_string());
+        s.from_domain = Some("carrier.example.net".to_string());
+        let invite = s.build_invite_with_uri("sip:+15550001111@10.0.0.2:5060", "sip:+15550001111@10.0.0.2");
+        let from = invite.from_header().unwrap().to_string();
+        assert!(
+            from.contains("sip:+19995551234@carrier.example.net"),
+            "From must carry the configured user@domain, got: {from}"
+        );
+        // The internal bind identity must be gone (the CP2 defect).
+        assert!(!from.contains("asterisk@"), "From still hardcodes asterisk: {from}");
+    }
+
+    #[test]
+    fn from_user_only_keeps_signalling_domain() {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.from_user = Some("+19995551234".to_string());
+        let invite = s.build_invite_with_uri("sip:x@10.0.0.2:5060", "sip:x@10.0.0.2");
+        let from = invite.from_header().unwrap().to_string();
+        assert!(from.contains("sip:+19995551234@"), "user not applied: {from}");
+        // Domain falls back to the signalling host:port (the bind), not "asterisk".
+        assert!(from.contains("@10.0.0.1:5060"), "domain fallback wrong: {from}");
+    }
+
+    #[test]
+    fn from_defaults_to_asterisk_when_unset() {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        let invite = s.build_invite_with_uri("sip:x@10.0.0.2:5060", "sip:x@10.0.0.2");
+        assert!(invite.from_header().unwrap().contains("sip:asterisk@10.0.0.1:5060"));
+    }
+
+    #[test]
+    fn bye_from_matches_configured_identity() {
+        // The in-dialog BYE From must carry the SAME user@domain as the INVITE.
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.from_user = Some("+19995551234".to_string());
+        s.from_domain = Some("carrier.example.net".to_string());
+        let invite = s.build_invite_with_uri("sip:+15550001111@10.0.0.2:5060", "sip:+15550001111@10.0.0.2");
+        let ok = SipMessage::parse(
+            format!(
+                "SIP/2.0 200 OK\r\n\
+                 Via: {via}\r\n\
+                 From: {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=c200\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 Contact: <sip:carrier@10.0.0.2:5060>\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = invite.get_header(header_names::VIA).unwrap(),
+                from = invite.from_header().unwrap(),
+                cid = s.call_id,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        s.on_response(&ok);
+        let bye = s.build_bye().unwrap();
+        let from = bye.from_header().unwrap().to_string();
+        assert!(from.contains("sip:+19995551234@carrier.example.net"), "BYE From wrong: {from}");
+        assert!(!from.contains("asterisk@"), "BYE From still hardcodes asterisk: {from}");
     }
 }
