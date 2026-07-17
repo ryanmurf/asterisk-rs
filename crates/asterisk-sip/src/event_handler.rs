@@ -765,20 +765,33 @@ impl SipEventHandler {
         let unique_id_for_answer_cb = unique_id_for_cb.clone();
 
         // Register an answer callback -- fires when Answer() sets state to Up.
-        asterisk_core::channel::register_answer_callback(Box::new(move |uid| {
-            if uid == unique_id_for_answer_cb {
-                answer_notify_for_cb.notify_one();
-            }
-        }));
+        // The returned handle unregisters the closure when the per-call task
+        // below ends, so the global answer registry returns to baseline instead
+        // of leaking one closure per inbound call (issue #121).
+        let answer_cb_handle =
+            asterisk_core::channel::register_answer_callback_scoped(Box::new(move |uid| {
+                if uid == unique_id_for_answer_cb {
+                    answer_notify_for_cb.notify_one();
+                }
+            }));
 
         // Register a hangup callback -- fires when Channel::hangup() is called.
-        asterisk_core::channel::register_hangup_callback(Box::new(move |uid, _cause| {
-            if uid == unique_id_for_cb {
-                hangup_notify_for_cb.notify_one();
-            }
-        }));
+        // Scoped for the same reason as the answer callback above (issue #121).
+        let hangup_cb_handle =
+            asterisk_core::channel::register_hangup_callback_scoped(Box::new(move |uid, _cause| {
+                if uid == unique_id_for_cb {
+                    hangup_notify_for_cb.notify_one();
+                }
+            }));
 
         tokio::spawn(async move {
+            // Keep the per-call answer/hangup callback registrations alive for
+            // the whole task. Both callbacks have already fired (or become
+            // moot) by the time this task returns; dropping the handles here
+            // unregisters the closures so the global registries do not grow
+            // without bound over a soak (issue #121).
+            let _answer_cb_handle = answer_cb_handle;
+            let _hangup_cb_handle = hangup_cb_handle;
             // Convert from parking_lot::Mutex to tokio::sync::Mutex for pbx_run.
             // pbx_run expects Arc<tokio::sync::Mutex<Channel>>.
             let channel_data = {

@@ -1458,15 +1458,19 @@ impl AppConfBridge {
             joined_channel_id: my_channel_id.clone(),
         });
 
-        // Register a hangup notification for this channel.
+        // Register a hangup notification for this channel. The scoped handle is
+        // held for the duration of this conference-participant call and dropped
+        // when the app returns, unregistering the closure so the global hangup
+        // registry does not leak one closure per conference join (issue #121).
         let hangup_notify = Arc::new(tokio::sync::Notify::new());
         let hangup_notify_clone = hangup_notify.clone();
         let my_uid = channel.unique_id.0.clone();
-        asterisk_core::channel::register_hangup_callback(Box::new(move |uid, _cause| {
-            if uid == my_uid {
-                hangup_notify_clone.notify_one();
-            }
-        }));
+        let _hangup_cb_handle =
+            asterisk_core::channel::register_hangup_callback_scoped(Box::new(move |uid, _cause| {
+                if uid == my_uid {
+                    hangup_notify_clone.notify_one();
+                }
+            }));
 
         // Also detect softhangup by polling (for BYE-triggered hangup).
         let channel_name_for_poll = channel.name.clone();

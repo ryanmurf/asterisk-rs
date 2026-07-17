@@ -294,11 +294,15 @@ impl ChannelDriver for LocalChannelDriver {
 
                 // Register an answer callback: when ;2 answers, set the pair's
                 // `answered` flag and update ;1's state in the channel store.
-                {
+                // The scoped handle is moved into the ;2 task below and dropped
+                // when that task ends, unregistering the closure so the global
+                // answer registry does not leak one closure per Local pair
+                // (issue #121).
+                let answer_cb_handle = {
                     let pair_for_cb = Arc::clone(&pair_state);
                     let chan1_name_for_cb = chan1_name.clone();
                     let chan2_uid_for_cb = chan2_uid.clone();
-                    asterisk_core::channel::register_answer_callback(Box::new(move |uid| {
+                    asterisk_core::channel::register_answer_callback_scoped(Box::new(move |uid| {
                         // Check if this is our ;2 channel answering
                         if uid == chan2_uid_for_cb {
                             pair_for_cb.answered.store(true, Ordering::SeqCst);
@@ -310,11 +314,15 @@ impl ChannelDriver for LocalChannelDriver {
                                 }
                             }
                         }
-                    }));
-                }
+                    }))
+                };
 
                 // Spawn PBX execution on ;2
                 tokio::spawn(async move {
+                    // Hold the answer-callback registration for the life of ;2;
+                    // dropping it here (task end) returns the answer registry to
+                    // baseline (issue #121).
+                    let _answer_cb_handle = answer_cb_handle;
                     info!(
                         chan2 = %chan2_name,
                         context = %local_context,
