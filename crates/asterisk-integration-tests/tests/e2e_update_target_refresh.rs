@@ -1,16 +1,32 @@
 //! End-to-end acceptance for UPDATE **target refresh** (RFC 3261 §12.2 / RFC
-//! 3311), the M5 review MAJOR-3 gap where `handle_update` advanced the remote
-//! CSeq but never applied the request's Contact to the dialog, so a subsequent
-//! local in-dialog request kept addressing the stale INVITE target.
+//! 3311), the M5 review MAJOR-3 property: an in-dialog UPDATE that carries a new
+//! Contact must refresh the dialog's remote target so that a subsequent local
+//! in-dialog request (BYE) is BOTH stamped with the refreshed Request-URI AND
+//! physically delivered to the refreshed transport address.
 //!
-//! Proof, observed on the wire: establish an answered, media-silent Echo() call
-//! whose INVITE Contact is port P1. Send an in-dialog UPDATE whose Contact is a
-//! DIFFERENT port P2. Then let `rtptimeout` reap the silent call — rustisk
-//! sends a BYE built from the dialog's remote target. Its **Request-URI** must
-//! carry P2 (the refreshed target), not P1.
+//! ## Why this is a two-live-socket wire proof
 //!
-//! RED control (PR body): drop the `update_remote_target` call in `handle_update`
-//! and the BYE Request-URI stays at P1 -> this assertion fails.
+//! The prior version of this test bound only P1, left P2 unbound, and inspected
+//! only the BYE's Request-URI. That masked MAJOR-3b: production refreshed the
+//! dialog target (so the R-URI moved to P2) but still sent the BYE *datagram* to
+//! the stale INVITE source tuple P1. Reading the BYE off the P1 socket and
+//! checking only its header could never see that the packet went to the wrong
+//! place.
+//!
+//! This version binds BOTH P1 and P2 as live UDP SIP sockets and races them for
+//! the BYE. It asserts the BYE **datagram arrives on P2** (the refreshed target)
+//! and that its **Request-URI also carries P2**. A datagram delivered to P1 is a
+//! hard failure, not an ignored packet.
+//!
+//! ## RED controls (captured in the PR body), each independently load-bearing
+//!
+//! * Defeat the **next-hop refresh** (leave `CallState.next_hop` at the INVITE
+//!   source in `handle_update`): the R-URI still says P2 but the datagram lands
+//!   on P1 -> the arrival-port assertion fails. This is the exact defect the
+//!   reviewer caught that the old test could not.
+//! * Defeat the **dialog target refresh** (drop `update_remote_target`): the
+//!   remote target stays P1, so both the resolved next hop and the R-URI stay
+//!   P1 -> the datagram lands on P1 and the assertion fails.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,7 +38,7 @@ use asterisk_core::channel::tech_registry::TECH_REGISTRY;
 use asterisk_core::pbx::{Context, Dialplan, Extension, Priority};
 use asterisk_sip::channel_driver::SipChannelDriver;
 use asterisk_sip::event_handler::SipEventHandler;
-use asterisk_sip::parser::{SipMessage, SipMethod, StartLine};
+use asterisk_sip::parser::{SipMessage, SipMethod, SipUri, StartLine};
 use asterisk_sip::pjsip_config::{set_global_pjsip_config, EndpointConfig, PjsipConfig};
 use asterisk_sip::sdp::SessionDescription;
 use asterisk_sip::session::SipSession;
@@ -52,8 +68,10 @@ async fn recv_sip_status(sock: &UdpSocket, status: u16, budget: Duration) -> Opt
     None
 }
 
-/// Wait for an in-dialog BYE *request* and return its Request-URI.
-async fn await_bye_uri(sock: &UdpSocket, budget: Duration) -> Option<asterisk_sip::parser::SipUri> {
+/// Wait for an in-dialog BYE *request* on this socket and return its
+/// Request-URI. Non-BYE traffic (e.g. a 200 OK) is skipped so the socket only
+/// "wins" the race when a BYE datagram actually lands on it.
+async fn await_bye_uri(sock: &UdpSocket, budget: Duration) -> Option<SipUri> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         if let Some(msg) = recv_sip(sock, Duration::from_millis(300)).await {
@@ -118,6 +136,18 @@ fn update_new_contact(
     SipMessage::parse(raw.as_bytes()).unwrap()
 }
 
+/// Which live socket the BYE datagram was physically delivered to.
+enum ByeArrival {
+    /// Delivered to the refreshed Contact target P2 (correct), with its R-URI.
+    OnP2(SipUri),
+    /// Delivered to the stale INVITE source P1 (the MAJOR-3b defect), with its
+    /// R-URI so the failure message can show the header moved but the packet
+    /// did not.
+    OnP1(SipUri),
+    /// No BYE landed on either socket within the budget.
+    Neither,
+}
+
 #[tokio::test]
 async fn update_refreshes_dialog_target_for_subsequent_requests() {
     register_all_apps();
@@ -161,13 +191,21 @@ async fn update_refreshes_dialog_target_for_subsequent_requests() {
     let handler = Arc::new(SipEventHandler::new(Arc::new(dp), handler_transport));
     handler.set_channel_driver(driver.clone());
     // Arm rtptimeout so the silent call is reaped, driving rustisk to send the
-    // BYE whose Request-URI we inspect.
+    // BYE whose destination + Request-URI we inspect.
     handler.set_rtp_timeout(Some(Duration::from_secs(2)));
 
+    // ---- Two LIVE SIP sockets: P1 (INVITE Contact) and P2 (refreshed) ------
+    // Binding BOTH is the whole point: the BYE datagram is physically delivered
+    // to exactly one of them, and we assert on which.
+    let p1_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let p1_addr = p1_sock.local_addr().unwrap();
+    let p1 = p1_addr.port();
+    let p2_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let p2_addr = p2_sock.local_addr().unwrap();
+    let p2 = p2_addr.port();
+    assert_ne!(p1, p2, "the refreshed target port must differ from the INVITE Contact");
+
     // ---- Establish an answered, media-silent call; INVITE Contact = P1 -----
-    let caller_sip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let caller_sip_addr = caller_sip.local_addr().unwrap();
-    let p1 = caller_sip_addr.port();
     let caller_rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let caller_rtp_addr = caller_rtp.local_addr().unwrap();
     let offer = SessionDescription::create_offer(
@@ -180,38 +218,67 @@ async fn update_refreshes_dialog_target_for_subsequent_requests() {
     let caller_tag = format!("caller{call_id}");
     let invite = invite_request(call_id, p1, &offer.to_string());
     let session =
-        SipSession::new_inbound(&invite, sip_local, caller_sip_addr).expect("inbound session");
+        SipSession::new_inbound(&invite, sip_local, p1_addr).expect("inbound session");
     handler
-        .handle_incoming_invite(&invite, caller_sip_addr, session)
+        .handle_incoming_invite(&invite, p1_addr, session)
         .await;
-    let ok = recv_sip_status(&caller_sip, 200, Duration::from_secs(5))
+    let ok = recv_sip_status(&p1_sock, 200, Duration::from_secs(5))
         .await
         .expect("200 OK for INVITE");
     let our_tag = header_tag(&ok, "To");
     // Keep the caller RTP socket bound but silent for the call's lifetime.
     std::mem::forget(caller_rtp);
 
-    // ---- Refresh the target to a NEW Contact port P2 via UPDATE ------------
-    // P2 is deliberately distinct from P1 and need not be a live socket — only
-    // the BYE's Request-URI port is inspected.
-    let p2: u16 = if p1 == 59999 { 59998 } else { 59999 };
-    assert_ne!(p1, p2, "the refreshed target port must differ from the INVITE Contact");
+    // ---- Refresh the target to the LIVE P2 Contact via UPDATE --------------
+    // The UPDATE arrives from P1's source tuple (symmetric), but its Contact is
+    // P2. The 200 OK for the UPDATE is a response and returns to the P1 source;
+    // only the subsequent local BYE should move to P2.
     let upd = update_new_contact(call_id, &our_tag, &caller_tag, p1, p2, 2);
-    handler.handle_update(&upd, caller_sip_addr).await;
-    let _upd_ok = recv_sip_status(&caller_sip, 200, Duration::from_secs(2))
+    handler.handle_update(&upd, p1_addr).await;
+    let _upd_ok = recv_sip_status(&p1_sock, 200, Duration::from_secs(2))
         .await
         .expect("target-refresh UPDATE must be answered 200");
 
-    // ---- rtptimeout reaps the silent call -> BYE addressed to P2 -----------
-    let bye_uri = await_bye_uri(&caller_sip, Duration::from_secs(6))
-        .await
-        .expect("rtptimeout must reap the media-silent call and send a BYE");
-    assert_eq!(
-        bye_uri.port,
-        Some(p2),
-        "BYE Request-URI must address the REFRESHED target (Contact from the UPDATE, \
-         port {p2}); got {:?}. If it is {p1} the UPDATE's target refresh was not applied.",
-        bye_uri.port
-    );
-    println!("[E2E] UPDATE target refresh: subsequent BYE addressed the refreshed Contact (port {p2})");
+    // ---- rtptimeout reaps the silent call -> BYE MUST land on P2 -----------
+    // Race both live sockets. Whichever receives the BYE first decides the
+    // verdict; a BYE on P1 is the MAJOR-3b defect.
+    let budget = Duration::from_secs(6);
+    let arrival = tokio::select! {
+        uri = await_bye_uri(&p2_sock, budget) => match uri {
+            Some(u) => ByeArrival::OnP2(u),
+            None => ByeArrival::Neither,
+        },
+        uri = await_bye_uri(&p1_sock, budget) => match uri {
+            Some(u) => ByeArrival::OnP1(u),
+            None => ByeArrival::Neither,
+        },
+    };
+
+    match arrival {
+        ByeArrival::OnP2(uri) => {
+            // Datagram routing proven. Also require the Request-URI to carry the
+            // refreshed target, so a regression in EITHER the dialog target or
+            // the next-hop resolution is caught.
+            assert_eq!(
+                uri.port,
+                Some(p2),
+                "BYE datagram reached P2 but its Request-URI addressed {:?}, not the refreshed \
+                 target port {p2}",
+                uri.port
+            );
+            println!(
+                "[E2E] UPDATE target refresh OPERATIONAL: BYE datagram delivered to the refreshed \
+                 Contact port P2={p2} and its Request-URI carries P2 (INVITE port P1={p1})"
+            );
+        }
+        ByeArrival::OnP1(uri) => panic!(
+            "MAJOR-3b: BYE datagram was delivered to the STALE INVITE source port P1={p1}, not the \
+             UPDATE-refreshed Contact port P2={p2}. Its Request-URI was {:?} — proof the header \
+             moved but the routing did not.",
+            uri.port
+        ),
+        ByeArrival::Neither => {
+            panic!("rtptimeout must reap the media-silent call and send a BYE, but none arrived on P1 or P2")
+        }
+    }
 }

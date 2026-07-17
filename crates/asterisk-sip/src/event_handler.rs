@@ -88,8 +88,19 @@ fn session_timer_response(request: &SipMessage) -> Option<(String, &'static str)
 struct CallState {
     /// The SIP session (holds INVITE, dialog, SDP, etc.).
     session: SipSession,
-    /// Remote address to send responses to.
+    /// Source-validation tuple: the address inbound in-dialog requests and
+    /// responses must originate from, and where server responses are sent.
+    /// This is the symmetric INVITE source and is NEVER moved by a target
+    /// refresh, so forged-request rejection and symmetric-response behavior
+    /// are preserved.
     remote_addr: SocketAddr,
+    /// Physical next hop for LOCAL in-dialog requests (BYE, re-INVITE).
+    /// Initialized to the INVITE source tuple (`remote_addr`) and refreshed to
+    /// the resolved Contact when an in-dialog UPDATE / re-INVITE performs an
+    /// RFC 3261 §12.2 target refresh. Kept separate from `remote_addr` so the
+    /// datagram actually reaches the refreshed target instead of the stale
+    /// INVITE source (M5 review MAJOR-3b).
+    next_hop: SocketAddr,
     /// Channel name for correlation.
     channel_name: String,
     /// Dial abandoned this leg while its INVITE was still pending. Retain
@@ -800,6 +811,9 @@ impl SipEventHandler {
         let call_state = Arc::new(tokio::sync::Mutex::new(CallState {
             session,
             remote_addr,
+            // Local in-dialog requests start out addressed to the INVITE
+            // source tuple; a later UPDATE/re-INVITE target refresh moves it.
+            next_hop: remote_addr,
             channel_name: channel_name.clone(),
             abandoned: false,
             _rtp_reservation: rtp_reservation,
@@ -1092,7 +1106,9 @@ impl SipEventHandler {
                 if let Some(cs_arc) = cs_arc_opt {
                     let mut cs = cs_arc.lock().await;
                     if let Some(bye) = cs.session.build_bye() {
-                        if let Err(e) = transport.send(&bye, cs.remote_addr).await {
+                        // Route to the dialog's (possibly UPDATE-refreshed) next
+                        // hop, not the stale INVITE source (M5 review MAJOR-3b).
+                        if let Err(e) = transport.send(&bye, cs.next_hop).await {
                             warn!(call_id = %call_id_for_task, "Failed to send BYE: {}", e);
                         } else {
                             eprintln!("[DEBUG] Sent BYE for call_id={}", call_id_for_task);
@@ -1205,6 +1221,7 @@ impl SipEventHandler {
         let call_state = Arc::new(tokio::sync::Mutex::new(CallState {
             session,
             remote_addr,
+            next_hop: remote_addr,
             channel_name: channel_name.to_string(),
             abandoned: false,
             _rtp_reservation: None,
@@ -1299,7 +1316,7 @@ impl SipEventHandler {
 
             if cs.abandoned {
                 if let Some(bye) = cs.session.build_bye() {
-                    if let Err(error) = self.send_client_request(bye, cs.remote_addr).await {
+                    if let Err(error) = self.send_client_request(bye, cs.next_hop).await {
                         warn!(call_id = %call_id, %error,
                             "Failed to send BYE after abandoned INVITE received 200");
                     } else {
@@ -1536,6 +1553,15 @@ impl SipEventHandler {
         {
             let mut cs = cs_arc.lock().await;
             cs.session.update_remote_target(&contact);
+            // The refreshed target is also the physical next hop: move the
+            // transport send destination to the resolved Contact so a later
+            // local BYE/re-INVITE datagram actually reaches the new target,
+            // not just its Request-URI (M5 review MAJOR-3b). Keep the prior
+            // next hop when the Contact host is not directly addressable, so
+            // symmetric routing stays intact (real NAT/DNS is M6).
+            if let Some(addr) = cs.session.remote_target_addr() {
+                cs.next_hop = addr;
+            }
         }
 
         let carries_sdp = request
@@ -1856,7 +1882,7 @@ impl SipEventHandler {
 
         let mut cs = cs_arc.lock().await;
         if let Some(reinvite) = cs.session.build_reinvite(&sdp) {
-            if let Err(e) = self.transport.send(&reinvite, cs.remote_addr).await {
+            if let Err(e) = self.transport.send(&reinvite, cs.next_hop).await {
                 warn!(call_id = %call_id, "Failed to send re-INVITE: {}", e);
                 return false;
             }
@@ -1936,6 +1962,21 @@ impl SipEventHandler {
         {
             self.reject_in_dialog_request(request, remote_addr, reason).await;
             return None;
+        }
+
+        // A re-INVITE is a target-refresh request too (RFC 3261 §12.2): apply
+        // its Contact to the dialog remote target and move the local-request
+        // next hop to the resolved Contact, mirroring the UPDATE path so a
+        // later BYE reaches the refreshed target (M5 review MAJOR-3b).
+        if let Some(contact) = request
+            .get_header(crate::parser::header_names::CONTACT)
+            .and_then(crate::parser::extract_uri)
+        {
+            let mut cs = cs_arc.lock().await;
+            cs.session.update_remote_target(&contact);
+            if let Some(addr) = cs.session.remote_target_addr() {
+                cs.next_hop = addr;
+            }
         }
 
         // Parse the re-INVITE's SDP offer
@@ -2126,7 +2167,7 @@ impl SipEventHandler {
             if let Some(cs_arc) = cs_arc {
                 let mut cs = cs_arc.lock().await;
                 if let Some(bye) = cs.session.build_bye() {
-                    if let Err(e) = self.send_client_request(bye, cs.remote_addr).await {
+                    if let Err(e) = self.send_client_request(bye, cs.next_hop).await {
                         warn!(call_id = %call_id, "Failed to send BYE for {}: {}", channel_name, e);
                     } else {
                         eprintln!("[DEBUG] Sent BYE for channel {} call_id={}", channel_name, call_id);
@@ -2171,7 +2212,7 @@ impl SipEventHandler {
             let mut state = call_state.lock().await;
             match state.session.build_bye() {
                 Some(bye) => {
-                    if let Err(error) = self.send_client_request(bye, state.remote_addr).await {
+                    if let Err(error) = self.send_client_request(bye, state.next_hop).await {
                         warn!(call_id = %call_id, channel = channel_name, %error,
                             "Failed to send BYE for completed Originate");
                     }
@@ -2248,7 +2289,7 @@ impl SipEventHandler {
                 };
                 if let Some(request) = request {
                     let method = request.method();
-                    if let Err(error) = self.send_client_request(request, cs.remote_addr).await {
+                    if let Err(error) = self.send_client_request(request, cs.next_hop).await {
                         warn!(call_id = %call_id, channel = channel_name,
                             ?method, %error, "Failed to signal abandoned Dial leg");
                     } else {

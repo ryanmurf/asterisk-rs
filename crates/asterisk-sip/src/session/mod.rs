@@ -387,6 +387,24 @@ impl SipSession {
         }
     }
 
+    /// Resolve the dialog's current remote target (Contact) to the transport
+    /// address that local in-dialog requests (BYE, re-INVITE) must be
+    /// physically sent to.
+    ///
+    /// Returns `Some(addr)` only when a dialog is established and the target's
+    /// host is an IP literal we can address without DNS. Returns `None`
+    /// otherwise, so a caller keeps its existing next hop (e.g. the symmetric
+    /// INVITE source tuple) rather than losing routing to an unresolvable
+    /// host. Real DNS/NAT next-hop resolution is out of scope here (deferred
+    /// to the M6 NAT work); this only makes a directly-addressable target
+    /// refresh operational.
+    pub fn remote_target_addr(&self) -> Option<SocketAddr> {
+        let dialog = self.dialog.as_ref()?;
+        let uri = SipUri::parse(&dialog.remote_target).ok()?;
+        let ip: std::net::IpAddr = uri.host.parse().ok()?;
+        Some(SocketAddr::new(ip, uri.port.unwrap_or(5060)))
+    }
+
     /// Build an ACK request.
     pub fn build_ack(&self) -> Option<SipMessage> {
         let invite = self.invite.as_ref()?;
