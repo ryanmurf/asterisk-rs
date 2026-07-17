@@ -1957,7 +1957,11 @@ impl SipEventHandler {
             }
         }
 
-        // Skip outbound calls — handle_response already sends their ACK
+        // Outbound calls: handle_response drives their ACK, so we only refresh
+        // the target above and return here. (That ACK's wire-correctness for a
+        // re-INVITE — build_ack hard-codes `CSeq: 1 ACK` and the initial R-URI —
+        // is the M7 M-f lifecycle item, out of this carryover's scope; the
+        // target refresh itself now applies to outbound too.)
         if cs.session.is_outbound {
             return;
         }
