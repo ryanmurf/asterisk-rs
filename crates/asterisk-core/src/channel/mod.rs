@@ -33,58 +33,138 @@ use asterisk_types::{
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
-// Hangup callback registry
+// Channel lifecycle callback registries (hangup + answer)
 // ---------------------------------------------------------------------------
+//
+// Historically these were append-only `Vec`s: a per-call closure that matched
+// one channel's `unique_id` was pushed on every inbound INVITE (and every
+// ConfBridge join / Local pair) and never removed. Over a soak the vectors
+// grew without bound — a slow memory leak — and, because `fire_*` scans the
+// whole vector on every hangup/answer, the per-event cost grew O(n), turning
+// N calls into O(N^2) callback invocations. Both are now keyed maps so a
+// scoped registration can unregister itself when the call ends (issue #121).
+//
+// Locking invariant: `fire_*` holds the registry lock while invoking closures
+// (unchanged from the original design). A closure must therefore not register
+// or drop a callback handle synchronously from inside a callback, or it would
+// re-enter the same non-reentrant lock. No in-tree closure does this.
+
+/// Monotonic id source shared by both callback registries.
+static CALLBACK_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_callback_id() -> u64 {
+    CALLBACK_ID.fetch_add(1, AtomicOrdering::Relaxed)
+}
 
 /// Callback type for hangup notifications.
 /// Receives the channel's unique_id and the hangup cause.
 pub type HangupCallback = Box<dyn Fn(&str, &HangupCause) + Send + Sync>;
 
-/// Global registry of hangup callbacks.
-static HANGUP_CALLBACKS: LazyLock<parking_lot::Mutex<Vec<HangupCallback>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+/// Global registry of hangup callbacks, keyed by registration id.
+static HANGUP_CALLBACKS: LazyLock<parking_lot::Mutex<HashMap<u64, HangupCallback>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Register a callback to be invoked whenever a channel hangs up.
+/// Register a **permanent** callback invoked whenever a channel hangs up.
 ///
-/// The callback receives the channel's unique_id and the hangup cause.
+/// The callback receives the channel's unique_id and the hangup cause and is
+/// never removed — use this only for process-lifetime subscribers (CDR and the
+/// like). For a per-call closure keyed to one channel, prefer
+/// [`register_hangup_callback_scoped`], whose handle unregisters the closure
+/// when the call ends so the registry does not grow without bound.
 pub fn register_hangup_callback(cb: HangupCallback) {
-    HANGUP_CALLBACKS.lock().push(cb);
+    HANGUP_CALLBACKS.lock().insert(next_callback_id(), cb);
+}
+
+/// RAII handle for a scoped hangup callback. Dropping it unregisters the
+/// callback, so it must be held for the lifetime of the channel it serves.
+#[must_use = "dropping this handle immediately unregisters the callback; \
+              hold it for the channel's lifetime"]
+pub struct HangupCallbackHandle {
+    id: u64,
+}
+
+impl Drop for HangupCallbackHandle {
+    fn drop(&mut self) {
+        HANGUP_CALLBACKS.lock().remove(&self.id);
+    }
+}
+
+/// Register a hangup callback that is unregistered when the returned handle is
+/// dropped. Hold the handle for as long as the callback must remain live
+/// (typically the owning call/leg's task); dropping it at teardown returns the
+/// registry to baseline (issue #121).
+pub fn register_hangup_callback_scoped(cb: HangupCallback) -> HangupCallbackHandle {
+    let id = next_callback_id();
+    HANGUP_CALLBACKS.lock().insert(id, cb);
+    HangupCallbackHandle { id }
+}
+
+/// Number of currently-registered hangup callbacks. Lets soak/regression
+/// harnesses assert the registry returns to baseline after teardown.
+pub fn registered_hangup_callbacks() -> usize {
+    HANGUP_CALLBACKS.lock().len()
 }
 
 /// Invoke all registered hangup callbacks.
 fn fire_hangup_callbacks(unique_id: &str, cause: &HangupCause) {
     let callbacks = HANGUP_CALLBACKS.lock();
-    for cb in callbacks.iter() {
+    for cb in callbacks.values() {
         cb(unique_id, cause);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Answer callback registry
-// ---------------------------------------------------------------------------
 
 /// Callback type for answer notifications.
 /// Receives the channel's unique_id. Fired when channel.answer() is called.
 pub type AnswerCallback = Box<dyn Fn(&str) + Send + Sync>;
 
-/// Global registry of answer callbacks.
-static ANSWER_CALLBACKS: LazyLock<parking_lot::Mutex<Vec<AnswerCallback>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+/// Global registry of answer callbacks, keyed by registration id.
+static ANSWER_CALLBACKS: LazyLock<parking_lot::Mutex<HashMap<u64, AnswerCallback>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// Register a callback to be invoked whenever a channel is answered.
+/// Register a **permanent** callback invoked whenever a channel is answered.
 ///
-/// The callback receives the channel's unique_id.
+/// Never removed — for a per-call closure keyed to one channel, prefer
+/// [`register_answer_callback_scoped`].
 pub fn register_answer_callback(cb: AnswerCallback) {
-    ANSWER_CALLBACKS.lock().push(cb);
+    ANSWER_CALLBACKS.lock().insert(next_callback_id(), cb);
+}
+
+/// RAII handle for a scoped answer callback. Dropping it unregisters the
+/// callback, so it must be held for the lifetime of the channel it serves.
+#[must_use = "dropping this handle immediately unregisters the callback; \
+              hold it for the channel's lifetime"]
+pub struct AnswerCallbackHandle {
+    id: u64,
+}
+
+impl Drop for AnswerCallbackHandle {
+    fn drop(&mut self) {
+        ANSWER_CALLBACKS.lock().remove(&self.id);
+    }
+}
+
+/// Register an answer callback that is unregistered when the returned handle is
+/// dropped. Hold the handle for as long as the callback must remain live
+/// (issue #121).
+pub fn register_answer_callback_scoped(cb: AnswerCallback) -> AnswerCallbackHandle {
+    let id = next_callback_id();
+    ANSWER_CALLBACKS.lock().insert(id, cb);
+    AnswerCallbackHandle { id }
+}
+
+/// Number of currently-registered answer callbacks.
+pub fn registered_answer_callbacks() -> usize {
+    ANSWER_CALLBACKS.lock().len()
 }
 
 /// Invoke all registered answer callbacks.
 fn fire_answer_callbacks(unique_id: &str) {
     let callbacks = ANSWER_CALLBACKS.lock();
-    for cb in callbacks.iter() {
+    for cb in callbacks.values() {
         cb(unique_id);
     }
 }
@@ -669,5 +749,133 @@ pub trait ChannelDriver: Send + Sync + fmt::Debug {
         _new_channel: &mut Channel,
     ) -> AsteriskResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod callback_registry_tests {
+    //! Regression coverage for the scoped channel-callback registries.
+    //!
+    //! Root cause (issue #121): `register_hangup_callback` /
+    //! `register_answer_callback` were append-only, so every inbound call (and
+    //! ConfBridge join / Local pair) leaked one closure forever and `fire_*`
+    //! scanned an ever-growing vector — an unbounded leak + O(n) per-event cost
+    //! that fails the M5 500-call soak. The scoped API unregisters on drop.
+    //!
+    //! Red control: make `HangupCallbackHandle`/`AnswerCallbackHandle::drop` a
+    //! no-op (or swap the scoped registration back to the permanent `push`
+    //! form) and `scoped_*_unregisters_on_drop` / `soak_*_returns_to_baseline`
+    //! fail with a monotonically climbing registry count.
+
+    use super::{
+        register_answer_callback_scoped, register_hangup_callback_scoped,
+        registered_answer_callbacks, registered_hangup_callbacks, Channel,
+    };
+    use asterisk_types::{ChannelState, HangupCause};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// The registries are process-global; serialize these tests so a sibling's
+    /// concurrent registration cannot perturb an exact baseline-relative count.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn scoped_hangup_callback_unregisters_on_drop() {
+        let _guard = serial();
+        let baseline = registered_hangup_callbacks();
+        let handle = register_hangup_callback_scoped(Box::new(|_uid, _cause| {}));
+        assert_eq!(
+            registered_hangup_callbacks(),
+            baseline + 1,
+            "scoped registration must add exactly one entry"
+        );
+        drop(handle);
+        assert_eq!(
+            registered_hangup_callbacks(),
+            baseline,
+            "dropping the handle must return the registry to baseline (leak)"
+        );
+    }
+
+    #[test]
+    fn scoped_answer_callback_unregisters_on_drop() {
+        let _guard = serial();
+        let baseline = registered_answer_callbacks();
+        let handle = register_answer_callback_scoped(Box::new(|_uid| {}));
+        assert_eq!(registered_answer_callbacks(), baseline + 1);
+        drop(handle);
+        assert_eq!(
+            registered_answer_callbacks(),
+            baseline,
+            "dropping the handle must return the registry to baseline (leak)"
+        );
+    }
+
+    #[test]
+    fn scoped_hangup_callback_fires_while_held_and_never_after_drop() {
+        let _guard = serial();
+        let hits = Arc::new(AtomicU32::new(0));
+        let hits_cb = hits.clone();
+
+        let mut chan = Channel::new("Test/scoped-hangup");
+        chan.set_state(ChannelState::Up);
+        let target = chan.unique_id.0.clone();
+
+        let handle = register_hangup_callback_scoped(Box::new(move |uid, _cause| {
+            if uid == target {
+                hits_cb.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        chan.hangup(HangupCause::NormalClearing);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "callback must fire while held");
+
+        // After the owning call ends and drops the handle, a later hangup for a
+        // reused unique_id must not re-enter the stale closure.
+        drop(handle);
+        let mut reused = Channel::new("Test/scoped-hangup");
+        reused.unique_id = super::ChannelId(
+            chan.unique_id.0.clone(),
+        );
+        reused.set_state(ChannelState::Up);
+        reused.hangup(HangupCause::NormalClearing);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "dropped callback must not fire again"
+        );
+    }
+
+    /// Mirrors the M4 exact-baseline discipline over a burst of short calls:
+    /// after every scoped registration is dropped the registries must be back
+    /// at the baseline, proving the soak leak is closed.
+    #[test]
+    fn soak_scoped_callbacks_return_to_baseline() {
+        let _guard = serial();
+        let hangup_baseline = registered_hangup_callbacks();
+        let answer_baseline = registered_answer_callbacks();
+
+        for _ in 0..500 {
+            let h = register_hangup_callback_scoped(Box::new(|_uid, _cause| {}));
+            let a = register_answer_callback_scoped(Box::new(|_uid| {}));
+            // Simulate the call ending: both handles drop here.
+            drop(h);
+            drop(a);
+        }
+
+        assert_eq!(
+            registered_hangup_callbacks(),
+            hangup_baseline,
+            "hangup registry leaked across 500 simulated calls"
+        );
+        assert_eq!(
+            registered_answer_callbacks(),
+            answer_baseline,
+            "answer registry leaked across 500 simulated calls"
+        );
     }
 }
