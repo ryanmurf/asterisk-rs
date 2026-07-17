@@ -181,6 +181,7 @@ def serve_core(sock, own, capture, route_target, realm, password, answer_delay):
     # Per-Call-ID state: challenged INVITE branch + retransmit bookkeeping.
     challenged = {}   # call_id -> {"branch", "retx", "deadline", "acked"}
     answered = set()  # call_id already 200'd
+    rejected = {}     # call_id -> set of branches given a non-2xx final (403)
     RETX_INTERVAL = 1.0
     MAX_RETX = 3
     while True:
@@ -234,6 +235,10 @@ def serve_core(sock, own, capture, route_target, realm, password, answer_delay):
                     own, src[0], src[1], branch, cseq, "yes" if valid else "no", prev.get("branch"), call_id))
                 if not valid:
                     sock.sendto(build_response(text, 403, "Forbidden", to_tag="cp1core403"), src)
+                    # Remember this branch: its non-2xx ACK (same branch, RFC
+                    # 3261 §17.1.1.3) correctly comes back to the core and must
+                    # not be mislabeled as a 2xx-ACK route-set violation.
+                    rejected.setdefault(call_id, set()).add(branch)
                     continue
                 if call_id in answered:
                     continue
@@ -253,10 +258,23 @@ def serve_core(sock, own, capture, route_target, realm, password, answer_delay):
             branch = branch_of(text)
             cseq = cseq_of(text)
             st = challenged.get(call_id)
-            if st and branch == st["branch"] and not st.get("marked_ack"):
-                st["acked"] = True
-                st["marked_ack"] = True
-                append_capture(capture, "ACK-CHALLENGE own=%s src=%s:%d branch=%s cseq=%s callid=%s" % (
+            # Label by the SPECIFIC transaction the ACK belongs to (branch),
+            # not a coarse challenged-or-not match — a non-2xx ACK reuses its
+            # INVITE's branch (§17.1.1.3), while a 2xx ACK is a NEW transaction
+            # with a fresh branch. Only the latter at the core is a route-set
+            # violation (RED).
+            if st and branch == st["branch"]:
+                if not st.get("marked_ack"):
+                    st["acked"] = True
+                    st["marked_ack"] = True
+                    append_capture(capture, "ACK-CHALLENGE own=%s src=%s:%d branch=%s cseq=%s callid=%s" % (
+                        own, src[0], src[1], branch, cseq, call_id))
+                else:
+                    append_capture(capture, "ACK-CHALLENGE-RETX own=%s src=%s:%d branch=%s cseq=%s callid=%s" % (
+                        own, src[0], src[1], branch, cseq, call_id))
+            elif branch in rejected.get(call_id, set()):
+                # The 403'd retry's ACK — hop-by-hop, correctly at the core.
+                append_capture(capture, "ACK-NON2XX-AT-CORE own=%s src=%s:%d branch=%s cseq=%s callid=%s" % (
                     own, src[0], src[1], branch, cseq, call_id))
             else:
                 # A 2xx ACK reaching CORE means the route set was IGNORED (RED).

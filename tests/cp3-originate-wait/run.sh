@@ -9,11 +9,25 @@
 #   PRE-ANSWER SILENCE: in the pre-answer window the carrier receives ONLY the
 #     INVITE — no ACK/BYE/CANCEL and no RTP (the app has not run).
 #   POST-ANSWER RUN: after the 200 the answer is ACKed and the app runs — the
-#     BYE (and the app's DTMF RTP) appear phase=post.
+#     BYE and the app's Playback RTP appear phase=post. The app plays a real
+#     (generated, TEST-only) audio file, so post-answer RTP > 0 is REQUIRED:
+#     it proves the media pump delivers, making pre-answer RTP == 0 a real
+#     no-media-before-answer guarantee instead of a vacuous one.
 #
 # RED (revert CP3 -> app runs immediately): the app runs and tears the unanswered
 # leg down before the delayed 200; the 200 is orphaned (no post-answer ACK, no
 # BYE). Captured below by reverting the wait.
+#
+# Scenarios (both run by default; select one with CP3_SCENARIO=baseline|early-media):
+#   baseline    — carrier sends 100 then the DELAYED 200 (the original CP3 run).
+#   early-media — carrier ALSO sends a 183 Session Progress WITH SDP before the
+#     delayed 200 (M7 follow-up, WIRE-MINOR-1). A pre-answer media path now
+#     EXISTS, giving the `RTP phase=pre == 0` guard independent teeth: if the
+#     Originate wait were defeated so the app ran on the 183 (the classic
+#     "early media treated as answer" defect), the app's Playback RTP would
+#     arrive pre-answer and that guard alone REDs (in the baseline a defeated
+#     wait can only surface as an orphaned 200 — the app has no remote media
+#     address before the 200 there).
 #
 # Isolated Docker only; never touches the live voice stack / carrier / real PIN.
 #   tests/cp3-originate-wait/run.sh
@@ -21,7 +35,21 @@ set -euo pipefail
 
 HARNESS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$HARNESS_DIR/../.." && pwd)"
-RUNTIME_DIR="$REPO_DIR/target/cp3-originate-wait"
+
+# With no CP3_SCENARIO set, run BOTH scenarios sequentially.
+if [[ -z "${CP3_SCENARIO:-}" ]]; then
+    CP3_SCENARIO=baseline "${BASH_SOURCE[0]}"
+    CP3_SCENARIO=early-media "${BASH_SOURCE[0]}"
+    printf '\nPASS: both CP3 scenarios (baseline + early-media) passed.\n'
+    exit 0
+fi
+case "$CP3_SCENARIO" in
+    baseline) EARLY_MEDIA=0 ;;
+    early-media) EARLY_MEDIA=1 ;;
+    *) printf 'FAIL: unknown CP3_SCENARIO=%s (baseline|early-media)\n' "$CP3_SCENARIO" >&2; exit 2 ;;
+esac
+
+RUNTIME_DIR="$REPO_DIR/target/cp3-originate-wait/$CP3_SCENARIO"
 CONFIG_DIR="$RUNTIME_DIR/config"
 RUN_DIR="$RUNTIME_DIR/run"
 RUSTISK_LOG="$RUNTIME_DIR/rustisk.log"
@@ -137,20 +165,29 @@ say "Building rustisk (Rust 1.97.0, CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6})..."
 sed -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" -e "s|@RUN_DIR@|$RUN_DIR|g" \
     "$HARNESS_DIR/config/asterisk.conf.tmpl" >"$CONFIG_DIR/asterisk.conf"
 cp "$HARNESS_DIR/config/manager.conf" "$CONFIG_DIR/manager.conf"
-cp "$HARNESS_DIR/config/extensions.conf" "$CONFIG_DIR/extensions.conf"
+# The app plays a real (generated, TEST-only) 1s G.711u file so app media
+# genuinely flows: post-answer RTP > 0 proves the media pump works, which is
+# what gives the pre-answer RTP == 0 guard its teeth (see verdict).
+MEDIA_FILE="$RUNTIME_DIR/media/app-tone.ulaw"
+mkdir -p "$RUNTIME_DIR/media"
+python3 -c "import sys; sys.stdout.buffer.write(bytes(range(256)) * 32)" >"$MEDIA_FILE"
+sed -e "s|@MEDIA_FILE@|$MEDIA_FILE|g" \
+    "$HARNESS_DIR/config/extensions.conf.tmpl" >"$CONFIG_DIR/extensions.conf"
 cp "$HARNESS_DIR/config/rtp.conf" "$CONFIG_DIR/rtp.conf"
 printf '[general]\nsecret_file = /run/secrets/rustisk/pin\n' >"$CONFIG_DIR/pin_gate.conf"
 
 say "Creating isolated --internal network $NET..."
 docker network create --internal --subnet "$SUBNET" --ip-range "$IP_RANGE" "$NET" >/dev/null
 
-say "Starting offline carrier (delays 200 by ${ANSWER_DELAY}s; captures SIP + RTP by phase)..."
+EM_FLAG=""
+(( EARLY_MEDIA )) && EM_FLAG="--early-media"
+say "Starting offline carrier (scenario=$CP3_SCENARIO; delays 200 by ${ANSWER_DELAY}s; captures SIP + RTP by phase)..."
 docker run -d --rm --name "$CARRIER_CONTAINER" \
     --network "$NET" --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$HARNESS_DIR/carrier_delay.py,dst=/carrier_delay.py,readonly" \
     --mount "type=bind,src=$RUNTIME_DIR,dst=/runtime" \
     "$RUSTISK_IMAGE" python3 /carrier_delay.py --caller "$RUSTISK_IP" \
-        --capture /runtime/carrier.log --answer-delay "$ANSWER_DELAY" >/dev/null
+        --capture /runtime/carrier.log --answer-delay "$ANSWER_DELAY" $EM_FLAG >/dev/null
 S=""
 for _ in $(seq 1 40); do S="$(container_ip "$CARRIER_CONTAINER")"; [[ -n "$S" ]] && break; sleep 0.25; done
 [[ -n "$S" ]] || fail "could not read carrier container IP"
@@ -197,25 +234,41 @@ else
     POST="FAIL"
 fi
 
-# Informational: app's DTMF media arrived (only) after answer.
+# App media (the app's Playback RTP) must have arrived — and only after answer.
+# RTP_POST > 0 proves the app's media pump actually delivers to the carrier, so
+# RTP_PRE == 0 is a real no-media-before-answer guarantee, not a vacuous one.
 RTP_PRE="$(grep -c 'RTP phase=pre' "$CAPTURE" || true)"
 RTP_POST="$(grep -c 'RTP phase=post' "$CAPTURE" || true)"
+
+# Early-media scenario: the pre-answer media path must have EXISTED (183 with
+# SDP sent BEFORE the 200) — otherwise the RTP phase=pre check has no teeth.
+EARLY="n/a"
+if (( EARLY_MEDIA )); then
+    L183="$(grep -n -m1 'SENT-183 ' "$CAPTURE" | cut -d: -f1 || true)"
+    L200="$(grep -n -m1 'SENT-200 ' "$CAPTURE" | cut -d: -f1 || true)"
+    if [[ -n "$L183" && -n "$L200" ]] && (( L183 < L200 )); then EARLY="PASS"; else EARLY="FAIL"; fi
+fi
 
 VERDICT_OK=1
 [[ "$SILENCE" == "PASS" ]] || VERDICT_OK=0
 [[ "$POST" == "PASS" ]] || VERDICT_OK=0
 [[ "${RTP_PRE:-0}" == "0" ]] || VERDICT_OK=0
+[[ "${RTP_POST:-0}" != "0" ]] || VERDICT_OK=0
+[[ "$EARLY" == "FAIL" ]] && VERDICT_OK=0
 
 {
-    echo "CP3 wait-for-answer harness — PROOF"
+    echo "CP3 wait-for-answer harness — PROOF (scenario=$CP3_SCENARIO)"
     echo "generated: $(date -u +%FT%TZ)"
     echo "rustisk HEAD: $(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "answer delay: ${ANSWER_DELAY}s"
     echo
     echo "PRE-ANSWER SILENCE (only INVITE before the 200, no ACK/BYE/CANCEL/RTP): $SILENCE"
     echo "POST-ANSWER RUN   (answer ACKed + app BYE after the 200):              $POST"
-    echo "RTP datagrams pre-answer (must be 0):  ${RTP_PRE:-0}"
-    echo "RTP datagrams post-answer (app media):  ${RTP_POST:-0}"
+    if (( EARLY_MEDIA )); then
+        echo "EARLY-MEDIA PATH  (183 with SDP sent before the 200):                  $EARLY"
+    fi
+    echo "RTP datagrams pre-answer (must be 0):            ${RTP_PRE:-0}"
+    echo "RTP datagrams post-answer (app media, must be >0): ${RTP_POST:-0}"
     echo
     echo "--- carrier capture (receiver-side, phase-tagged, rel = seconds since start) ---"
     cat "$CAPTURE" 2>/dev/null || true
@@ -227,8 +280,8 @@ cat "$PROOF"
 
 if (( VERDICT_OK == 1 )); then
     say ''
-    say "PASS: Originate stayed SILENT before answer and ran the app only after the delayed 200 (receiver-side)."
+    say "PASS ($CP3_SCENARIO): Originate stayed SILENT before answer and ran the app only after the delayed 200 (receiver-side)."
     exit 0
 else
-    fail "CP3 harness verdict FAILED (see verdict above)"
+    fail "CP3 harness verdict FAILED (scenario=$CP3_SCENARIO; see verdict above)"
 fi
