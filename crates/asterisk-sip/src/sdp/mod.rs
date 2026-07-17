@@ -915,23 +915,35 @@ fn addr_type_for(addr: &str) -> &'static str {
 /// 2. the concrete local bind address, when there is one;
 /// 3. for an unspecified bind (`0.0.0.0`/`::`), the local interface the
 ///    kernel routes toward the peer.
-pub fn advertised_media_ip(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> String {
+///
+/// **Fail-closed (CP3):** returns `None` when a configured
+/// `external_media_address` is an FQDN that does NOT resolve. In that case the
+/// caller MUST reject the call setup rather than advertise an unresolved FQDN
+/// or fall back to a leaky internal address in `c=`/`o=`. An IP-literal external
+/// address, a resolvable FQDN, or any non-external path always returns `Some`.
+pub fn advertised_media_ip(
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> Option<String> {
     let (external, local_net) = match crate::pjsip_config::get_global_pjsip_config() {
         Some(cfg) => {
-            // NAT config is transport-specific: use the transport whose bind
-            // covers `local` — exact ip+port, then exact ip, then a wildcard
-            // bind (which covers every interface). A transport bound to a
-            // DIFFERENT concrete address never donates its NAT config.
-            // (Dialogs don't yet carry their transport name; when they do,
-            // that binding should replace this bind-coverage lookup.)
-            let with_ext = |pred: &dyn Fn(&crate::pjsip_config::TransportConfig) -> bool| {
-                cfg.transports
-                    .iter()
-                    .find(|t| t.external_media_address.is_some() && pred(t))
-            };
-            let transport = with_ext(&|t| t.bind.ip() == local.ip() && t.bind.port() == local.port())
-                .or_else(|| with_ext(&|t| t.bind.ip() == local.ip()))
-                .or_else(|| with_ext(&|t| t.bind.ip().is_unspecified()));
+            // Select the transport whose bind COVERS `local` first — exact
+            // ip+port, then exact ip, then a wildcard bind — and only THEN read
+            // its NAT config. Selecting by bind coverage (not by "has an
+            // external address") stops a same-ip/wildcard transport that
+            // happens to set an external address from donating it to a covering
+            // transport that set none — which, with fail-closed resolution,
+            // would otherwise REJECT a normal call on the transport that has no
+            // external address (codex CP3 F2). A transport bound to a DIFFERENT
+            // concrete address never covers `local`. (Dialogs don't yet carry
+            // their transport name; when they do, that binding should replace
+            // this bind-coverage lookup.)
+            let transport = cfg
+                .transports
+                .iter()
+                .find(|t| t.bind == local)
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip() == local.ip()))
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip().is_unspecified()));
             match transport {
                 Some(t) => (t.external_media_address.clone(), t.local_net.clone()),
                 None => (None, Vec::new()),
@@ -1041,7 +1053,7 @@ fn advertised_media_ip_with(
     local_net: &[String],
     local: std::net::SocketAddr,
     remote: std::net::SocketAddr,
-) -> String {
+) -> Option<String> {
     // 1. A configured NAT address wins for peers outside local_net.
     if let Some(ext) = external.filter(|e| !e.is_empty()) {
         let peer_is_local = local_net.iter().any(|cidr| {
@@ -1050,13 +1062,18 @@ fn advertised_media_ip_with(
                 .unwrap_or(false)
         });
         if !peer_is_local {
-            return ext.to_string();
+            // CP3: interpret the external address. An IP literal is emitted as
+            // is; an FQDN is resolved to an IP. On DNS failure we FAIL CLOSED
+            // (return None) — never emit an unresolved FQDN into c=/o= and never
+            // fall through to the internal/routed address below, which would
+            // leak the internal topology or advertise a bogus media address.
+            return resolve_external_media_addr(ext, remote.ip());
         }
     }
 
     // 2. A concrete bound address is advertised as-is.
     if !local.ip().is_unspecified() {
-        return local.ip().to_string();
+        return Some(local.ip().to_string());
     }
 
     // 3. Bound to INADDR_ANY: let the kernel pick the interface it would
@@ -1067,7 +1084,7 @@ fn advertised_media_ip_with(
         if sock.connect(remote).is_ok() {
             if let Ok(resolved) = sock.local_addr() {
                 if !resolved.ip().is_unspecified() {
-                    return resolved.ip().to_string();
+                    return Some(resolved.ip().to_string());
                 }
             }
         }
@@ -1075,7 +1092,48 @@ fn advertised_media_ip_with(
 
     // 4. No route to the peer: keep the bind address (previous behaviour)
     //    rather than inventing one.
-    local.ip().to_string()
+    Some(local.ip().to_string())
+}
+
+/// Interpret a configured `external_media_address` for SDP `c=`/`o=` (CP3).
+///
+/// * An IP literal (v4 or v6) is emitted verbatim.
+/// * An FQDN is resolved to an IP, preferring the peer's address family so an
+///   IPv4 peer is not handed an IPv6 media address (and vice-versa), falling
+///   back to any resolved address.
+/// * **Fail closed:** returns `None` on DNS failure (or an empty resolution set)
+///   so the caller rejects the offer/answer rather than advertising an
+///   unresolved FQDN or a leaky internal address.
+///
+/// The FQDN lookup is bounded by a hard timeout so a slow NSS/DNS resolver
+/// cannot stall the serialized SIP control path indefinitely — on timeout it
+/// fails closed (`None`), the safe posture. Full async resolution with TTL
+/// caching is the separate M1/M-l DNS hardening; this only bounds the blocking
+/// call and preserves fail-closed.
+fn resolve_external_media_addr(ext: &str, remote: std::net::IpAddr) -> Option<String> {
+    if let Ok(ip) = ext.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    // Resolve on a scratch thread with a bounded receive: a slow lookup times
+    // out to None rather than blocking every other call on this stack.
+    let host = ext.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<std::net::SocketAddr>>(1);
+    std::thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let resolved = (host.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|it| it.collect())
+            .unwrap_or_default();
+        let _ = tx.send(resolved);
+    });
+    let resolved = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .ok()?;
+    let pick = resolved
+        .iter()
+        .find(|sa| sa.is_ipv4() == remote.is_ipv4())
+        .or_else(|| resolved.first())?;
+    Some(pick.ip().to_string())
 }
 
 #[cfg(test)]
@@ -1093,7 +1151,7 @@ mod tests {
     fn test_media_ip_concrete_bind_passes_through() {
         assert_eq!(
             advertised_media_ip_with(None, &[], sa("192.0.2.10:5060"), sa("198.51.100.7:5060")),
-            "192.0.2.10"
+            Some("192.0.2.10".to_string())
         );
     }
 
@@ -1101,7 +1159,8 @@ mod tests {
     /// peer is used instead (loopback peer -> loopback source).
     #[test]
     fn test_media_ip_unspecified_resolves_routable_source() {
-        let ip = advertised_media_ip_with(None, &[], sa("0.0.0.0:5060"), sa("127.0.0.1:5062"));
+        let ip = advertised_media_ip_with(None, &[], sa("0.0.0.0:5060"), sa("127.0.0.1:5062"))
+            .expect("non-external path always resolves Some");
         assert_ne!(ip, "0.0.0.0", "must never advertise INADDR_ANY (issue #56)");
         assert_eq!(ip, "127.0.0.1", "loopback peer routes via loopback");
     }
@@ -1116,7 +1175,7 @@ mod tests {
                 sa("0.0.0.0:5060"),
                 sa("198.51.100.7:5060"),
             ),
-            "203.0.113.99"
+            Some("203.0.113.99".to_string())
         );
     }
 
@@ -1131,7 +1190,7 @@ mod tests {
                 sa("127.0.0.1:5060"),
                 sa("127.0.0.1:5062"),
             ),
-            "127.0.0.1"
+            Some("127.0.0.1".to_string())
         );
     }
 
@@ -1180,9 +1239,101 @@ mod tests {
         // Local bind 127.0.0.1 is NOT covered by the 192.0.2.50 transport:
         // its external address must not leak into this dialog's SDP.
         let ip = advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062"));
-        assert_eq!(ip, "127.0.0.1");
+        assert_eq!(ip, Some("127.0.0.1".to_string()));
         // Reset the process-global config for other tests in this binary.
         set_global_pjsip_config(PjsipConfig::default());
+    }
+
+    /// codex CP3 F2: a call on a transport with NO external_media_address must
+    /// get the normal (internal/routed) address — a same-ip transport whose
+    /// external FQDN is unresolvable must NOT be selected and fail the call
+    /// closed. Covering-transport-first selection prevents that cross-donation.
+    #[test]
+    fn test_media_ip_covering_transport_without_external_not_rejected() {
+        use crate::pjsip_config::{set_global_pjsip_config, PjsipConfig, TransportConfig};
+        let base = |bind: &str, ext: Option<&str>| TransportConfig {
+            name: format!("t-{bind}"),
+            protocol: "udp".to_string(),
+            bind: bind.parse().unwrap(),
+            external_media_address: ext.map(|s| s.to_string()),
+            external_signaling_address: None,
+            external_signaling_port: None,
+            cert_file: None,
+            priv_key_file: None,
+            local_net: vec![],
+        };
+        let cfg = PjsipConfig {
+            transports: vec![
+                // The covering transport (exact ip 127.0.0.1) has NO external.
+                base("127.0.0.1:5060", None),
+                // A same-ip transport has an UNRESOLVABLE external FQDN.
+                base("127.0.0.1:5070", Some("no-such-host.invalid")),
+            ],
+            ..Default::default()
+        };
+        set_global_pjsip_config(cfg);
+        // The call is on 127.0.0.1:5060 (no external) -> must resolve to the
+        // internal address, NOT fail closed by inheriting the :5070 FQDN.
+        assert_eq!(
+            advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062")),
+            Some("127.0.0.1".to_string()),
+            "a call on the no-external transport must not be rejected via a sibling's unresolvable FQDN"
+        );
+        set_global_pjsip_config(PjsipConfig::default());
+    }
+
+    // ---- external_media_address FQDN-vs-literal, fail-closed (CP3) -------
+
+    /// An IP-literal external_media_address is emitted verbatim.
+    #[test]
+    fn test_media_external_ip_literal_passes_through() {
+        assert_eq!(
+            resolve_external_media_addr("203.0.113.99", sa("198.51.100.7:5060").ip()),
+            Some("203.0.113.99".to_string())
+        );
+        assert_eq!(
+            resolve_external_media_addr("2001:db8::1", sa("[2001:db8::9]:5060").ip()),
+            Some("2001:db8::1".to_string())
+        );
+    }
+
+    /// A resolvable FQDN external_media_address resolves to an IP literal
+    /// (localhost is guaranteed to resolve on any host).
+    #[test]
+    fn test_media_external_fqdn_resolves_to_ip() {
+        let resolved = resolve_external_media_addr("localhost", sa("127.0.0.1:5060").ip())
+            .expect("localhost must resolve");
+        let ip: std::net::IpAddr = resolved.parse().expect("resolved value must be an IP literal");
+        assert!(ip.is_loopback(), "localhost must resolve to a loopback IP, got {ip}");
+    }
+
+    /// **Fail closed:** an unresolvable FQDN yields None so the caller rejects
+    /// the offer/answer instead of advertising a bogus/internal address. Uses
+    /// the RFC 6761 `.invalid` TLD, guaranteed never to resolve.
+    #[test]
+    fn test_media_external_fqdn_unresolvable_fails_closed() {
+        assert_eq!(
+            resolve_external_media_addr("no-such-host.invalid", sa("198.51.100.7:5060").ip()),
+            None,
+            "an unresolvable external_media_address FQDN must fail closed (None)"
+        );
+    }
+
+    /// End-to-end through advertised_media_ip_with: an external FQDN that will
+    /// not resolve, for a non-local peer, fails closed rather than falling
+    /// through to the internal bind address.
+    #[test]
+    fn test_media_ip_with_unresolvable_external_fails_closed() {
+        assert_eq!(
+            advertised_media_ip_with(
+                Some("no-such-host.invalid"),
+                &[],
+                sa("10.1.2.3:5060"),
+                sa("198.51.100.7:5060"),
+            ),
+            None,
+            "fail closed: must NOT fall back to the internal bind 10.1.2.3"
+        );
     }
 
     // ---- advertised_signaling_hostport (New-3) --------------------------

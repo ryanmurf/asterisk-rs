@@ -587,12 +587,15 @@ impl ChannelDriver for SipChannelDriver {
 
         // Create SDP offer with a concrete, routable connection address
         // (external_media_address / routed interface — never 0.0.0.0,
-        // issue #56).
-        let sdp = SessionDescription::create_offer(
-            &crate::sdp::advertised_media_ip(self.local_addr, remote_addr),
-            rtp_port,
-            &channel_codecs,
-        );
+        // issue #56). Fail closed (CP3): if a configured external_media_address
+        // FQDN does not resolve, do NOT offer a bogus/internal media address —
+        // fail the dial.
+        let Some(media_ip) = crate::sdp::advertised_media_ip(self.local_addr, remote_addr) else {
+            return Err(AsteriskError::Internal(format!(
+                "outbound {dest}: external_media_address did not resolve; refusing to offer a media address (fail-closed)"
+            )));
+        };
+        let sdp = SessionDescription::create_offer(&media_ip, rtp_port, &channel_codecs);
         sip_session.local_sdp = Some(sdp);
 
         let counter = next_channel_suffix();
