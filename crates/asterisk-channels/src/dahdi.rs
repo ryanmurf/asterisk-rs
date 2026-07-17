@@ -220,7 +220,8 @@ impl AnalogChannel {
             }
             AnalogEvent::DtmfDown(digit) => {
                 self.dial_string.push(digit);
-                debug!(ch = self.channel_number, digit = %digit, "Analog: DTMF digit");
+                // REVIEW-M3 MINOR-1: never log the digit value (PIN material).
+                debug!(ch = self.channel_number, "Analog: DTMF digit");
             }
             AnalogEvent::DtmfUp(_) => {}
             AnalogEvent::RingBegin => {
@@ -707,19 +708,20 @@ impl ChannelDriver for DahdiDriver {
         Ok(())
     }
 
-    async fn send_digit_begin(&self, _channel: &mut Channel, digit: char) -> AsteriskResult<()> {
+    async fn send_digit_begin(&self, _channel: &mut Channel, _digit: char) -> AsteriskResult<()> {
         // DAHDI generates DTMF tones on hardware.
-        debug!(digit = %digit, "DAHDI: DTMF begin (stub)");
+        // REVIEW-M3 MINOR-1: never log the digit value (PIN material).
+        debug!("DAHDI: DTMF begin (stub)");
         Ok(())
     }
 
     async fn send_digit_end(
         &self,
         _channel: &mut Channel,
-        digit: char,
+        _digit: char,
         _duration: u32,
     ) -> AsteriskResult<()> {
-        debug!(digit = %digit, "DAHDI: DTMF end (stub)");
+        debug!("DAHDI: DTMF end (stub)");
         Ok(())
     }
 }

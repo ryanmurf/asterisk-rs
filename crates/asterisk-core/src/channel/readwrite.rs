@@ -103,7 +103,10 @@ fn process_read_frame(channel: &mut Channel, mut frame: Frame) -> AsteriskResult
         Frame::Null => {
             // Check DTMF emulation tick on null frames.
             if let Some((digit, dur)) = channel.dtmf_state.check_emulation_tick() {
-                tracing::debug!(digit = %digit, duration = dur, "DTMF end emulated");
+                // REVIEW-M3 MINOR-1: never log the digit value -- entered
+                // digits are PIN material (log that a digit happened, not
+                // which).
+                tracing::debug!(duration = dur, "DTMF end emulated");
                 Frame::DtmfEnd {
                     digit,
                     duration_ms: dur,
@@ -116,7 +119,7 @@ fn process_read_frame(channel: &mut Channel, mut frame: Frame) -> AsteriskResult
             // Check DTMF emulation on voice frames too.
             if let Some((digit, dur)) = channel.dtmf_state.check_emulation_tick() {
                 // Replace the voice frame with the emulated DTMF end.
-                tracing::debug!(digit = %digit, duration = dur, "DTMF end emulated (from voice)");
+                tracing::debug!(duration = dur, "DTMF end emulated (from voice)");
                 Frame::DtmfEnd {
                     digit,
                     duration_ms: dur,
