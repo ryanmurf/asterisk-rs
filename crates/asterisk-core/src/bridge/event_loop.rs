@@ -110,9 +110,10 @@ pub fn process_frame(
                         FrameAction::Continue
                     }
                     DtmfFeatureResult::Collecting => {
+                        // REVIEW-M3 MINOR-1: never log the digit value (PIN
+                        // material).
                         debug!(
                             channel = channel_id,
-                            digit = %digit,
                             "Bridge event loop: collecting DTMF for feature detection"
                         );
                         // Still collecting digits -- do not pass through yet.

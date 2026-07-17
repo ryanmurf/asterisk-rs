@@ -915,14 +915,75 @@ assert_m3_zero_hit_audit() {
     done
     [[ -z "$hits" ]] || fail "secret audit found a test PIN in artifacts: $hits"
 
+    # PER-DIGIT LEAK AUDIT (REVIEW-M3 MINOR-1). The concatenated grep above is
+    # blind to a sink that emits the PIN one digit at a time (e.g. a
+    # `debug!(digit = %digit, ...)` tracing field per DTMF event): no artifact
+    # ever contains the 6-digit string, yet the full PIN is trivially
+    # reassembled by reading the digit fields in order. For every runtime
+    # artifact, extract each individually-logged DTMF digit value (shapes:
+    # `digit=5`, `digit='5'`, `digit: 5`, `Digit: 5`) preserving file order,
+    # and fail if either test PIN appears in that file's digit stream — raw,
+    # or with consecutive duplicates collapsed (a begin+end pair logs every
+    # digit twice: 112233… would defeat the raw check alone).
+    #
+    # Scope: every artifact EXCEPT freeswitch-artifacts/. The FreeSWITCH
+    # carrier simulator is the DTMF *sender* — `uuid_send_dtmf` hands it the
+    # digits, and its own debug log records each digit it transmits
+    # (`digit=7 ms=200 samples=1600`), exactly like the mounted secret input
+    # (which also lives outside the audited tree, see SecretInputArtifact).
+    # That send-side record is harness input, not a rustisk sink; proven
+    # empirically — the first run of this audit flagged it. The concatenated
+    # scan above still covers freeswitch-artifacts/ unreduced. If the live
+    # FreeSWITCH pod runs at a loglevel this chatty, its pod logs leak PIN
+    # digits FS-side — flagged separately; not fixable from this repo.
+    local perdigit_extractor="[Dd]igit *[=:] *['\"]?[0-9A-D#*]"
+    # ANSI SGR sequences must be stripped BEFORE matching: the tracing fmt
+    # writer colors its output even into the redirected log file, so a leaked
+    # field arrives as `digit\e[0m\e[2m=\e[0m7` — the literal bytes "digit="
+    # never appear and an unstripped grep stays silently GREEN on a real
+    # leak (caught by this audit's own red-proof run).
+    local strip_ansi='s/\x1b\[[0-9;]*m//g'
+    # Extractor positive control: prove the pattern still captures the log
+    # shapes — including the ANSI-colored tracing shape — before trusting a
+    # zero-hit result (guards against silent rot the same way the AMI
+    # positive control above guards the subscriber).
+    local perdigit_selftest
+    perdigit_selftest="$(printf "digit=4 a\nx digit: 2 b\nDigit: 4\ndigit='2'\n\x1b[3mdigit\x1b[0m\x1b[2m=\x1b[0m7\n" \
+        | sed -e "$strip_ansi" \
+        | grep -aoE "$perdigit_extractor" | grep -o '.$' | tr -d '\n')"
+    [[ "$perdigit_selftest" == "42427" ]] \
+        || fail "per-digit extractor self-test failed (positive control): got '$perdigit_selftest'"
+    local perdigit_stream
+    local perdigit_squeezed
+    local perdigit_hits=""
+    while IFS= read -r -d '' file; do
+        perdigit_stream="$(sed -e "$strip_ansi" "$file" \
+            | grep -aoE -- "$perdigit_extractor" \
+            | grep -o '.$' | tr -d '\n' || true)"
+        [[ -n "$perdigit_stream" ]] || continue
+        perdigit_squeezed="$(printf '%s' "$perdigit_stream" | tr -s '0-9A-D#*')"
+        for pattern in "$GRANTED_TEST_PIN" "$WRONG_TEST_PIN"; do
+            if [[ "$perdigit_stream" == *"$pattern"* \
+                || "$perdigit_squeezed" == *"$pattern"* ]]; then
+                perdigit_hits+="$file (per-digit stream: $perdigit_stream)"$'\n'
+            fi
+        done
+    done < <(find "$RUNTIME_DIR" -type f \
+        ! -path "$RUNTIME_DIR/freeswitch-artifacts/*" -print0)
+    [[ -z "$perdigit_hits" ]] \
+        || fail "per-digit audit reassembled a test PIN from individually-logged digits: $perdigit_hits"
+
     {
         printf 'GrantedPatternHits=0\n'
         printf 'RejectedPatternHits=0\n'
+        printf 'PerDigitPatternHits=0\n'
+        printf 'PerDigitExtractorSelfTest=%s\n' "$perdigit_selftest"
+        printf 'PerDigitScanExcluded=freeswitch-artifacts (carrier simulator send-side log; concatenated scan still covers it)\n'
         printf 'ArtifactClasses=rustisk-trace-log,freeswitch-logs,sip-only-pcap,ami-transcript,cdr-cel,audio,stats\n'
         printf 'AMIObserved=Newexten,VarSet,PINGATESTATUS\n'
         printf 'SecretInputArtifact=false (mounted input lived outside artifact tree)\n'
     } >"$RUNTIME_DIR/m3-zero-hit-proof.txt"
-    printf 'ZERO_HIT_SECRET_AUDIT: PASS (both test patterns; every runtime artifact; AMI live)\n'
+    printf 'ZERO_HIT_SECRET_AUDIT: PASS (both test patterns, concatenated + per-digit; every runtime artifact; AMI live)\n'
 }
 
 run_outbound_listen_only_case() {

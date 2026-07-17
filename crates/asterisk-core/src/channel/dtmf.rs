@@ -89,7 +89,8 @@ impl DtmfState {
     /// should be suppressed (turned into a null frame by the caller).
     pub fn on_begin(&mut self, digit: char) -> bool {
         if self.should_suppress_begin() {
-            tracing::debug!(digit = %digit, "DTMF begin suppressed (gap/emulation)");
+            // REVIEW-M3 MINOR-1: never log the digit value (PIN material).
+            tracing::debug!("DTMF begin suppressed (gap/emulation)");
             return false;
         }
         self.in_dtmf = true;
