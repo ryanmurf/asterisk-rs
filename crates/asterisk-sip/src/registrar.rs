@@ -134,6 +134,13 @@ impl Registrar {
             .unwrap_or_default()
     }
 
+    /// Total number of contact bindings across every AoR. Used as a soak
+    /// baseline: a REGISTER that binds and later expires/unregisters must
+    /// return this to its pre-test value (no leaked registration state).
+    pub fn total_bindings(&self) -> usize {
+        self.contacts.read().values().map(|v| v.len()).sum()
+    }
+
     /// The single best live contact URI to route a new call to for an AoR:
     /// the most-recently-refreshed non-expired binding. Returns `None` when
     /// the AoR has no live registration, so callers can fall back to a

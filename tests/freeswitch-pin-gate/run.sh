@@ -244,6 +244,47 @@ core_status_response() {
     fail "CoreStatus did not respond after retries"
 }
 
+# The full M5 soak baseline: EVERY registry the plan enumerates, in one string.
+# Core (5) + all four transaction maps (4) + RTP port allocations, registrar
+# bindings, and the #122 hangup/answer callback counts (4). Per M-g,
+# active_channel_count==0 proves nothing — this asserts each registry exactly.
+full_snapshot() {
+    local response value
+    local fields=(
+        CoreCurrentCalls SIPDriverChannels SIPCallIdMappings SIPCallStates SIPNotifyChannels
+        SIPInviteClientTransactions SIPInviteServerTransactions
+        SIPNonInviteClientTransactions SIPNonInviteServerTransactions
+        SIPRtpSessions SIPRegistrarBindings SIPHangupCallbacks SIPAnswerCallbacks
+    )
+    local values=()
+    response="$(core_status_response)"
+    for field in "${fields[@]}"; do
+        value="$(stat_value "$field" "$response")"
+        [[ "$value" =~ ^[0-9]+$ ]] || fail "$field missing from CoreStatus: $response"
+        values+=("$value")
+    done
+    (IFS=/; printf '%s\n' "${values[*]}")
+}
+
+# Poll the full registry snapshot until it returns to the exact baseline, or
+# fail after `timeout_ms`. The generous default lets the last calls' RFC 3261
+# absorption timers (Timer J/K/I/D) drain before the exact-baseline check.
+wait_for_full_baseline() {
+    local baseline="$1"
+    local timeout_ms="${2:-60000}"
+    local deadline snapshot
+    deadline=$(( $(now_ms) + timeout_ms ))
+    while (( $(now_ms) < deadline )); do
+        snapshot="$(full_snapshot)"
+        if [[ "$snapshot" == "$baseline" ]]; then
+            printf '%s\n' "$snapshot"
+            return 0
+        fi
+        sleep 0.5
+    done
+    fail "M5 soak did not return to exact baseline within $((timeout_ms/1000))s: baseline=$baseline actual=$(full_snapshot)"
+}
+
 set_impairment() {
     local mode="$1"
     local inject_forged="${2:-false}"
@@ -1362,6 +1403,35 @@ run_m4_bye_final_failure_cases() {
         "$(impairment_counter fs_to_rustisk_response_200_BYE)"
 }
 
+run_m5_soak_case() {
+    local count="${M5_SOAK_CALLS:-500}"
+    local baseline after uuid resp
+    printf '\nRunning M5 %d-call exact-baseline soak (every registry)...\n' "$count"
+    baseline="$(full_snapshot)"
+    printf 'M5_SOAK baseline (core/txn/rtp/registrar/hangup-cb/answer-cb): %s\n' "$baseline"
+
+    local i
+    for ((i = 1; i <= count; i++)); do
+        if ! resp="$(fs_cli "originate {ignore_early_media=true,origination_caller_id_number=15551230000,rtp_adv_audio_ip=$FS_CONTAINER_IP}sofia/internal/9500@$FS_HOST_IP:15060 &park()" 2>&1)"; then
+            fail "M5 soak originate #$i failed: $resp"
+        fi
+        uuid="$(grep -Eo '[0-9a-f]{8}-[0-9a-f-]{27}' <<<"$resp" | head -n1)"
+        [[ -n "$uuid" ]] || fail "M5 soak originate #$i produced no A-leg uuid: $resp"
+        wait_for_call_end "$uuid"
+        if (( i % 50 == 0 )); then
+            printf '  M5_SOAK progress: %d/%d complete; live=%s\n' "$i" "$count" "$(full_snapshot)"
+        fi
+    done
+
+    # EXACT baseline restoration across every registry — zero drift. A per-call
+    # leak of even one unit in any map (a stranded outbound register-store
+    # channel per M-g, a leaked RTP socket, an unfreed callback closure) shows
+    # as non-zero drift after `count` calls.
+    after="$(wait_for_full_baseline "$baseline")"
+    printf 'M5_SOAK: PASS (%d calls; exact baseline restored across all registries: %s)\n' \
+        "$count" "$after"
+}
+
 require_command cargo
 require_command docker
 require_command python3
@@ -1479,6 +1549,13 @@ if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m4-timer-b" ]]; then
     exit 0
 fi
 
+if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m5-soak" ]]; then
+    run_m5_soak_case
+    printf '\nPASS: isolated M5 exact-baseline soak.\n'
+    printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
+    exit 0
+fi
+
 start_m3_sink_receivers
 run_case 1 "$WRONG_TEST_PIN" REJECTED
 run_case 2 "$GRANTED_TEST_PIN" GRANTED
@@ -1505,6 +1582,7 @@ run_m4_forged_dialog_case
 run_m4_concurrency_case
 run_m4_abandon_200_race_case
 run_m4_bye_final_failure_cases
+run_m5_soak_case
 
 assert_m3_zero_hit_audit
 printf '\nPASS: real FreeSWITCH SIP/RTP gate completed PIN, M1, M2, and M4 impairment acceptance.\n'

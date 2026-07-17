@@ -461,6 +461,25 @@ fn handle_core_status(
                 .unwrap_or(0)
                 .to_string(),
         )
+        .with_header(
+            "SIPRtpSessions",
+            sip_counts.map(|counts| counts.rtp_sessions).unwrap_or(0).to_string(),
+        )
+        .with_header(
+            "SIPRegistrarBindings",
+            sip_counts
+                .map(|counts| counts.registrar_bindings)
+                .unwrap_or(0)
+                .to_string(),
+        )
+        .with_header(
+            "SIPHangupCallbacks",
+            sip_counts.map(|counts| counts.hangup_callbacks).unwrap_or(0).to_string(),
+        )
+        .with_header(
+            "SIPAnswerCallbacks",
+            sip_counts.map(|counts| counts.answer_callbacks).unwrap_or(0).to_string(),
+        )
         .with_header("CoreStartupSecs", uptime_secs.to_string())
 }
 
@@ -2642,6 +2661,10 @@ mod tests {
             "SIPInviteServerTransactions",
             "SIPNonInviteClientTransactions",
             "SIPNonInviteServerTransactions",
+            "SIPRtpSessions",
+            "SIPRegistrarBindings",
+            "SIPHangupCallbacks",
+            "SIPAnswerCallbacks",
         ] {
             assert!(
                 resp.headers.get(field).is_some_and(|value| value.parse::<usize>().is_ok()),
