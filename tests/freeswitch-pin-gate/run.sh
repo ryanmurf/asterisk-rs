@@ -867,8 +867,17 @@ stop_m3_sink_receivers() {
     AMI_SUBSCRIBER_PID=""
     SIP_CAPTURE_PID=""
 
+    # POSITIVE CONTROL (load-bearing under AMI default-DENY, issues #126/#127).
+    # The zero-hit PIN audit only proves something if the subscriber is actually
+    # RECEIVING events. With the AMI read default now DENY, an account without an
+    # explicit `read=` would receive NOTHING and the audit would FALSELY PASS
+    # (no PIN seen because no events seen). The [harness] account is granted
+    # `read = all`; these four assertions require it to have observed benign,
+    # non-secret control events (a PinGate Newexten and a PINGATESTATUS VarSet),
+    # proving the subscriber is live and its read grant is effective. If the
+    # grant were dropped, the subscriber would go silent and these greps fail.
     grep -q 'Event: Newexten' "$RUNTIME_DIR/m3-ami-transcript.txt" \
-        || fail "AMI subscriber saw no Newexten events"
+        || fail "AMI subscriber saw no Newexten events (read grant silenced? subscriber-sees-nothing false pass)"
     grep -q 'Application: PinGate' "$RUNTIME_DIR/m3-ami-transcript.txt" \
         || fail "AMI subscriber did not observe PinGate Newexten"
     grep -q 'Event: VarSet' "$RUNTIME_DIR/m3-ami-transcript.txt" \
@@ -877,7 +886,7 @@ stop_m3_sink_receivers() {
         || fail "AMI subscriber did not observe the non-secret gate status"
     grep -Eq 'SIPOnlyPackets=[1-9][0-9]*' "$RUNTIME_DIR/m3-sip-capture-proof.txt" \
         || fail "SIP-only pcap captured no packets"
-    printf 'AMI_SUBSCRIBER: PASS (authenticated, default read perms, Newexten+VarSet observed)\n'
+    printf 'AMI_SUBSCRIBER: PASS (authenticated, explicit read=all, positive control: Newexten/PinGate + VarSet/PINGATESTATUS observed)\n'
     printf 'SIP_ONLY_CAPTURE: PASS (%s)\n' \
         "$(tr -d '\r\n' <"$RUNTIME_DIR/m3-sip-capture-proof.txt")"
 }

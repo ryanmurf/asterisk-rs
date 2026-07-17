@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Capture authenticated default-permission AMI events until a stop file exists."""
+"""Capture AMI events for the M3 zero-hit audit until a stop file exists.
+
+Logs in as the [harness] account, which is granted an explicit `read = all` in
+manager.conf. Under the AMI least-privilege default (DENY, issues #126/#127) an
+account without an explicit read grant would receive NOTHING; the harness's
+positive control (observing a benign PinGate Newexten + PINGATESTATUS VarSet)
+proves this subscriber is live and its read grant is effective, so audited
+silence cannot masquerade as a pass.
+"""
 
 import argparse
 import os

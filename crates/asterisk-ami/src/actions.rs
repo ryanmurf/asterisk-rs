@@ -19,6 +19,77 @@ use tracing::{debug, info, warn};
 /// Used by CoreStatus to report real uptime.
 static STARTUP_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// The authorization requirement for an AMI action.
+///
+/// This mirrors Asterisk's per-action `authority` field (`manager.c`): every
+/// action is classified once, in [`action_authority`], so the trust boundary is
+/// auditable in a single table rather than scattered across handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionAuthority {
+    /// Part of the login handshake; permitted before authentication.
+    Preauth,
+    /// Read-only status / list / show / session-control action. Any
+    /// authenticated session may run it, matching Asterisk (status reads are
+    /// not write-gated).
+    ReadOnly,
+    /// State-changing action. The session's `write_perm` MUST contain this
+    /// category or the action is refused with "Permission denied".
+    Write(EventCategory),
+}
+
+/// Classify an AMI action's authorization requirement by its lowercased name.
+///
+/// Returns `None` for a name that is not a recognized action. A recognized
+/// (registered) action MUST be classified here: the
+/// `test_every_registered_action_is_classified` drift test fails if any
+/// registered handler is missing from this table, so a newly added
+/// state-changing action can never silently inherit a read-only free pass —
+/// an unmapped dangerous action is a caught bug, not a default-allow.
+///
+/// The write categories mirror Asterisk's per-action authority:
+/// - `Command` (CLI execution) → `COMMAND`
+/// - `UpdateConfig` → `CONFIG`
+/// - `Originate` / `PJSIPNotify` / `PJSIPQualify` → `SYSTEM`
+///   (Asterisk lets `Originate` use `system` OR `call`; we require the stricter
+///   `SYSTEM` and document it.)
+/// - `Redirect` / `Hangup` / `Bridge` / `Park` / `SetVar` / `Atxfer` /
+///   `SendText` / `Queue*` / `ConfBridgeKick` / `ConfBridgeMute` → `CALL`
+pub fn action_authority(name_lower: &str) -> Option<ActionAuthority> {
+    use ActionAuthority::{Preauth, ReadOnly, Write};
+    let authority = match name_lower {
+        // Login handshake: allowed before authentication.
+        "login" | "challenge" => Preauth,
+
+        // COMMAND: the CLI execution surface.
+        "command" => Write(EventCategory::COMMAND),
+
+        // CONFIG: configuration writes.
+        "updateconfig" => Write(EventCategory::CONFIG),
+
+        // SYSTEM: origination and system-level signaling.
+        "originate" | "pjsipnotify" | "pjsipqualify" => Write(EventCategory::SYSTEM),
+
+        // CALL: call control, dialplan-variable writes, queue and conf-bridge ops.
+        "redirect" | "hangup" | "bridge" | "park" | "setvar" | "atxfer" | "sendtext"
+        | "queueadd" | "queueremove" | "queuepause" | "confbridgekick" | "confbridgemute" => {
+            Write(EventCategory::CALL)
+        }
+
+        // Read-only status / list / show / session-control actions: any
+        // authenticated session may run them (must not be over-gated).
+        "logoff" | "ping" | "events" | "corestatus" | "coresettings" | "coreshowchannels"
+        | "status" | "getconfig" | "getvar" | "listcategories" | "listcommands" | "rtpstats"
+        | "showdialplan" | "queuestatus" | "meetmelist" | "confbridgelist" | "waitfullybooted"
+        | "pjsipshowendpoints" | "pjsipshowendpoint" | "pjsipshowregistrationsinbound"
+        | "pjsipshowregistrationsoutbound" => ReadOnly,
+
+        // Unrecognized name: not a registered action. Falls through to the
+        // handler lookup, which returns "Invalid/unknown command".
+        _ => return None,
+    };
+    Some(authority)
+}
+
 /// Type alias for action handler functions.
 ///
 /// An action handler receives the action, a mutable reference to the session,
@@ -70,11 +141,31 @@ impl ActionRegistry {
         context: &ActionContext,
     ) -> AmiResponse {
         let name_lower = action.name.to_lowercase();
+        let authority = action_authority(&name_lower);
 
-        // Login is special: allowed before authentication
-        if name_lower != "login" && name_lower != "challenge" && !session.authenticated {
+        // Authentication gate: every action except the login handshake requires
+        // an authenticated session. (An unrecognized action — `authority` ==
+        // None — is also gated here so a pre-auth client cannot probe handlers.)
+        if authority != Some(ActionAuthority::Preauth) && !session.authenticated {
             return AmiResponse::error("Permission denied")
                 .with_action_id(action.action_id.clone());
+        }
+
+        // Per-action write-authority gate (issue #126), enforced AFTER the auth
+        // gate: a state-changing action requires the matching write category in
+        // the session's `write_perm`. Read-only and pre-auth actions are not
+        // write-gated. Registered actions are guaranteed to be classified (see
+        // `test_every_registered_action_is_classified`), so a registered
+        // state-changing action can never reach its handler without this check.
+        if let Some(ActionAuthority::Write(required)) = authority {
+            if !session.write_perm.contains(required) {
+                warn!(
+                    "AMI: session {} denied '{}' (missing write category 0x{:04x})",
+                    session.id, action.name, required.0
+                );
+                return AmiResponse::error("Permission denied")
+                    .with_action_id(action.action_id.clone());
+            }
         }
 
         let handler = {
@@ -2983,5 +3074,190 @@ mod tests {
         let resp = registry.dispatch(&action, &mut session, &ctx);
         assert!(!resp.success);
         assert!(resp.message.contains("Conference is required"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-action write-authority enforcement (#126) + default-DENY (#127)
+    //
+    // Decisive properties. Each is red-capable:
+    //   - Revert the `Some(ActionAuthority::Write(required))` gate in
+    //     `dispatch` (delete the write-permission check) and every "denied"
+    //     assertion below flips to allowed → these tests go RED.
+    //   - Widen `action_authority` (e.g. map a write action to `ReadOnly`) and
+    //     that action's gate disappears → RED.
+    // A "denied" action returns the gate's "Permission denied"; an "allowed"
+    // action instead reaches its handler and returns that handler's own
+    // argument-validation message (e.g. "Channel is required"), which proves it
+    // passed the gate rather than being refused.
+    // -----------------------------------------------------------------------
+
+    /// Authenticate a fresh session as a user with explicit read/write perms.
+    fn authed_session_with(
+        read_perm: EventCategory,
+        write_perm: EventCategory,
+    ) -> (AmiSession, mpsc::Receiver<String>) {
+        let (mut session, rx) = make_session();
+        let user = AmiUser::with_permissions("scoped", "secret", read_perm, write_perm);
+        session.authenticate(&user);
+        (session, rx)
+    }
+
+    fn dispatch_named(
+        registry: &ActionRegistry,
+        ctx: &ActionContext,
+        session: &mut AmiSession,
+        name: &str,
+    ) -> AmiResponse {
+        registry.dispatch(&AmiAction::new(name), session, ctx)
+    }
+
+    #[test]
+    fn test_authz_write_call_user_allows_call_denies_command_and_system() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // write=call only.
+        let (mut session, _rx) = authed_session_with(EventCategory::ALL, EventCategory::CALL);
+
+        // ALLOWED: a CALL action reaches its handler (arg-validation message,
+        // NOT "Permission denied").
+        let hangup = dispatch_named(&registry, &ctx, &mut session, "Hangup");
+        assert_eq!(hangup.message, "Channel is required", "CALL user must pass the CALL gate");
+
+        let setvar = dispatch_named(&registry, &ctx, &mut session, "SetVar");
+        assert_eq!(setvar.message, "Variable is required", "CALL user must pass the CALL gate");
+
+        // DENIED: Command needs COMMAND, Originate needs SYSTEM.
+        let command = dispatch_named(&registry, &ctx, &mut session, "Command");
+        assert!(!command.success);
+        assert_eq!(command.message, "Permission denied", "CALL user must be denied Command (COMMAND)");
+
+        let originate = dispatch_named(&registry, &ctx, &mut session, "Originate");
+        assert!(!originate.success);
+        assert_eq!(originate.message, "Permission denied", "CALL user must be denied Originate (SYSTEM)");
+
+        let update = dispatch_named(&registry, &ctx, &mut session, "UpdateConfig");
+        assert!(!update.success);
+        assert_eq!(update.message, "Permission denied", "CALL user must be denied UpdateConfig (CONFIG)");
+    }
+
+    #[test]
+    fn test_authz_write_system_user_allows_originate_denies_call_and_command() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // write=system only.
+        let (mut session, _rx) = authed_session_with(EventCategory::ALL, EventCategory::SYSTEM);
+
+        // ALLOWED: Originate maps to SYSTEM -> reaches handler.
+        let originate = dispatch_named(&registry, &ctx, &mut session, "Originate");
+        assert_eq!(originate.message, "Channel is required", "SYSTEM user must pass the Originate/SYSTEM gate");
+
+        // DENIED: a CALL action and Command.
+        let hangup = dispatch_named(&registry, &ctx, &mut session, "Hangup");
+        assert_eq!(hangup.message, "Permission denied", "SYSTEM user must be denied Hangup (CALL)");
+
+        let command = dispatch_named(&registry, &ctx, &mut session, "Command");
+        assert_eq!(command.message, "Permission denied", "SYSTEM user must be denied Command (COMMAND)");
+    }
+
+    #[test]
+    fn test_authz_empty_write_user_denied_all_state_changing_actions() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // write= (empty) -> NONE. This is the operator who wrote `write =`.
+        let (mut session, _rx) = authed_session_with(EventCategory::ALL, EventCategory::NONE);
+
+        for action in ["Originate", "Command", "UpdateConfig", "Hangup", "SetVar", "PJSIPNotify"] {
+            let resp = dispatch_named(&registry, &ctx, &mut session, action);
+            assert!(!resp.success, "{action} must be denied for a NONE-write user");
+            assert_eq!(resp.message, "Permission denied", "{action} must be write-denied");
+        }
+    }
+
+    #[test]
+    fn test_authz_default_deny_no_write_directive_is_not_default_all() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // A user built the way the manager.conf parser builds one with NO
+        // `write=` directive: default-DENY = NONE (proves not default-ALL).
+        let (mut session, _rx) = authed_session_with(EventCategory::NONE, EventCategory::NONE);
+
+        let command = dispatch_named(&registry, &ctx, &mut session, "Command");
+        assert_eq!(command.message, "Permission denied", "default-DENY user must not run Command");
+        let originate = dispatch_named(&registry, &ctx, &mut session, "Originate");
+        assert_eq!(originate.message, "Permission denied", "default-DENY user must not run Originate");
+    }
+
+    #[test]
+    fn test_authz_write_all_user_allowed_every_state_changing_action() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // write=all.
+        let (mut session, _rx) = authed_session_with(EventCategory::ALL, EventCategory::ALL);
+
+        // All reach their handlers (arg-validation messages), never "Permission denied".
+        let cases = [
+            ("Command", "Command is required"),
+            ("UpdateConfig", "SrcFilename is required"),
+            ("Originate", "Channel is required"),
+            ("Hangup", "Channel is required"),
+            ("SetVar", "Variable is required"),
+        ];
+        for (action, expected) in cases {
+            let resp = dispatch_named(&registry, &ctx, &mut session, action);
+            assert_eq!(resp.message, expected, "write=all must allow {action} to reach its handler");
+        }
+    }
+
+    #[test]
+    fn test_authz_readonly_actions_allowed_for_no_perm_user() {
+        let (ctx, _reg) = make_context();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+        // No read, no write — still must run read-only status actions (Asterisk
+        // does not write-gate status reads).
+        let (mut session, _rx) = authed_session_with(EventCategory::NONE, EventCategory::NONE);
+
+        let ping = dispatch_named(&registry, &ctx, &mut session, "Ping");
+        assert!(ping.success, "Ping must be allowed for any authenticated session");
+        assert!(ping.headers.contains_key("Ping"));
+
+        let channels = dispatch_named(&registry, &ctx, &mut session, "CoreShowChannels");
+        assert!(channels.success, "CoreShowChannels must be allowed for any authenticated session");
+    }
+
+    /// Drift guard (#126): EVERY registered action MUST be classified in
+    /// `action_authority`. If a new handler is registered without a
+    /// classification, `action_authority` returns `None` here and this test
+    /// fails — turning "forgot to classify a new dangerous action" into a
+    /// caught bug rather than a silent read-only free pass.
+    #[test]
+    fn test_every_registered_action_is_classified() {
+        let (_ctx, registry_arc) = make_context();
+        let registry = ActionRegistry::new(registry_arc);
+        for name in registry.list_actions() {
+            assert!(
+                action_authority(&name).is_some(),
+                "registered AMI action '{name}' is not classified in action_authority \
+                 (an unmapped action must never silently inherit a read-only free pass)"
+            );
+        }
+    }
+
+    /// Locks the action->category table so a reviewer sees the trust boundary
+    /// in one place and an accidental re-map (e.g. Command -> CALL) fails here.
+    #[test]
+    fn test_action_authority_table() {
+        use ActionAuthority::{Preauth, ReadOnly, Write};
+        assert_eq!(action_authority("login"), Some(Preauth));
+        assert_eq!(action_authority("challenge"), Some(Preauth));
+        assert_eq!(action_authority("command"), Some(Write(EventCategory::COMMAND)));
+        assert_eq!(action_authority("updateconfig"), Some(Write(EventCategory::CONFIG)));
+        assert_eq!(action_authority("originate"), Some(Write(EventCategory::SYSTEM)));
+        assert_eq!(action_authority("pjsipnotify"), Some(Write(EventCategory::SYSTEM)));
+        assert_eq!(action_authority("hangup"), Some(Write(EventCategory::CALL)));
+        assert_eq!(action_authority("setvar"), Some(Write(EventCategory::CALL)));
+        assert_eq!(action_authority("confbridgekick"), Some(Write(EventCategory::CALL)));
+        assert_eq!(action_authority("ping"), Some(ReadOnly));
+        assert_eq!(action_authority("coreshowchannels"), Some(ReadOnly));
+        assert_eq!(action_authority("nonexistentaction"), None);
     }
 }
