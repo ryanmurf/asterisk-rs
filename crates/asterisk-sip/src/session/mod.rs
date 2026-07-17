@@ -342,6 +342,15 @@ impl SipSession {
             value: contact,
         });
 
+        // RFC 3311 §5.1: advertise our supported methods (incl. UPDATE) in the
+        // initial 2xx Allow so peers know in-dialog UPDATE is supported. Absent
+        // this, a peer is told UPDATE is unsupported though the handler exists
+        // (M5 review MAJOR-3).
+        response.headers.push(SipHeader {
+            name: header_names::ALLOW.to_string(),
+            value: crate::event_handler::SUPPORTED_METHODS.to_string(),
+        });
+
         // Add To tag
         for h in &mut response.headers {
             if h.name.eq_ignore_ascii_case(header_names::TO) && !h.value.contains("tag=") {
@@ -366,6 +375,16 @@ impl SipSession {
         }
 
         Some(response)
+    }
+
+    /// Refresh the dialog's remote target (Contact) from an in-dialog
+    /// target-refresh request (re-INVITE / UPDATE), RFC 3261 §12.2. No-op if no
+    /// dialog is established yet. The remote *URI* (To) is left unchanged — only
+    /// the target (Request-URI for subsequent local requests) is refreshed.
+    pub fn update_remote_target(&mut self, contact_uri: &str) {
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.update_remote_target(contact_uri);
+        }
     }
 
     /// Build an ACK request.

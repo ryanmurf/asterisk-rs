@@ -118,6 +118,32 @@ fn update_request(
     SipMessage::parse(raw.as_bytes()).unwrap()
 }
 
+/// A no-SDP UPDATE carrying `Supported: timer` and an explicit `Session-Expires`
+/// value (e.g. `"1800;refresher=uac"`), for RFC 4028 refresher-policy tests.
+fn update_timer_request(
+    call_id: &str,
+    our_tag: &str,
+    caller_tag: &str,
+    contact_port: u16,
+    cseq: u32,
+    session_expires: &str,
+) -> SipMessage {
+    let raw = format!(
+        "UPDATE sip:asterisk@127.0.0.1 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:{contact_port};branch=z9hG4bK{call_id}upd{cseq}\r\n\
+         From: \"Caller\" <sip:caller@127.0.0.1>;tag={caller_tag}\r\n\
+         To: <sip:{EXTEN}@127.0.0.1>;tag={our_tag}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} UPDATE\r\n\
+         Contact: <sip:caller@127.0.0.1:{contact_port}>\r\n\
+         Supported: timer\r\n\
+         Session-Expires: {session_expires}\r\n\
+         Content-Length: 0\r\n\
+         \r\n"
+    );
+    SipMessage::parse(raw.as_bytes()).unwrap()
+}
+
 /// Send a burst of PCMU frames from `src` to `dest` and report whether any
 /// non-zero echoed payload comes back on `src` inside the budget.
 async fn echo_roundtrip(src: &UdpSocket, dest: SocketAddr, budget: Duration) -> bool {
@@ -219,6 +245,15 @@ async fn in_dialog_update_is_answered_and_renegotiates_media() {
         .expect("200 OK for INVITE");
     let our_tag = header_tag(&ok, "To");
 
+    // RFC 3311 §5.1 (M5 review MAJOR-3): the initial INVITE 200 must advertise
+    // UPDATE in Allow, otherwise peers are told UPDATE is unsupported though the
+    // handler exists.
+    let allow = ok.get_header("Allow").unwrap_or("");
+    assert!(
+        allow.to_ascii_uppercase().contains("UPDATE"),
+        "initial INVITE 200 Allow must advertise UPDATE, got {allow:?}"
+    );
+
     // Media flows to the original port A.
     assert!(
         echo_roundtrip(&rtp_a, {
@@ -245,7 +280,19 @@ async fn in_dialog_update_is_answered_and_renegotiates_media() {
         resp.body.trim().is_empty(),
         "a no-SDP UPDATE answer must not carry an SDP body"
     );
-    println!("[E2E] UPDATE (no SDP) answered 200 OK");
+    // RFC 4028 §9 (M5 review MAJOR-3): an UPDATE with a session interval but no
+    // explicit refresher must be answered with the UAC selected as refresher
+    // (responder-only policy) — never uas.
+    let se_default = resp.get_header("Session-Expires").unwrap_or("");
+    assert!(
+        se_default.contains("refresher=uac"),
+        "no-refresher UPDATE must be answered refresher=uac (responder-only), got {se_default:?}"
+    );
+    assert!(
+        !se_default.to_ascii_lowercase().contains("uas"),
+        "must never claim refresher=uas, got {se_default:?}"
+    );
+    println!("[E2E] UPDATE (no SDP, no refresher) answered 200 OK; refresher=uac selected");
 
     // ---- Phase 2: UPDATE with SDP moving RTP to a NEW port ----------------
     let rtp_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -301,4 +348,54 @@ async fn in_dialog_update_is_answered_and_renegotiates_media() {
          (media plane must have re-pointed to the new remote)"
     );
     println!("[E2E] UPDATE (SDP) answered 200 + SDP; media re-pointed to the new port");
+
+    // ---- Phase 3: RFC 4028 §9 explicit refresher policy (MAJOR-3) ---------
+    // Explicit refresher=uac MUST be honored (echoed uac), never overridden.
+    let upd_uac = update_timer_request(
+        call_id,
+        &our_tag,
+        caller_tag,
+        caller_sip_addr.port(),
+        4,
+        "1800;refresher=uac",
+    );
+    handler.handle_update(&upd_uac, caller_sip_addr).await;
+    let r_uac = recv_sip_status(&caller_sip, 200, Duration::from_secs(2))
+        .await
+        .expect("explicit refresher=uac UPDATE must be answered 200");
+    let se_uac = r_uac.get_header("Session-Expires").unwrap_or("");
+    assert!(
+        se_uac.contains("refresher=uac"),
+        "explicit refresher=uac must be honored (RFC 4028: UAS cannot override), got {se_uac:?}"
+    );
+    assert!(
+        !se_uac.to_ascii_lowercase().contains("uas"),
+        "explicit refresher=uac must never be flipped to uas, got {se_uac:?}"
+    );
+    println!("[E2E] UPDATE refresher=uac honored (not overridden to uas)");
+
+    // Explicit refresher=uas: we do NOT implement UAS-side refresh scheduling,
+    // so we must NOT claim that role (deferred to M7). The 200 must not assert
+    // refresher=uas.
+    let upd_uas = update_timer_request(
+        call_id,
+        &our_tag,
+        caller_tag,
+        caller_sip_addr.port(),
+        5,
+        "1800;refresher=uas",
+    );
+    handler.handle_update(&upd_uas, caller_sip_addr).await;
+    let r_uas = recv_sip_status(&caller_sip, 200, Duration::from_secs(2))
+        .await
+        .expect("refresher=uas UPDATE must still be answered 200");
+    let se_uas = r_uas.get_header("Session-Expires");
+    assert!(
+        se_uas
+            .map(|s| !s.to_ascii_lowercase().contains("uas"))
+            .unwrap_or(true),
+        "must not claim refresher=uas — UAS refresh scheduling is not implemented \
+         (deferred to M7); got Session-Expires {se_uas:?}"
+    );
+    println!("[E2E] UPDATE refresher=uas NOT claimed (honest responder; deferred to M7)");
 }

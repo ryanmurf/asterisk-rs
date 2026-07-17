@@ -2148,14 +2148,13 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
                                     } else if request.method()
                                         == Some(asterisk_sip::SipMethod::Options)
                                     {
-                                        if let Ok(mut ok_resp) = request.create_response(200, "OK")
+                                        // Advertise UPDATE in the OPTIONS Allow
+                                        // (RFC 3311 §5.2) via the shared builder,
+                                        // so the OPTIONS and initial-2xx Allow
+                                        // lists stay in lockstep (M5 MAJOR-3).
+                                        if let Some(ok_resp) =
+                                            asterisk_sip::event_handler::build_options_ok(&request)
                                         {
-                                            ok_resp.add_header(
-                                                "Allow",
-                                                "INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY",
-                                            );
-                                            ok_resp.add_header("Accept", "application/sdp");
-                                            ok_resp.add_header("Server", "Rustisk/0.1.0");
                                             let _ = sip_stack
                                                 .send_response(ok_resp, remote_addr)
                                                 .await;
