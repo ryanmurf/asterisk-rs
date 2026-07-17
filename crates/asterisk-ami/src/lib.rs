@@ -40,6 +40,7 @@ pub mod actions;
 pub mod events;
 pub mod auth;
 pub mod event_bus;
+pub mod rate_limit;
 
 pub use protocol::{AmiAction, AmiResponse, AmiEvent};
 pub use session::AmiSession;
