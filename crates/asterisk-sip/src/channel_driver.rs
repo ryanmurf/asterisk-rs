@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -47,6 +47,11 @@ struct SipChannelPrivate {
     remote_targets: Vec<SocketAddr>,
     /// Endpoint-filtered codecs used to create and validate this dialog's SDP.
     codecs: Vec<Codec>,
+    /// Media pump hold state. When a peer sends a hold re-INVITE
+    /// (`a=sendonly`/`a=inactive`/`c=0.0.0.0`), this is set so the media pump
+    /// forwards nothing to or from this leg (the far side hears silence);
+    /// un-hold clears it and media resumes.
+    held: AtomicBool,
 }
 
 impl fmt::Debug for SipChannelPrivate {
@@ -258,6 +263,7 @@ impl SipChannelDriver {
             request_uri: String::new(),
             remote_targets: vec![remote_addr],
             codecs,
+            held: AtomicBool::new(false),
         });
         self.channels.write().insert(channel_name.to_string(), priv_data);
         let unique_id = asterisk_core::channel_store::find_by_name(channel_name)
@@ -433,6 +439,28 @@ impl SipChannelDriver {
         Ok(())
     }
 
+    /// Set the media pump hold state for a channel. `true` pauses the pump so
+    /// no media crosses this leg in either direction (the far side hears
+    /// silence); `false` resumes it. Returns whether the channel existed.
+    pub fn set_channel_hold(&self, channel_name: &str, held: bool) -> bool {
+        match self.channels.read().get(channel_name) {
+            Some(priv_data) => {
+                priv_data.held.store(held, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the channel's media pump is currently paused for hold.
+    pub fn channel_is_held(&self, channel_name: &str) -> bool {
+        self.channels
+            .read()
+            .get(channel_name)
+            .map(|p| p.held.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
     #[cfg(test)]
     async fn channel_rtp_remote_addr(&self, channel_name: &str) -> Option<SocketAddr> {
         let priv_data = self.get_private(channel_name)?;
@@ -588,6 +616,7 @@ impl ChannelDriver for SipChannelDriver {
             request_uri,
             remote_targets,
             codecs: channel_codecs,
+            held: AtomicBool::new(false),
         });
 
         self.channels.write().insert(channel_name.clone(), priv_data);
@@ -766,6 +795,16 @@ impl ChannelDriver for SipChannelDriver {
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
 
+        // On hold, forward nothing: yield a Null frame (which the bridge pump
+        // drops) after a short poll, instead of reading the socket. This pauses
+        // the src->dst direction so the far side hears silence; un-hold clears
+        // the flag and the next read resumes real media. Polling (rather than
+        // blocking on the socket) lets un-hold take effect promptly.
+        if priv_data.held.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return Ok(Frame::Null);
+        }
+
         // Clone the session handle and release the lock before blocking on
         // the socket, so concurrent write_frame calls are never starved by
         // a reader waiting for inbound media.
@@ -784,6 +823,12 @@ impl ChannelDriver for SipChannelDriver {
         let priv_data = self
             .get_private(&channel.name)
             .ok_or_else(|| AsteriskError::NotFound(channel.name.clone()))?;
+
+        // On hold, drop outbound media so this leg receives silence (pauses the
+        // dst->src direction). Symmetric with the read_frame gate above.
+        if priv_data.held.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
         let rtp = priv_data
             .rtp
