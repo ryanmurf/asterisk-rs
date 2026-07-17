@@ -26,6 +26,20 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=cutover_lib.sh
 source "${HERE}/cutover_lib.sh"
 
+# Fail-safe: `set -euo pipefail` aborts mid-sequence if STOP_OLD/WAIT/START_NEW
+# fails, which would otherwise leave the blanket handover drop STUCK ON (phone
+# outage until an operator clears it). This EXIT trap idempotently clears any
+# lingering handover drop on EVERY exit path — failure or success — so a failed
+# apply fails CLOSED (SIP retransmits) without leaving the port blocked. It
+# preserves the original exit code. handover_drop_off is a no-op if the drop is
+# already off (the success path clears it before this trap runs).
+_apply_on_exit() {
+  local rc=$?
+  handover_drop_off 2>/dev/null || true
+  exit "${rc}"
+}
+trap _apply_on_exit EXIT
+
 : "${STOP_OLD_CMD:?}" ; : "${START_NEW_CMD:?}"
 : "${WAIT_RELEASED_CMD:=true}" ; : "${WAIT_BOUND_CMD:=true}"
 
