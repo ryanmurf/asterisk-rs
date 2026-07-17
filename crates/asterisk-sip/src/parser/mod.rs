@@ -790,7 +790,16 @@ pub fn parse_message(text: &str) -> Result<SipMessage, ParseError> {
             )));
         }
         if cl > 0 && body.len() >= cl {
-            body[..cl].to_string()
+            // `cl` is a byte count taken from the wire and may fall in the
+            // middle of a multi-byte UTF-8 sequence. `body` is a validated
+            // `&str`, so slicing it on a non-char-boundary index panics
+            // ("byte index N is not a char boundary") — a remotely triggerable
+            // crash. Only truncate on a real char boundary; otherwise keep the
+            // full (already length-bounded) body rather than aborting.
+            match body.get(..cl) {
+                Some(truncated) => truncated.to_string(),
+                None => body.to_string(),
+            }
         } else {
             body.to_string()
         }
@@ -1290,5 +1299,49 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(via_param(via, "received"), Some(Some("198.51.100.7")));
         assert_eq!(via_param(via, "rport"), Some(Some("5062")));
         assert_eq!(via_param(via, "branch"), Some(Some("z9hG4bKopt")));
+    }
+
+    /// Regression: a `Content-Length` that lands in the middle of a multi-byte
+    /// UTF-8 character in the body must NOT panic (`body[..cl]` used to abort
+    /// with "byte index N is not a char boundary"). One malformed unauthenticated
+    /// datagram would otherwise take down the whole SIP receive loop. See the
+    /// GitHub issue for the DoS analysis.
+    #[test]
+    fn test_content_length_mid_utf8_char_does_not_panic() {
+        // Body is "é" = 0xC3 0xA9 (2 bytes). Content-Length: 1 points into the
+        // middle of that character.
+        let raw = "MESSAGE sip:x@h SIP/2.0\r\n\
+Via: SIP/2.0/UDP h;branch=z9hG4bK1\r\n\
+Call-ID: cl-mid-char\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 1\r\n\
+\r\n\
+é";
+        // Must return a parsed message, not panic.
+        let parsed = SipMessage::parse(raw.as_bytes())
+            .expect("mid-character Content-Length must parse, not panic");
+        assert_eq!(parsed.method(), Some(SipMethod::Message));
+        // The body is preserved intact (falls back to the full body because the
+        // requested truncation point is not a char boundary).
+        assert_eq!(parsed.body, "é");
+    }
+
+    /// A `Content-Length` that DOES land on a char boundary still truncates the
+    /// body as before (guards against the fix over-correcting).
+    #[test]
+    fn test_content_length_char_boundary_truncates() {
+        // Body "ab" with Content-Length: 1 truncates to "a" (byte 1 is a valid
+        // boundary since 'a' is single-byte).
+        let raw = "MESSAGE sip:x@h SIP/2.0\r\n\
+Via: SIP/2.0/UDP h;branch=z9hG4bK2\r\n\
+Call-ID: cl-boundary\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 1\r\n\
+\r\n\
+ab";
+        let parsed = SipMessage::parse(raw.as_bytes()).expect("must parse");
+        assert_eq!(parsed.body, "a");
     }
 }
