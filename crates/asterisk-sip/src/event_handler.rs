@@ -2132,7 +2132,15 @@ fn extract_user_from_header(header: &str) -> Option<String> {
     // Try to find a SIP URI in angle brackets first
     let uri_str = if let Some(start) = header.find('<') {
         if let Some(end) = header.find('>') {
-            &header[start + 1..end]
+            // '>' before '<' yields start > end; slicing the reversed range
+            // `header[start + 1..end]` panics ("byte range starts at N but
+            // ends at M"), a remotely triggerable crash on a malformed
+            // From/To header. Only slice when the brackets are ordered.
+            if start < end {
+                &header[start + 1..end]
+            } else {
+                header
+            }
         } else {
             header
         }
@@ -2476,6 +2484,24 @@ mod tests {
     fn test_extract_user_no_at() {
         let from = "<sip:5551234>";
         assert_eq!(extract_user_from_header(from), Some("5551234".to_string()));
+    }
+
+    /// Regression: a From/To header where '>' precedes '<' must NOT panic.
+    /// `header[start + 1..end]` used to abort with "byte range starts at N but
+    /// ends at M" on the reversed range — a remote DoS, since this runs on the
+    /// From/To of every incoming request in the main SIP event loop.
+    #[test]
+    fn test_extract_user_from_header_reversed_brackets_does_not_panic() {
+        // '>' at index 0, '<' at index 6: reversed range if sliced blindly.
+        assert_eq!(
+            extract_user_from_header(">sip:x<"),
+            Some(">sip:x<".to_string())
+        );
+        // Well-formed brackets still extract the user part.
+        assert_eq!(
+            extract_user_from_header(r#""Alice" <sip:alice@atlanta.example.com>"#),
+            Some("alice".to_string())
+        );
     }
 
     #[test]
