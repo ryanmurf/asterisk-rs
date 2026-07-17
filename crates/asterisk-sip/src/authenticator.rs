@@ -345,7 +345,13 @@ impl OutboundAuthenticator {
         // Clone the original request and add the Authorization header.
         let mut new_request = original_request.clone();
 
-        // Increment CSeq.
+        // Increment CSeq and mint a FRESH top Via branch. The credentialed retry
+        // is a NEW client transaction (RFC 3261 §8.1.3.5 / §17.1.1.1): reusing
+        // the challenged request's branch collides with the transaction the 401/
+        // 407 just terminated, so the retry must carry both an incremented CSeq
+        // and a new branch. Reusing the branch was the M-f defect.
+        let new_branch = generate_branch();
+        let mut via_rewritten = false;
         for h in &mut new_request.headers {
             if h.name.eq_ignore_ascii_case(header_names::CSEQ) {
                 if let Some((num_str, method_str)) = h.value.split_once(' ') {
@@ -353,6 +359,11 @@ impl OutboundAuthenticator {
                         h.value = format!("{} {}", num + 1, method_str);
                     }
                 }
+            } else if !via_rewritten && h.name.eq_ignore_ascii_case(header_names::VIA) {
+                // Only the topmost (our own) Via carries this transaction's
+                // branch; a downstream proxy's Via must be left untouched.
+                h.value = replace_via_branch(&h.value, &new_branch);
+                via_rewritten = true;
             }
         }
 
@@ -491,6 +502,45 @@ fn generate_nonce() -> String {
     let mut rng = rand::thread_rng();
     let bytes: [u8; 16] = rng.gen();
     hex::encode(bytes)
+}
+
+/// Generate a fresh RFC 3261 magic-cookie Via branch for a new client
+/// transaction.
+fn generate_branch() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 8] = rng.gen();
+    format!("z9hG4bK{}", hex::encode(bytes))
+}
+
+/// Replace the `branch=` parameter of a Via header value with `new_branch`,
+/// preserving every other Via parameter (`rport`, `received`, transport, host).
+/// If the Via carries no `branch=` param, one is appended.
+fn replace_via_branch(via_value: &str, new_branch: &str) -> String {
+    let mut out = Vec::new();
+    let mut replaced = false;
+    for (idx, part) in via_value.split(';').enumerate() {
+        if idx == 0 {
+            // The sent-protocol + sent-by (e.g. "SIP/2.0/UDP host:port").
+            out.push(part.trim_end().to_string());
+            continue;
+        }
+        let trimmed = part.trim();
+        if trimmed.eq_ignore_ascii_case("branch")
+            || trimmed
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("branch"))
+        {
+            out.push(format!("branch={}", new_branch));
+            replaced = true;
+        } else {
+            out.push(trimmed.to_string());
+        }
+    }
+    if !replaced {
+        out.push(format!("branch={}", new_branch));
+    }
+    out.join(";")
 }
 
 // ---------------------------------------------------------------------------
@@ -827,5 +877,38 @@ mod tests {
         // CSeq should be incremented.
         let cseq = authed_request.cseq().unwrap();
         assert!(cseq.starts_with("2 "));
+
+        // The credentialed retry MUST be a new client transaction: its top Via
+        // branch differs from the challenged request's branch (M-f: reusing the
+        // branch collides with the just-completed 401 transaction). Before the
+        // fix this branch was `z9hG4bK123`, identical to the original.
+        let orig_branch = extract_branch(&request.get_header(header_names::VIA).unwrap());
+        let retry_branch = extract_branch(&authed_request.get_header(header_names::VIA).unwrap());
+        assert_eq!(orig_branch.as_deref(), Some("z9hG4bK123"));
+        assert!(
+            retry_branch.is_some() && retry_branch.as_deref() != Some("z9hG4bK123"),
+            "retry Via must carry a FRESH branch, got {:?}",
+            retry_branch
+        );
+    }
+
+    fn extract_branch(via: &str) -> Option<String> {
+        via.split(';')
+            .find_map(|p| p.trim().strip_prefix("branch="))
+            .map(|b| b.trim().to_string())
+    }
+
+    /// `replace_via_branch` swaps only the branch and preserves the sent-by and
+    /// every other Via parameter (rport, transport).
+    #[test]
+    fn test_replace_via_branch_preserves_other_params() {
+        let via = "SIP/2.0/UDP 10.0.0.9:5060;rport;branch=z9hG4bKold";
+        let out = replace_via_branch(via, "z9hG4bKnew");
+        assert!(out.starts_with("SIP/2.0/UDP 10.0.0.9:5060"));
+        assert!(out.contains(";rport"));
+        assert!(out.contains(";branch=z9hG4bKnew"));
+        assert!(!out.contains("z9hG4bKold"));
+        // Exactly one branch param.
+        assert_eq!(out.matches("branch=").count(), 1);
     }
 }

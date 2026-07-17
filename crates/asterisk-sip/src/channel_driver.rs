@@ -585,6 +585,24 @@ impl ChannelDriver for SipChannelDriver {
         // Create SIP session
         let mut sip_session = SipSession::new_outbound(self.local_addr, remote_addr);
 
+        // Resolve the endpoint's OUTBOUND digest credential so a carrier's
+        // 401/407 on this origination INVITE can be answered (M-f). Absent
+        // `outbound_auth`, a challenge is a hard failure (no credentials to
+        // present). `dest` is the endpoint name here (a raw URI dial has no
+        // endpoint and therefore no outbound auth).
+        sip_session.outbound_auth = endpoint_config
+            .as_ref()
+            .and_then(|config| {
+                let ep = config.find_endpoint(dest)?;
+                let auth_name = ep.outbound_auth.as_deref()?;
+                let auth = config.find_auth(auth_name)?;
+                Some(crate::authenticator::AuthCredentials::new(
+                    &auth.username,
+                    &auth.password,
+                    auth.realm.as_deref().unwrap_or(""),
+                ))
+            });
+
         // Create SDP offer with a concrete, routable connection address
         // (external_media_address / routed interface — never 0.0.0.0,
         // issue #56). Fail closed (CP3): if a configured external_media_address
@@ -710,6 +728,8 @@ impl ChannelDriver for SipChannelDriver {
                 local_tag: session.local_tag.clone(),
                 early_media: session.early_media.clone(),
                 early_media_config: session.early_media_config.clone(),
+                outbound_auth: session.outbound_auth.clone(),
+                auth_attempts: session.auth_attempts,
             };
             handler.register_outbound_session(
                 &session.call_id,

@@ -141,6 +141,14 @@ pub struct SipSession {
     pub early_media: EarlyMediaState,
     /// Early media configuration.
     pub early_media_config: EarlyMediaConfig,
+    /// Outbound digest credentials to answer a 401/407 challenge on this
+    /// origination leg (M-f). `None` for legs whose endpoint has no
+    /// `outbound_auth`, in which case a challenge is a hard failure (no retry).
+    pub outbound_auth: Option<crate::authenticator::AuthCredentials>,
+    /// How many credentialed INVITE retries this leg has already sent. Bounds
+    /// the challenge/response loop so a carrier that keeps challenging cannot
+    /// drive an unbounded resend (M-f "bounded retries").
+    pub auth_attempts: u32,
 }
 
 impl SipSession {
@@ -166,6 +174,8 @@ impl SipSession {
             local_tag,
             early_media: EarlyMediaState::default(),
             early_media_config: EarlyMediaConfig::default(),
+            outbound_auth: None,
+            auth_attempts: 0,
         }
     }
 
@@ -203,6 +213,8 @@ impl SipSession {
             local_tag,
             early_media: EarlyMediaState::default(),
             early_media_config: EarlyMediaConfig::default(),
+            outbound_auth: None,
+            auth_attempts: 0,
         })
     }
 
@@ -418,20 +430,94 @@ impl SipSession {
         Some(SocketAddr::new(ip, uri.port.unwrap_or(5060)))
     }
 
-    /// Build an ACK request.
+    /// The CSeq **number** of the INVITE this session sent (1 on the first
+    /// attempt, higher after a credentialed challenge retry). ACK and CANCEL
+    /// must carry this exact number, not a hardcoded 1 (M-f).
+    pub fn invite_cseq_num(&self) -> u32 {
+        self.invite
+            .as_ref()
+            .and_then(|inv| inv.cseq())
+            .and_then(|cs| cs.split_whitespace().next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+
+    /// Resolve loose/strict routing for an in-dialog request (RFC 3261
+    /// §12.2.1.1). Returns `(request_uri, route_header_values)`.
+    ///
+    /// With a Record-Route-established route set of loose-routing proxies
+    /// (`;lr`, as Chime / AWS Voice Connector and every RFC 3261 proxy emit),
+    /// the Request-URI is the peer's Contact (remote target) and each route set
+    /// entry becomes a `Route` header. A strict (non-`lr`) first hop is handled
+    /// per spec by promoting it to the Request-URI and appending the target.
+    fn in_dialog_routing(&self) -> Option<(String, Vec<String>)> {
+        let dialog = self.dialog.as_ref()?;
+        let target = if dialog.remote_target.is_empty() {
+            dialog.remote_uri.clone()
+        } else {
+            dialog.remote_target.clone()
+        };
+        if target.is_empty() {
+            return None;
+        }
+        if dialog.route_set.is_empty() {
+            return Some((target, Vec::new()));
+        }
+        let first_uri = extract_uri(&dialog.route_set[0]).unwrap_or_else(|| dialog.route_set[0].clone());
+        let loose = SipUri::parse(&first_uri)
+            .map(|u| u.parameters.contains_key("lr"))
+            .unwrap_or(true);
+        if loose {
+            Some((target, dialog.route_set.clone()))
+        } else {
+            let mut routes: Vec<String> = dialog.route_set[1..].to_vec();
+            routes.push(format!("<{}>", target));
+            Some((first_uri, routes))
+        }
+    }
+
+    /// The physical next hop (IP:port) an in-dialog request must be sent to:
+    /// the first route-set hop when a route set exists (loose routing keeps the
+    /// datagram on the proxy path), otherwise the resolved remote target
+    /// (Contact). `None` when neither is an addressable IP literal.
+    pub fn in_dialog_next_hop(&self) -> Option<SocketAddr> {
+        let dialog = self.dialog.as_ref()?;
+        let hop = if let Some(first) = dialog.route_set.first() {
+            extract_uri(first)?
+        } else if !dialog.remote_target.is_empty() {
+            dialog.remote_target.clone()
+        } else {
+            return None;
+        };
+        let uri = SipUri::parse(&hop).ok()?;
+        let ip: std::net::IpAddr = uri.host.parse().ok()?;
+        Some(SocketAddr::new(ip, uri.port.unwrap_or(5060)))
+    }
+
+    /// Build the 2xx ACK request (RFC 3261 §13.2.2.4). This is a NEW transaction
+    /// (fresh branch), sent through the dialog route set to the remote target
+    /// (Contact), carrying the INVITE's actual CSeq number — NOT a hardcoded 1.
     pub fn build_ack(&self) -> Option<SipMessage> {
         let invite = self.invite.as_ref()?;
         let dialog = self.dialog.as_ref()?;
 
-        let uri = match &invite.start_line {
-            StartLine::Request(r) => r.uri.clone(),
-            _ => return None,
-        };
+        let (request_uri, route_headers) = self.in_dialog_routing().or_else(|| {
+            // No dialog target available — fall back to the original R-URI so an
+            // ACK is still emitted rather than silently dropped.
+            match &invite.start_line {
+                StartLine::Request(r) => Some((r.uri.to_string(), Vec::new())),
+                _ => None,
+            }
+        })?;
+        let uri = SipUri::parse(&request_uri).ok().or_else(|| match &invite.start_line {
+            StartLine::Request(r) => Some(r.uri.clone()),
+            _ => None,
+        })?;
 
         let branch = format!("z9hG4bK{}", &Uuid::new_v4().to_string().replace('-', "")[..16]);
         let sig = self.signaling_hostport();
 
-        let headers = vec![
+        let mut headers = vec![
             SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: invite.from_header()?.to_string() },
@@ -440,9 +526,12 @@ impl SipSession {
                 value: format!("{};tag={}", invite.to_header()?.split(";tag=").next().unwrap_or(""), dialog.remote_tag),
             },
             SipHeader { name: header_names::CALL_ID.to_string(), value: self.call_id.clone() },
-            SipHeader { name: header_names::CSEQ.to_string(), value: "1 ACK".to_string() },
-            SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: "0".to_string() },
+            SipHeader { name: header_names::CSEQ.to_string(), value: format!("{} ACK", self.invite_cseq_num()) },
         ];
+        for route in &route_headers {
+            headers.push(SipHeader { name: header_names::ROUTE.to_string(), value: route.clone() });
+        }
+        headers.push(SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: "0".to_string() });
 
         Some(SipMessage {
             start_line: StartLine::Request(RequestLine {
@@ -455,13 +544,42 @@ impl SipSession {
         })
     }
 
+    /// Build a credentialed retry INVITE answering a 401/407 `challenge`, and
+    /// adopt it as this session's current INVITE so a subsequent ACK/CANCEL
+    /// derives the right (incremented) CSeq and the response matches. Returns
+    /// `None` when the leg has no `outbound_auth` or the challenge is
+    /// unparseable. The retry is a NEW client transaction: fresh branch,
+    /// incremented CSeq, `Authorization`/`Proxy-Authorization` attached.
+    pub fn build_auth_retry_invite(&mut self, challenge: &SipMessage) -> Option<SipMessage> {
+        let creds = self.outbound_auth.clone()?;
+        let invite = self.invite.as_ref()?;
+        let retry = crate::authenticator::OutboundAuthenticator::create_authenticated_request(
+            invite,
+            challenge,
+            std::slice::from_ref(&creds),
+        )?;
+        self.auth_attempts += 1;
+        // Adopt the retry as the live INVITE: its CSeq/branch now govern the
+        // transaction, and build_ack/build_cancel read CSeq from here.
+        self.invite = Some(retry.clone());
+        self.state = SessionState::Initiated;
+        Some(retry)
+    }
+
     /// Build a BYE request.
     pub fn build_bye(&mut self) -> Option<SipMessage> {
         let sig = self.signaling_hostport();
+        // Loose/strict routing per the established route set (Contact + Route),
+        // so an in-dialog BYE follows the same proxy path as the ACK instead of
+        // being sent blind to the original request-URI. Fall back to the
+        // symmetric INVITE source tuple when no addressable target exists.
+        let (request_uri, route_headers) = self
+            .in_dialog_routing()
+            .unwrap_or_else(|| (format!("sip:{}", self.remote_addr), Vec::new()));
         let dialog = self.dialog.as_mut()?;
         let cseq = dialog.next_cseq();
 
-        let uri = SipUri::parse(&dialog.remote_target).ok().unwrap_or_else(|| SipUri {
+        let uri = SipUri::parse(&request_uri).ok().unwrap_or_else(|| SipUri {
             scheme: "sip".to_string(),
             user: None,
             password: None,
@@ -477,15 +595,18 @@ impl SipSession {
 
         let to_value = format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag);
 
-        let headers = vec![
+        let mut headers = vec![
             SipHeader { name: header_names::VIA.to_string(), value: format!("SIP/2.0/UDP {};branch={}", sig, branch) },
             SipHeader { name: header_names::MAX_FORWARDS.to_string(), value: "70".to_string() },
             SipHeader { name: header_names::FROM.to_string(), value: from_value },
             SipHeader { name: header_names::TO.to_string(), value: to_value },
             SipHeader { name: header_names::CALL_ID.to_string(), value: self.call_id.clone() },
             SipHeader { name: header_names::CSEQ.to_string(), value: format!("{} BYE", cseq) },
-            SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: "0".to_string() },
         ];
+        for route in &route_headers {
+            headers.push(SipHeader { name: header_names::ROUTE.to_string(), value: route.clone() });
+        }
+        headers.push(SipHeader { name: header_names::CONTENT_LENGTH.to_string(), value: "0".to_string() });
 
         self.state = SessionState::Terminating;
 
@@ -536,8 +657,10 @@ impl SipSession {
                 value: self.call_id.clone(),
             },
             SipHeader {
+                // CANCEL matches the INVITE's CSeq NUMBER (RFC 3261 §9.1),
+                // method CANCEL — not a hardcoded 1 (M-f).
                 name: header_names::CSEQ.to_string(),
-                value: "1 CANCEL".to_string(),
+                value: format!("{} CANCEL", self.invite_cseq_num()),
             },
             SipHeader {
                 name: header_names::CONTENT_LENGTH.to_string(),
@@ -662,5 +785,173 @@ impl SipSession {
         if let Some(ref mut dialog) = self.dialog {
             dialog.terminate();
         }
+    }
+}
+
+#[cfg(test)]
+mod cp1_tests {
+    use super::*;
+    use crate::authenticator::AuthCredentials;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn cseq_of(msg: &SipMessage) -> String {
+        msg.cseq().unwrap().to_string()
+    }
+
+    fn branch_of(msg: &SipMessage) -> String {
+        msg.get_header(header_names::VIA)
+            .unwrap()
+            .split(';')
+            .find_map(|p| p.trim().strip_prefix("branch="))
+            .unwrap()
+            .to_string()
+    }
+
+    fn request_uri(msg: &SipMessage) -> String {
+        match &msg.start_line {
+            StartLine::Request(r) => r.uri.to_string(),
+            _ => panic!("not a request"),
+        }
+    }
+
+    /// Drive an outbound session through: INVITE(1) -> 401 challenge ->
+    /// credentialed retry INVITE(2) -> 200 with a CHANGED Contact and a
+    /// Record-Route. Returns the established session.
+    fn established_after_challenge() -> SipSession {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.outbound_auth = Some(AuthCredentials::new("carrier", "s3cr3t", ""));
+        let invite = s.build_invite_with_uri("sip:+15550001111@10.0.0.2:5060", "sip:+15550001111@10.0.0.2");
+        // The carrier's 401 challenge (To gains a tag).
+        let challenge = SipMessage::parse(
+            format!(
+                "SIP/2.0 401 Unauthorized\r\n\
+                 {via}\r\n\
+                 {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=carrier401\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 WWW-Authenticate: Digest realm=\"carrier\", nonce=\"abc123\", algorithm=MD5, qop=\"auth\"\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = format!("Via: {}", invite.get_header(header_names::VIA).unwrap()),
+                from = format!("From: {}", invite.from_header().unwrap()),
+                cid = s.call_id,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let retry = s.build_auth_retry_invite(&challenge).expect("retry built");
+        // Sanity: the retry is a new transaction with an incremented CSeq.
+        assert_eq!(cseq_of(&retry), "2 INVITE");
+        assert_ne!(branch_of(&retry), branch_of(&invite));
+        assert!(retry.get_header(header_names::AUTHORIZATION).is_some());
+        assert_eq!(s.auth_attempts, 1);
+
+        // The carrier answers the RETRY with a 200 carrying a CHANGED Contact
+        // (10.0.0.9:5070, not the request-URI 10.0.0.2) and a Record-Route.
+        let ok = SipMessage::parse(
+            format!(
+                "SIP/2.0 200 OK\r\n\
+                 {via}\r\n\
+                 {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=carrier200\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: 2 INVITE\r\n\
+                 Record-Route: <sip:10.0.0.9:5070;lr>\r\n\
+                 Contact: <sip:carrier@10.0.0.9:5070>\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = format!("Via: {}", retry.get_header(header_names::VIA).unwrap()),
+                from = format!("From: {}", retry.from_header().unwrap()),
+                cid = s.call_id,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        s.on_response(&ok);
+        assert_eq!(s.state, SessionState::Established);
+        s
+    }
+
+    #[test]
+    fn twoxx_ack_targets_route_set_and_contact_with_real_cseq() {
+        let s = established_after_challenge();
+        let ack = s.build_ack().unwrap();
+        // Real CSeq: the RETRY INVITE was CSeq 2, so the ACK is "2 ACK". A
+        // hardcoded "1 ACK" (the M-f defect) would fail this.
+        assert_eq!(cseq_of(&ack), "2 ACK");
+        // Loose routing: Request-URI is the refreshed Contact (10.0.0.9:5070),
+        // NOT the original request-URI (10.0.0.2).
+        assert_eq!(request_uri(&ack), "sip:carrier@10.0.0.9:5070");
+        assert!(request_uri(&ack).contains("10.0.0.9:5070"));
+        // The Record-Route became a Route header.
+        let routes: Vec<_> = ack.get_headers(header_names::ROUTE);
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].contains("10.0.0.9:5070"));
+        // Physical next hop is the route-set first hop.
+        assert_eq!(s.in_dialog_next_hop(), Some(addr("10.0.0.9:5070")));
+    }
+
+    #[test]
+    fn bye_follows_route_set_to_target_with_incremented_cseq() {
+        let mut s = established_after_challenge();
+        let bye = s.build_bye().unwrap();
+        // In-dialog CSeq advances beyond the INVITE's 2.
+        assert_eq!(cseq_of(&bye), "3 BYE");
+        // Request-URI is the Contact target, Route header carries the route set.
+        assert_eq!(request_uri(&bye), "sip:carrier@10.0.0.9:5070");
+        let routes = bye.get_headers(header_names::ROUTE);
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].contains("10.0.0.9:5070"));
+    }
+
+    #[test]
+    fn cancel_carries_invite_real_cseq_and_branch() {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        s.outbound_auth = Some(AuthCredentials::new("carrier", "s3cr3t", ""));
+        let invite = s.build_invite_with_uri("sip:+15550001111@10.0.0.2:5060", "sip:+15550001111@10.0.0.2");
+        let challenge = SipMessage::parse(
+            format!(
+                "SIP/2.0 401 Unauthorized\r\n\
+                 Via: {via}\r\n\
+                 From: {from}\r\n\
+                 To: <sip:+15550001111@10.0.0.2>;tag=c1\r\n\
+                 Call-ID: {cid}\r\n\
+                 CSeq: 1 INVITE\r\n\
+                 WWW-Authenticate: Digest realm=\"carrier\", nonce=\"n\", algorithm=MD5, qop=\"auth\"\r\n\
+                 Content-Length: 0\r\n\r\n",
+                via = invite.get_header(header_names::VIA).unwrap(),
+                from = invite.from_header().unwrap(),
+                cid = s.call_id,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let retry = s.build_auth_retry_invite(&challenge).unwrap();
+        // CANCEL matches the LIVE (retried) INVITE: same branch + same CSeq
+        // number (2), method CANCEL. A hardcoded "1 CANCEL" is the M-f defect.
+        let cancel = s.build_cancel().unwrap();
+        assert_eq!(cseq_of(&cancel), "2 CANCEL");
+        assert_eq!(branch_of(&cancel), branch_of(&retry));
+    }
+
+    #[test]
+    fn no_retry_without_outbound_auth() {
+        let mut s = SipSession::new_outbound(addr("10.0.0.1:5060"), addr("10.0.0.2:5060"));
+        let _invite = s.build_invite_with_uri("sip:x@10.0.0.2:5060", "sip:x@10.0.0.2");
+        let challenge = SipMessage::parse(
+            b"SIP/2.0 401 Unauthorized\r\n\
+              Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKx\r\n\
+              From: <sip:asterisk@10.0.0.1:5060>;tag=t\r\n\
+              To: <sip:x@10.0.0.2>;tag=c\r\n\
+              Call-ID: cid\r\n\
+              CSeq: 1 INVITE\r\n\
+              WWW-Authenticate: Digest realm=\"carrier\", nonce=\"n\", algorithm=MD5\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(s.build_auth_retry_invite(&challenge).is_none());
+        assert_eq!(s.auth_attempts, 0);
     }
 }

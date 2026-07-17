@@ -111,6 +111,13 @@ struct CallState {
     _rtp_reservation: Option<RtpSession>,
 }
 
+/// Maximum credentialed INVITE retries in response to a 401/407 on an
+/// origination leg. RFC 3261 gives a UAC one retry per challenge; a well-behaved
+/// carrier challenges once (nonce), so a single retry suffices. Bounding it
+/// stops a misbehaving or malicious carrier that keeps re-challenging (or issues
+/// `stale`) from driving an unbounded INVITE loop (M-f "bounded retries").
+const MAX_OUTBOUND_AUTH_ATTEMPTS: u32 = 2;
+
 #[cfg(not(test))]
 const ABANDONED_SIGNALING_GRACE: std::time::Duration =
     crate::transaction::timers::TIMER_B;
@@ -276,6 +283,21 @@ impl SipEventHandler {
     ) -> Result<(), crate::transport::TransportError> {
         match self.stack.get() {
             Some(stack) => stack.send_request(request, remote_addr).await.map(|_| ()),
+            None => self.transport.send(&request, remote_addr).await,
+        }
+    }
+
+    /// Send an INVITE (e.g. a credentialed challenge retry) as a NEW INVITE
+    /// client transaction when the stack is attached, so it gets its own
+    /// retransmission/timeout timers. Handler-only tests fall back to the raw
+    /// transport.
+    async fn send_client_invite(
+        &self,
+        request: SipMessage,
+        remote_addr: SocketAddr,
+    ) -> Result<(), crate::transport::TransportError> {
+        match self.stack.get() {
+            Some(stack) => stack.send_invite(request, remote_addr).await.map(|_| ()),
             None => self.transport.send(&request, remote_addr).await,
         }
     }
@@ -1378,6 +1400,56 @@ impl SipEventHandler {
         if !cs.session.is_outbound {
             return;
         }
+
+        // Wire-correct digest challenge handling on origination (M-f). The
+        // transaction layer has ALREADY sent the RFC 3261 §17.1.1.3 non-2xx ACK
+        // for this 401/407 (stack::process_response, reusing the INVITE branch +
+        // real CSeq) before this event was delivered. What is missing — and is
+        // added here — is answering the challenge with a NEW INVITE transaction
+        // (fresh branch, incremented CSeq, Authorization). Do it BEFORE
+        // on_response so the challenge is not treated as a generic failure.
+        if matches!(status_code, 401 | 407) {
+            // Bounded credentialed retry.
+            let may_retry = cs.session.outbound_auth.is_some()
+                && cs.session.auth_attempts < MAX_OUTBOUND_AUTH_ATTEMPTS;
+            if may_retry {
+                if let Some(retry) = cs.session.build_auth_retry_invite(response) {
+                    if let Err(error) = self.send_client_invite(retry, remote_addr).await {
+                        warn!(call_id = %call_id, %error,
+                            "Failed to send credentialed INVITE retry");
+                    } else {
+                        info!(call_id = %call_id, status_code,
+                            attempt = cs.session.auth_attempts,
+                            "Sent credentialed INVITE retry for auth challenge");
+                        return;
+                    }
+                } else {
+                    warn!(call_id = %call_id,
+                        "Auth challenge unanswerable (no/invalid outbound credentials)");
+                }
+            } else if cs.session.outbound_auth.is_some() {
+                warn!(call_id = %call_id,
+                    "Auth challenge retry bound reached; failing origination");
+            } else {
+                debug!(call_id = %call_id,
+                    "Auth challenge received but endpoint has no outbound_auth; failing");
+            }
+
+            // No (further) retry: fail the leg like any other final failure.
+            let abandoned = cs.abandoned;
+            drop(cs);
+            if abandoned {
+                self.release_outbound_leg(&channel_name);
+                return;
+            }
+            if let Some(channel) = store::find_by_name(&channel_name) {
+                let mut ch = channel.lock();
+                ch.hangup_cause = HangupCause::NormalClearing;
+                ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+            }
+            return;
+        }
+
         cs.session.on_response(response);
 
         if let Some(to_tag) = response.get_header("To")
@@ -1387,8 +1459,15 @@ impl SipEventHandler {
         }
 
         if (200..300).contains(&status_code) {
+            // ACK — and every subsequent in-dialog request (BYE) — is routed
+            // through the dialog route set (Record-Route) to the refreshed
+            // Contact / first route hop, NOT the original request-URI (M-f).
+            // Refresh the stored next hop so the abandoned-crossing BYE and the
+            // reject-answer BYE below use the same proxy path.
+            let ack_hop = cs.session.in_dialog_next_hop().unwrap_or(remote_addr);
+            cs.next_hop = ack_hop;
             if let Some(ack) = cs.session.build_ack() {
-                if let Err(error) = self.transport.send(&ack, remote_addr).await {
+                if let Err(error) = self.transport.send(&ack, ack_hop).await {
                     warn!(call_id = %call_id, %error, "Failed to send ACK");
                 } else {
                     debug!(call_id = %call_id, "Sent ACK for 200 OK");
@@ -1429,7 +1508,7 @@ impl SipEventHandler {
                     warn!(call_id = %call_id, channel = %channel_name, %error,
                         "Rejecting unusable outbound SDP answer");
                     if let Some(bye) = cs.session.build_bye() {
-                        if let Err(send_error) = self.send_client_request(bye, remote_addr).await {
+                        if let Err(send_error) = self.send_client_request(bye, cs.next_hop).await {
                             warn!(call_id = %call_id,
                                 "Failed to send BYE after rejecting answer: {}", send_error);
                         }

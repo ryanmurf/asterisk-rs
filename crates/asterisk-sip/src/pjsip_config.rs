@@ -69,8 +69,13 @@ pub struct EndpointConfig {
     pub disallow: Vec<String>,
     /// Codecs to allow.
     pub allow: Vec<String>,
-    /// Reference to an auth section name.
+    /// Reference to an auth section name (INBOUND: the credential this endpoint
+    /// is challenged against).
     pub auth: Option<String>,
+    /// Reference to an auth section used for OUTBOUND digest — the credential
+    /// rustisk presents when this endpoint (a carrier/trunk) challenges our
+    /// origination INVITE with 401/407 (M-f). Distinct from `auth`.
+    pub outbound_auth: Option<String>,
     /// Reference to an AOR section name.
     pub aors: Option<String>,
     /// Whether to allow direct media (RTP bypass).
@@ -119,6 +124,7 @@ impl Default for EndpointConfig {
             disallow: Vec::new(),
             allow: Vec::new(),
             auth: None,
+            outbound_auth: None,
             aors: None,
             direct_media: true,
             rtp_symmetric: false,
@@ -575,6 +581,9 @@ fn parse_endpoint(cat: &asterisk_config::Category) -> EndpointConfig {
 
     if let Some(v) = get_last_variable(cat,"auth") {
         ep.auth = Some(v.to_string());
+    }
+    if let Some(v) = get_last_variable(cat,"outbound_auth") {
+        ep.outbound_auth = Some(v.to_string());
     }
     if let Some(v) = get_last_variable(cat,"aors") {
         ep.aors = Some(v.to_string());
