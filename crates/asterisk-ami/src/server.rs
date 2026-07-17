@@ -534,6 +534,12 @@ impl AmiServer {
         self.sessions.len()
     }
 
+    /// Get the number of connected but not-yet-authenticated sessions
+    /// (the `auth_limit` counter, issue #130).
+    pub fn unauthenticated_session_count(&self) -> usize {
+        self.unauth_sessions.load(Ordering::SeqCst)
+    }
+
     /// Get the number of authenticated sessions.
     pub fn authenticated_session_count(&self) -> usize {
         self.sessions
@@ -747,6 +753,57 @@ mod tests {
         assert!(
             closed,
             "an unauthenticated response-flooder must still be dropped at the auth deadline"
+        );
+    }
+
+    /// #130 auth_timeout regression (adversarial review SECURITY-1), isolated:
+    /// the deadline releases the pre-auth slot even for a flooder that NEVER
+    /// reads. This targets the pre-auth SEND-deadline specifically: without it,
+    /// the dispatch send parks on the full channel and the task never returns to
+    /// the read `select!`, so the slot is held indefinitely. Neg-control: make
+    /// the pre-auth response send a plain `.await` → the slot is never released
+    /// while the client withholds reads → this times out → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auth_timeout_releases_slot_under_send_backpressure() {
+        let (server, addr) = spawn_test_server(AmiServerConfig {
+            auth_timeout: 1,
+            ..Default::default()
+        })
+        .await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_rd, mut wr) = stream.into_split();
+        // Flood pre-auth actions and NEVER read (keep _rd idle) so the server's
+        // dispatch send parks on the full channel.
+        let writer = tokio::spawn(async move {
+            let msg = b"Action: Ping\r\n\r\n";
+            while wr.write_all(msg).await.is_ok() {}
+        });
+
+        // Wait until the pre-auth slot is reserved.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.unauthenticated_session_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pre-auth slot should be reserved");
+
+        // The slot must be released at the deadline despite the client never
+        // reading its responses.
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while server.unauthenticated_session_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+        writer.abort();
+
+        assert!(
+            released,
+            "auth_timeout must release the pre-auth slot even for a never-reading flooder"
         );
     }
 
