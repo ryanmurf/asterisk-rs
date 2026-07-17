@@ -927,20 +927,23 @@ pub fn advertised_media_ip(
 ) -> Option<String> {
     let (external, local_net) = match crate::pjsip_config::get_global_pjsip_config() {
         Some(cfg) => {
-            // NAT config is transport-specific: use the transport whose bind
-            // covers `local` — exact ip+port, then exact ip, then a wildcard
-            // bind (which covers every interface). A transport bound to a
-            // DIFFERENT concrete address never donates its NAT config.
-            // (Dialogs don't yet carry their transport name; when they do,
-            // that binding should replace this bind-coverage lookup.)
-            let with_ext = |pred: &dyn Fn(&crate::pjsip_config::TransportConfig) -> bool| {
-                cfg.transports
-                    .iter()
-                    .find(|t| t.external_media_address.is_some() && pred(t))
-            };
-            let transport = with_ext(&|t| t.bind.ip() == local.ip() && t.bind.port() == local.port())
-                .or_else(|| with_ext(&|t| t.bind.ip() == local.ip()))
-                .or_else(|| with_ext(&|t| t.bind.ip().is_unspecified()));
+            // Select the transport whose bind COVERS `local` first — exact
+            // ip+port, then exact ip, then a wildcard bind — and only THEN read
+            // its NAT config. Selecting by bind coverage (not by "has an
+            // external address") stops a same-ip/wildcard transport that
+            // happens to set an external address from donating it to a covering
+            // transport that set none — which, with fail-closed resolution,
+            // would otherwise REJECT a normal call on the transport that has no
+            // external address (codex CP3 F2). A transport bound to a DIFFERENT
+            // concrete address never covers `local`. (Dialogs don't yet carry
+            // their transport name; when they do, that binding should replace
+            // this bind-coverage lookup.)
+            let transport = cfg
+                .transports
+                .iter()
+                .find(|t| t.bind == local)
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip() == local.ip()))
+                .or_else(|| cfg.transports.iter().find(|t| t.bind.ip().is_unspecified()));
             match transport {
                 Some(t) => (t.external_media_address.clone(), t.local_net.clone()),
                 None => (None, Vec::new()),
@@ -1102,15 +1105,30 @@ fn advertised_media_ip_with(
 ///   so the caller rejects the offer/answer rather than advertising an
 ///   unresolved FQDN or a leaky internal address.
 ///
-/// The lookup is blocking, matching the existing blocking route-selection in
-/// [`advertised_media_ip_with`]. Async resolution with TTL caching is a separate
-/// hardening (M1/M-l) and out of this fail-closed scope.
+/// The FQDN lookup is bounded by a hard timeout so a slow NSS/DNS resolver
+/// cannot stall the serialized SIP control path indefinitely — on timeout it
+/// fails closed (`None`), the safe posture. Full async resolution with TTL
+/// caching is the separate M1/M-l DNS hardening; this only bounds the blocking
+/// call and preserves fail-closed.
 fn resolve_external_media_addr(ext: &str, remote: std::net::IpAddr) -> Option<String> {
     if let Ok(ip) = ext.parse::<std::net::IpAddr>() {
         return Some(ip.to_string());
     }
-    use std::net::ToSocketAddrs;
-    let resolved: Vec<std::net::SocketAddr> = (ext, 0u16).to_socket_addrs().ok()?.collect();
+    // Resolve on a scratch thread with a bounded receive: a slow lookup times
+    // out to None rather than blocking every other call on this stack.
+    let host = ext.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<std::net::SocketAddr>>(1);
+    std::thread::spawn(move || {
+        use std::net::ToSocketAddrs;
+        let resolved = (host.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|it| it.collect())
+            .unwrap_or_default();
+        let _ = tx.send(resolved);
+    });
+    let resolved = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .ok()?;
     let pick = resolved
         .iter()
         .find(|sa| sa.is_ipv4() == remote.is_ipv4())
@@ -1223,6 +1241,44 @@ mod tests {
         let ip = advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062"));
         assert_eq!(ip, Some("127.0.0.1".to_string()));
         // Reset the process-global config for other tests in this binary.
+        set_global_pjsip_config(PjsipConfig::default());
+    }
+
+    /// codex CP3 F2: a call on a transport with NO external_media_address must
+    /// get the normal (internal/routed) address — a same-ip transport whose
+    /// external FQDN is unresolvable must NOT be selected and fail the call
+    /// closed. Covering-transport-first selection prevents that cross-donation.
+    #[test]
+    fn test_media_ip_covering_transport_without_external_not_rejected() {
+        use crate::pjsip_config::{set_global_pjsip_config, PjsipConfig, TransportConfig};
+        let base = |bind: &str, ext: Option<&str>| TransportConfig {
+            name: format!("t-{bind}"),
+            protocol: "udp".to_string(),
+            bind: bind.parse().unwrap(),
+            external_media_address: ext.map(|s| s.to_string()),
+            external_signaling_address: None,
+            external_signaling_port: None,
+            cert_file: None,
+            priv_key_file: None,
+            local_net: vec![],
+        };
+        let cfg = PjsipConfig {
+            transports: vec![
+                // The covering transport (exact ip 127.0.0.1) has NO external.
+                base("127.0.0.1:5060", None),
+                // A same-ip transport has an UNRESOLVABLE external FQDN.
+                base("127.0.0.1:5070", Some("no-such-host.invalid")),
+            ],
+            ..Default::default()
+        };
+        set_global_pjsip_config(cfg);
+        // The call is on 127.0.0.1:5060 (no external) -> must resolve to the
+        // internal address, NOT fail closed by inheriting the :5070 FQDN.
+        assert_eq!(
+            advertised_media_ip(sa("127.0.0.1:5060"), sa("127.0.0.1:5062")),
+            Some("127.0.0.1".to_string()),
+            "a call on the no-external transport must not be rejected via a sibling's unresolvable FQDN"
+        );
         set_global_pjsip_config(PjsipConfig::default());
     }
 

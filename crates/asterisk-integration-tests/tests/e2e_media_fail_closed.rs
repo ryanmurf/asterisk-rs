@@ -41,8 +41,14 @@ use tokio::net::UdpSocket;
 
 const EXTEN: &str = "100";
 
-/// Wait for a specific SIP status code, skipping provisional 1xx.
-async fn recv_sip_status(sock: &UdpSocket, status: u16, budget: Duration) -> Option<SipMessage> {
+/// Wait for a specific SIP status code for `call_id`, skipping others (so a
+/// retransmitted response from an earlier call cannot be mistaken for this one).
+async fn recv_sip_status(
+    sock: &UdpSocket,
+    status: u16,
+    call_id: &str,
+    budget: Duration,
+) -> Option<SipMessage> {
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 4096];
     while Instant::now() < deadline {
@@ -50,7 +56,7 @@ async fn recv_sip_status(sock: &UdpSocket, status: u16, budget: Duration) -> Opt
             tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await
         {
             if let Ok(msg) = SipMessage::parse(&buf[..len]) {
-                if msg.status_code() == Some(status) {
+                if msg.status_code() == Some(status) && msg.call_id() == Some(call_id) {
                     return Some(msg);
                 }
             }
@@ -59,8 +65,10 @@ async fn recv_sip_status(sock: &UdpSocket, status: u16, budget: Duration) -> Opt
     None
 }
 
-/// Collect every distinct status code seen within the budget.
-async fn collect_status_codes(sock: &UdpSocket, budget: Duration) -> Vec<u16> {
+/// Collect every distinct status code seen for `call_id` within the budget
+/// (responses for other Call-IDs are ignored, so an earlier call's retransmit
+/// cannot contaminate this assertion).
+async fn collect_status_codes(sock: &UdpSocket, call_id: &str, budget: Duration) -> Vec<u16> {
     let deadline = Instant::now() + budget;
     let mut buf = [0u8; 4096];
     let mut seen = Vec::new();
@@ -69,6 +77,9 @@ async fn collect_status_codes(sock: &UdpSocket, budget: Duration) -> Vec<u16> {
             tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await
         {
             if let Ok(msg) = SipMessage::parse(&buf[..len]) {
+                if msg.call_id() != Some(call_id) {
+                    continue;
+                }
                 if let Some(code) = msg.status_code() {
                     if !seen.contains(&code) {
                         seen.push(code);
@@ -179,7 +190,7 @@ async fn external_media_fqdn_fails_closed() {
         Some("media-fc-ok"),
         "positive control: an IP-literal external_media_address must be accepted"
     );
-    let ok = recv_sip_status(&caller, 200, Duration::from_secs(5))
+    let ok = recv_sip_status(&caller, 200, "media-fc-ok", Duration::from_secs(5))
         .await
         .expect("positive control: IP-literal external must be answered 200");
     let answer = SessionDescription::parse(&ok.body).expect("200 must carry SDP");
@@ -197,7 +208,7 @@ async fn external_media_fqdn_fails_closed() {
         accepted, None,
         "fail-closed: an unresolvable external_media_address FQDN must NOT be accepted"
     );
-    let codes = collect_status_codes(&caller, Duration::from_secs(3)).await;
+    let codes = collect_status_codes(&caller, "media-fc-fail", Duration::from_secs(3)).await;
     assert!(
         !codes.contains(&200),
         "fail-closed: rustisk must NEVER send a 200 (with a bogus/internal c=) for an \
