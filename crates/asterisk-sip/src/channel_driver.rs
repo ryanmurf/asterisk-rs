@@ -374,6 +374,65 @@ impl SipChannelDriver {
         Ok(())
     }
 
+    /// Apply an inbound in-dialog SDP **offer** (from a re-INVITE or an UPDATE)
+    /// to the driver-owned media session: re-point the RTP remote to the
+    /// offer's endpoint, re-install the negotiated voice payload type, and
+    /// (re)set the telephone-event payload type. This is the media-plane half
+    /// of a mid-call renegotiation — without it, an answered SDP is a
+    /// sent-claim only: the pump keeps sending to the old address and keeps
+    /// discarding the peer's new-codec datagrams as wrong-payload-type.
+    ///
+    /// Fail-closed on the channel's pinned G.711 policy: a non-PCMU/PCMA
+    /// negotiated type is rejected so the caller answers 488 rather than
+    /// silently mis-negotiating.
+    pub(crate) async fn apply_inbound_offer(
+        &self,
+        channel_name: &str,
+        offer: &crate::sdp::SessionDescription,
+    ) -> AsteriskResult<()> {
+        let priv_data = self
+            .get_private(channel_name)
+            .ok_or_else(|| AsteriskError::NotFound(channel_name.to_string()))?;
+
+        let payload_type =
+            crate::sdp_rtp::negotiated_audio_payload_type(offer, &priv_data.codecs)
+                .ok_or_else(|| {
+                    AsteriskError::InvalidArgument(
+                        "re-negotiation offer has no common audio codec".into(),
+                    )
+                })?;
+        if !matches!(payload_type, 0 | 8) {
+            return Err(AsteriskError::InvalidArgument(format!(
+                "re-negotiation offer selected non-G.711 payload type {payload_type}"
+            )));
+        }
+        let remote_addr = crate::sdp_rtp::remote_rtp_endpoint(offer).ok_or_else(|| {
+            AsteriskError::InvalidArgument(
+                "re-negotiation offer has no active IP audio endpoint".into(),
+            )
+        })?;
+
+        let rtp = priv_data
+            .rtp
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| AsteriskError::Internal("No RTP session".into()))?;
+        rtp.set_remote_addr(remote_addr);
+        rtp.set_payload_type(payload_type);
+
+        let dtmf = crate::sdp_rtp::negotiated_dtmf_payload_type(offer, &priv_data.codecs);
+        match dtmf {
+            Some(dtmf_payload_type) => rtp.set_dtmf_payload_type(dtmf_payload_type),
+            None => rtp.clear_dtmf_payload_type(),
+        }
+
+        debug!(channel = channel_name, %remote_addr, payload_type,
+            dtmf_payload_type = ?dtmf,
+            "Applied inbound re-negotiation offer to driver media session");
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn channel_rtp_remote_addr(&self, channel_name: &str) -> Option<SocketAddr> {
         let priv_data = self.get_private(channel_name)?;

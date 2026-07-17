@@ -1386,9 +1386,48 @@ impl SipEventHandler {
         }
     }
 
-    /// Validate UPDATE even though SDP renegotiation itself belongs to M5.
-    /// A valid request receives an explicit unsupported response so its
-    /// non-INVITE server transaction can complete instead of leaking.
+    /// Build an SDP answer to an in-dialog offer (re-INVITE / UPDATE). It
+    /// advertises the channel's REAL bound RTP port and a routable connection
+    /// address (never 0.0.0.0), with route/NAT selection targeting the offer's
+    /// media endpoint and falling back to the signaling source.
+    async fn renegotiation_answer(
+        &self,
+        channel_name: &str,
+        offer: &SessionDescription,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> SessionDescription {
+        let channel_codecs = self
+            .channel_driver
+            .get()
+            .and_then(|driver| driver.channel_codecs(channel_name))
+            .unwrap_or_else(|| self.supported_codecs.clone());
+        let media_port = match self.channel_driver.get() {
+            Some(driver) => driver
+                .channel_rtp_local_port(channel_name)
+                .await
+                .unwrap_or(10000),
+            None => 10000,
+        };
+        let media_peer = crate::sdp_rtp::remote_rtp_endpoint(offer).unwrap_or(remote_addr);
+        let local_ip = crate::sdp::advertised_media_ip(local_addr, media_peer);
+        SessionDescription::create_answer(offer, &local_ip, media_port, &channel_codecs)
+    }
+
+    /// Handle an in-dialog **UPDATE** (RFC 3311). Two shapes:
+    ///
+    /// * **With an SDP offer** — a mid-dialog media renegotiation. The offer is
+    ///   applied to the media plane (remote address + payload type re-installed,
+    ///   fail-closed on the pinned G.711 policy), the stored SDP is updated, and
+    ///   a 200 OK carrying the SDP answer is returned. Real renegotiation, not a
+    ///   sent-claim: the pump immediately sends to the new address and accepts
+    ///   the new payload type.
+    /// * **Without SDP** — a session-timer refresh / connected-line update. A
+    ///   200 OK is returned, echoing `Session-Expires;refresher=uas` when the
+    ///   peer armed a session timer.
+    ///
+    /// Previously this was silently answered `501 Not Implemented`, dropping any
+    /// mid-call media change or session refresh (`main.rs` UPDATE dispatch).
     pub async fn handle_update(&self, request: &SipMessage, remote_addr: SocketAddr) {
         if let Err(reason) = self
             .validate_in_dialog_request(request, remote_addr)
@@ -1397,8 +1436,111 @@ impl SipEventHandler {
             self.reject_in_dialog_request(request, remote_addr, reason).await;
             return;
         }
-        if let Ok(response) = request.create_response(501, "Not Implemented") {
-            let _ = self.send_server_response(&response, remote_addr).await;
+
+        let Some(call_id) = request.call_id().map(|c| c.to_string()) else {
+            return;
+        };
+        let cs_arc = {
+            let states = self.call_states.read();
+            states.get(&call_id).cloned()
+        };
+        let Some(cs_arc) = cs_arc else {
+            return;
+        };
+        let (channel_name, local_addr) = {
+            let cs = cs_arc.lock().await;
+            (cs.channel_name.clone(), cs.session.local_addr)
+        };
+
+        let carries_sdp = request
+            .get_header(crate::parser::header_names::CONTENT_TYPE)
+            .map(|ct| ct.to_ascii_lowercase().contains("application/sdp"))
+            .unwrap_or(false)
+            && !request.body.trim().is_empty();
+
+        if carries_sdp {
+            let Ok(offer) = SessionDescription::parse(&request.body) else {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    let _ = self.send_server_response(&resp, remote_addr).await;
+                }
+                warn!(call_id = %call_id, "Rejected UPDATE with unparseable SDP offer");
+                return;
+            };
+
+            // Fail-closed on the channel's pinned G.711 policy (mirrors the
+            // re-INVITE path). A non-PCMU/PCMA offer is answered 488 rather than
+            // silently mis-negotiated.
+            let channel_codecs = self
+                .channel_driver
+                .get()
+                .and_then(|driver| driver.channel_codecs(&channel_name))
+                .unwrap_or_else(|| self.supported_codecs.clone());
+            let negotiated =
+                crate::sdp_rtp::negotiated_audio_payload_type(&offer, &channel_codecs);
+            if !matches!(negotiated, Some(0 | 8)) {
+                if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                    let _ = self.send_server_response(&resp, remote_addr).await;
+                    warn!(call_id = %call_id, ?negotiated,
+                        "Rejected UPDATE outside the channel's pinned G.711 policy");
+                }
+                return;
+            }
+
+            // Apply the offer to the media plane BEFORE answering, so the pump
+            // is renegotiated the instant our 200 goes out.
+            if let Some(driver) = self.channel_driver.get() {
+                if let Err(error) = driver.apply_inbound_offer(&channel_name, &offer).await {
+                    warn!(call_id = %call_id, %error, "UPDATE media renegotiation failed");
+                    if let Ok(resp) = request.create_response(488, "Not Acceptable Here") {
+                        let _ = self.send_server_response(&resp, remote_addr).await;
+                    }
+                    return;
+                }
+            }
+
+            let answer = self
+                .renegotiation_answer(&channel_name, &offer, local_addr, remote_addr)
+                .await;
+            {
+                let mut cs = cs_arc.lock().await;
+                cs.session.remote_sdp = Some(offer);
+                cs.session.local_sdp = Some(answer.clone());
+            }
+
+            let Ok(mut ok) = request.create_response(200, "OK") else {
+                return;
+            };
+            ok.add_header("Contact", &format!("<sip:asterisk@{}>", local_addr));
+            let sdp_str = answer.to_string();
+            ok.add_header("Content-Type", "application/sdp");
+            ok.add_header("Content-Length", &sdp_str.len().to_string());
+            ok.body = sdp_str;
+            if let Err(e) = self.send_server_response(&ok, remote_addr).await {
+                warn!(call_id = %call_id, "Failed to send 200 OK for UPDATE: {}", e);
+            } else {
+                info!(call_id = %call_id, "Answered in-dialog UPDATE (media renegotiated)");
+            }
+        } else {
+            // Session-timer refresh / connected-line update: answer 200 and
+            // echo the session interval as the refresher when a timer was armed.
+            let Ok(mut ok) = request.create_response(200, "OK") else {
+                return;
+            };
+            ok.add_header("Contact", &format!("<sip:asterisk@{}>", local_addr));
+            if let Some(se) =
+                request.get_header(crate::parser::header_names::SESSION_EXPIRES)
+            {
+                let interval = se.split(';').next().unwrap_or(se).trim();
+                if !interval.is_empty() {
+                    ok.add_header("Session-Expires", &format!("{};refresher=uas", interval));
+                    ok.add_header("Require", "timer");
+                }
+            }
+            if let Err(e) = self.send_server_response(&ok, remote_addr).await {
+                warn!(call_id = %call_id, "Failed to send 200 OK for UPDATE refresh: {}", e);
+            } else {
+                info!(call_id = %call_id, "Answered in-dialog UPDATE (session refresh)");
+            }
         }
     }
 
