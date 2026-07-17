@@ -271,8 +271,12 @@ impl AmiServer {
         // that have NOT yet authenticated. Reserve a pre-auth slot up front;
         // refuse the connection if the cap is already reached. `fetch_add` +
         // rollback keeps this lock-free.
+        //
+        // 0-means-unlimited guard: `authlimit = 0` means "no cap" (mirroring
+        // the authtimeout=0 semantics). Without the `> 0` check, `prior >= 0`
+        // is always true and EVERY connection would be refused.
         let prior = unauth_sessions.fetch_add(1, Ordering::SeqCst);
-        if prior >= config.auth_limit {
+        if config.auth_limit > 0 && prior >= config.auth_limit {
             unauth_sessions.fetch_sub(1, Ordering::SeqCst);
             warn!(
                 "AMI: refusing connection from {} — unauthenticated session limit ({}) reached",
@@ -356,8 +360,20 @@ impl AmiServer {
         // authenticate. `sleep_until` on a fixed instant does NOT reset per
         // iteration; the `if !authed` guard disables the branch once the
         // session authenticates, so a logged-in session lives indefinitely.
-        let auth_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(config.auth_timeout);
+        //
+        // 0-means-disabled guard: `authtimeout = 0` is Asterisk's "no limit" —
+        // it must DISABLE the deadline. The naive math (`now + 0 = now`) would
+        // instead fire the deadline arm immediately and drop EVERY
+        // unauthenticated connection, breaking all logins. A disabled deadline
+        // is represented as a far-future instant (~30 years, tokio's own
+        // `far_future` idiom; much larger values can overflow `Instant` on some
+        // platforms) so BOTH `sleep_until` arms (read loop + pre-auth send
+        // below) stay inert without restructuring the enforcement.
+        let auth_deadline = if config.auth_timeout == 0 {
+            tokio::time::Instant::now() + Duration::from_secs(86400 * 365 * 30)
+        } else {
+            tokio::time::Instant::now() + Duration::from_secs(config.auth_timeout)
+        };
 
         // Bounded reader (issue #110): read the AMI stream as CRLF-framed lines,
         // capping each line at MAX_AMI_LINE_BYTES and the accumulated
@@ -712,6 +728,10 @@ mod tests {
     /// pre-auth response send a plain `.await` (drop the `sleep_until` arm), OR
     /// revert the teardown to `let _ = writer_handle.await;` → the connection is
     /// never closed → `expect_closed` times out → RED.
+    ///
+    /// NOTE: this is the WEAKER witness of the send-deadline pair — the
+    /// load-bearing red-capable witness is
+    /// `test_auth_timeout_releases_slot_under_send_backpressure` (PR #144 review).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_auth_timeout_covers_response_send_backpressure() {
         let (_server, addr) = spawn_test_server(AmiServerConfig {
@@ -836,6 +856,74 @@ mod tests {
                 .is_ok_and(|s| s.contains("Pong")),
             "authenticated session must survive the auth deadline"
         );
+    }
+
+    /// 0-means-disabled (DECISIVE landmine test): `authtimeout = 0` is
+    /// Asterisk's "no limit" and must DISABLE the auth deadline — a
+    /// never-yet-authenticated connection survives well past the instant at
+    /// which naive `deadline = now + 0 = now` math would have killed it, and
+    /// can still log in. Neg-control (captured RED): implement 0 as
+    /// `deadline = now` (the naive bug — what the pre-guard code computed) →
+    /// the connection is dropped immediately with "Authentication timeout" and
+    /// the late Login never gets "Authentication accepted" → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auth_timeout_zero_disables_deadline_not_instant_drop() {
+        let (_server, addr) = spawn_test_server(AmiServerConfig {
+            auth_timeout: 0,
+            ..Default::default()
+        })
+        .await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        assert!(drain_until(&mut client, "Call Manager", Duration::from_secs(2)).await.is_ok());
+
+        // Stay unauthenticated well past where a `deadline = now` bug drops us
+        // (the drop is immediate; 1.5s is decisive, not timing-sensitive).
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The connection must still be alive and able to authenticate.
+        client
+            .write_all(b"Action: Login\r\nUsername: admin\r\nSecret: correct-secret\r\n\r\n")
+            .await
+            .expect("connection must still be writable with authtimeout=0");
+        let got = drain_until(&mut client, "Authentication accepted", Duration::from_secs(2)).await;
+        assert!(
+            got.as_ref().is_ok_and(|s| s.contains("Authentication accepted")),
+            "authtimeout=0 must mean NO auth deadline (0 = disabled), not drop-immediately; got: {:?}",
+            got
+        );
+    }
+
+    /// 0-means-unlimited: `authlimit = 0` must mean "no cap on concurrent
+    /// pre-auth connections", NOT "refuse everything". Neg-control (captured
+    /// RED): drop the `auth_limit > 0` guard → `prior >= 0` is always true →
+    /// the very first connection is refused with "Too many unauthenticated"
+    /// and never gets the banner → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auth_limit_zero_means_unlimited_not_reject_all() {
+        let (_server, addr) = spawn_test_server(AmiServerConfig {
+            auth_limit: 0,
+            auth_timeout: 30, // isolate from the timeout path
+            ..Default::default()
+        })
+        .await;
+
+        // Several concurrent pre-auth connections must ALL be accepted
+        // (banner received, no refusal message).
+        let mut clients = Vec::new();
+        for i in 0..3 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            let got = drain_until(&mut c, "Call Manager", Duration::from_secs(2)).await;
+            assert!(
+                got.as_ref().is_ok_and(|s| s.contains("Call Manager")
+                    && !s.contains("Too many unauthenticated")),
+                "authlimit=0 must mean unlimited — connection {} must be accepted; got: {:?}",
+                i,
+                got
+            );
+            clients.push(c);
+        }
+        drop(clients);
     }
 
     /// #130 auth_limit: the (cap+1)th concurrent pre-auth connection is refused.

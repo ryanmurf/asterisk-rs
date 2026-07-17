@@ -1080,6 +1080,15 @@ struct ManagerConfig {
     enabled: bool,
     port: u16,
     bind_addr: String,
+    /// `[general] authtimeout` (seconds). `None` = directive absent → keep the
+    /// server's protective default (30s). `Some(0)` = Asterisk's "no limit":
+    /// the auth deadline is DISABLED (guarded in `asterisk-ami` so 0 never
+    /// means "drop every unauthenticated connection instantly").
+    auth_timeout: Option<u64>,
+    /// `[general] authlimit` (max concurrent unauthenticated sessions).
+    /// `None` = directive absent → keep the server default (50). `Some(0)` =
+    /// unlimited (guarded in `asterisk-ami` so 0 never means "refuse all").
+    auth_limit: Option<usize>,
     users: Vec<asterisk_ami::auth::AmiUser>,
 }
 
@@ -1089,6 +1098,8 @@ impl Default for ManagerConfig {
             enabled: false,
             port: 5038,
             bind_addr: "127.0.0.1".to_string(),
+            auth_timeout: None,
+            auth_limit: None,
             users: Vec::new(),
         }
     }
@@ -1206,6 +1217,26 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
                         config.port = value.parse().unwrap_or(5038);
                     } else if key.eq_ignore_ascii_case("bindaddr") {
                         config.bind_addr = value.to_string();
+                    } else if key.eq_ignore_ascii_case("authtimeout") {
+                        // Fail-safe: an unparseable value keeps the protective
+                        // server default (None), it must NEVER become 0 —
+                        // 0 disables the auth deadline entirely.
+                        match value.parse::<u64>() {
+                            Ok(v) => config.auth_timeout = Some(v),
+                            Err(_) => warn!(
+                                "manager.conf: invalid authtimeout '{}'; keeping default",
+                                value
+                            ),
+                        }
+                    } else if key.eq_ignore_ascii_case("authlimit") {
+                        // Same fail-safe: unparseable → keep the default cap.
+                        match value.parse::<usize>() {
+                            Ok(v) => config.auth_limit = Some(v),
+                            Err(_) => warn!(
+                                "manager.conf: invalid authlimit '{}'; keeping default",
+                                value
+                            ),
+                        }
                     }
                 }
                 Some(_) if key.eq_ignore_ascii_case("secret") => {
@@ -1261,6 +1292,29 @@ fn manager_bind_addr(config: &ManagerConfig) -> SocketAddr {
         );
         loopback
     })
+}
+
+/// Build the `AmiServerConfig` from the parsed manager.conf `[general]`
+/// options (the REVIEW-BUNDLEA-PR2 config-fidelity fix: `authtimeout` /
+/// `authlimit` used to be parsed nowhere, so the server always ran on its
+/// defaults and an operator could not tighten them).
+///
+/// Absent directives (`None`) keep the server's protective defaults
+/// (authtimeout 30s, authlimit 50). The login rate-limit stays on its default:
+/// Asterisk's manager.conf has no standard knob for it (brute-force throttling
+/// is conventionally delegated to fail2ban).
+fn build_ami_server_config(
+    manager: &ManagerConfig,
+    bind_addr: SocketAddr,
+) -> asterisk_ami::server::AmiServerConfig {
+    let defaults = asterisk_ami::server::AmiServerConfig::default();
+    asterisk_ami::server::AmiServerConfig {
+        bind_addr,
+        enabled: manager.enabled,
+        auth_timeout: manager.auth_timeout.unwrap_or(defaults.auth_timeout),
+        auth_limit: manager.auth_limit.unwrap_or(defaults.auth_limit),
+        ..defaults
+    }
 }
 
 /// Parse ari.conf and return (enabled, AriConfig) -- kept for future use.
@@ -2248,17 +2302,15 @@ async fn startup_sequence(config_dir: &str, dirs: &AsteriskDirs) -> Result<(), S
     // Start the AMI server with config-driven users
     // =========================================================================
     {
-        use asterisk_ami::server::{AmiServer, AmiServerConfig};
+        use asterisk_ami::server::AmiServer;
 
         let manager = parse_manager_conf(config_dir);
         let bind_addr = manager_bind_addr(&manager);
         let ami_enabled = manager.enabled;
 
-        let ami_config = AmiServerConfig {
-            bind_addr,
-            enabled: ami_enabled,
-            ..Default::default()
-        };
+        // Wire the parsed [general] authtimeout/authlimit into the server
+        // config (they were previously dropped, leaving the defaults).
+        let ami_config = build_ami_server_config(&manager, bind_addr);
         let ami_server = AmiServer::new(ami_config);
 
         for user in manager.users {
@@ -2839,6 +2891,109 @@ mod tests {
         assert!(!user.write_perm.contains(EventCategory::SYSTEM));
         assert!(!user.write_perm.contains(EventCategory::COMMAND));
         assert_ne!(user.write_perm, EventCategory::ALL, "unknown token must not grant ALL");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // manager.conf authtimeout/authlimit parsing + wiring (REVIEW-BUNDLEA-PR2
+    // config-fidelity). RED capture: revert `build_ami_server_config` to
+    // `..Default::default()` for auth_timeout/auth_limit (the pre-fix wiring)
+    // → the built config shows the defaults (30/50) despite the parsed values
+    // → the wiring tests go RED. The parse tests go RED if the [general]
+    // authtimeout/authlimit arms are dropped from the parser.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manager_conf_parses_authtimeout_and_authlimit() {
+        let dir = test_dir("manager-authknobs");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\nauthtimeout = 7\nauthlimit = 3\n\n[operator]\nsecret = not-a-default\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert_eq!(config.auth_timeout, Some(7), "authtimeout must be parsed from [general]");
+        assert_eq!(config.auth_limit, Some(3), "authlimit must be parsed from [general]");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wired_ami_config_honors_tighter_authtimeout_and_authlimit() {
+        // The operator TIGHTENS both knobs below the defaults (30s/50); the
+        // built AmiServerConfig must reflect the tightened values, not the
+        // defaults the old `..Default::default()` wiring silently kept.
+        let manager = ManagerConfig {
+            enabled: true,
+            auth_timeout: Some(7),
+            auth_limit: Some(3),
+            ..Default::default()
+        };
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 5038));
+
+        let ami = build_ami_server_config(&manager, bind_addr);
+
+        assert!(ami.enabled);
+        assert_eq!(ami.bind_addr, bind_addr);
+        assert_eq!(ami.auth_timeout, 7, "a tighter authtimeout must take effect (not default 30)");
+        assert_eq!(ami.auth_limit, 3, "a tighter authlimit must take effect (not default 50)");
+    }
+
+    #[test]
+    fn absent_authtimeout_authlimit_keep_protective_defaults() {
+        let manager = ManagerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let ami = build_ami_server_config(&manager, SocketAddr::from(([127, 0, 0, 1], 5038)));
+
+        assert_eq!(ami.auth_timeout, 30, "absent authtimeout keeps the protective default");
+        assert_eq!(ami.auth_limit, 50, "absent authlimit keeps the protective default");
+    }
+
+    #[test]
+    fn invalid_authtimeout_keeps_default_never_becomes_zero() {
+        // Fail-safe direction: an unparseable value must keep the protective
+        // default — it must NEVER collapse to 0, which disables the deadline.
+        let dir = test_dir("manager-authknobs-invalid");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\nauthtimeout = banana\nauthlimit = -5\n\n[operator]\nsecret = not-a-default\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+        assert_eq!(config.auth_timeout, None, "invalid authtimeout must be ignored");
+        assert_eq!(config.auth_limit, None, "invalid (negative) authlimit must be ignored");
+
+        let ami = build_ami_server_config(&config, SocketAddr::from(([127, 0, 0, 1], 5038)));
+        assert_eq!(ami.auth_timeout, 30);
+        assert_ne!(ami.auth_timeout, 0, "an invalid authtimeout must never disable the deadline");
+        assert_eq!(ami.auth_limit, 50);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_authtimeout_zero_is_parsed_as_zero_for_disabled_semantics() {
+        // 0 is a VALID value (Asterisk: no limit). It must flow through as
+        // Some(0) — the 0-means-disabled guard lives in asterisk-ami's server
+        // (see test_auth_timeout_zero_disables_deadline_not_instant_drop).
+        let dir = test_dir("manager-authknobs-zero");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\nauthtimeout = 0\nauthlimit = 0\n\n[operator]\nsecret = not-a-default\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+        assert_eq!(config.auth_timeout, Some(0));
+        assert_eq!(config.auth_limit, Some(0));
+
+        let ami = build_ami_server_config(&config, SocketAddr::from(([127, 0, 0, 1], 5038)));
+        assert_eq!(ami.auth_timeout, 0, "authtimeout=0 must reach the server as 0 (disabled)");
+        assert_eq!(ami.auth_limit, 0, "authlimit=0 must reach the server as 0 (unlimited)");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
