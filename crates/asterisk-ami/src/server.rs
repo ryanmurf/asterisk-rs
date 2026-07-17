@@ -303,7 +303,7 @@ impl AmiServer {
         sessions.insert(session_id.to_string(), session.clone());
 
         // Spawn the writer task
-        let writer_handle = tokio::spawn(session::session_writer(send_rx, writer));
+        let mut writer_handle = tokio::spawn(session::session_writer(send_rx, writer));
 
         // Send the AMI banner
         if let Err(e) = send_tx.send(AMI_BANNER.to_string()).await {
@@ -387,9 +387,11 @@ impl AmiServer {
                         "AMI session {}: authentication timeout ({}s) — dropping unauthenticated connection from {}",
                         session_id, config.auth_timeout, addr
                     );
+                    // Best-effort (`try_send`, not `.await`): a non-reading client
+                    // may have filled the channel; we are dropping the connection
+                    // regardless and must not block on a full channel here.
                     let _ = send_tx
-                        .send("Response: Error\r\nMessage: Authentication timeout\r\n\r\n".to_string())
-                        .await;
+                        .try_send("Response: Error\r\nMessage: Authentication timeout\r\n\r\n".to_string());
                     break;
                 }
             };
@@ -401,30 +403,35 @@ impl AmiServer {
                     break;
                 }
                 Ok(_) => {
-                    // Per-line cap: the take limit hit 0 without a terminating
-                    // newline means the line exceeds MAX_AMI_LINE_BYTES.
-                    if limited.limit() == 0 && line_bytes.last() != Some(&b'\n') {
+                    // Per-line and total-message caps (issue #110) bound the
+                    // PRE-AUTH read buffer. They are scoped to `!authenticated`:
+                    // once a trusted operator has authenticated, a legitimately
+                    // large action (e.g. a big UpdateConfig) must not be torn
+                    // down. The unauthenticated phase is where the memory-
+                    // exhaustion DoS lives, and it is fully bounded here.
+                    if !authenticated
+                        && limited.limit() == 0
+                        && line_bytes.last() != Some(&b'\n')
+                    {
                         warn!(
-                            "AMI session {}: line exceeded {} bytes — dropping connection from {}",
+                            "AMI session {}: pre-auth line exceeded {} bytes — dropping connection from {}",
                             session_id, MAX_AMI_LINE_BYTES, addr
                         );
                         let _ = send_tx
-                            .send("Response: Error\r\nMessage: Line too long\r\n\r\n".to_string())
-                            .await;
+                            .try_send("Response: Error\r\nMessage: Line too long\r\n\r\n".to_string());
                         break;
                     }
 
                     message_buf.push_str(&String::from_utf8_lossy(&line_bytes));
 
-                    // Total-message cap: bound the un-dispatched buffer.
-                    if message_buf.len() > MAX_AMI_MESSAGE_BYTES {
+                    // Total-message cap: bound the un-dispatched pre-auth buffer.
+                    if !authenticated && message_buf.len() > MAX_AMI_MESSAGE_BYTES {
                         warn!(
-                            "AMI session {}: message exceeded {} bytes without terminator — dropping connection from {}",
+                            "AMI session {}: pre-auth message exceeded {} bytes without terminator — dropping connection from {}",
                             session_id, MAX_AMI_MESSAGE_BYTES, addr
                         );
                         let _ = send_tx
-                            .send("Response: Error\r\nMessage: Message too long\r\n\r\n".to_string())
-                            .await;
+                            .try_send("Response: Error\r\nMessage: Message too long\r\n\r\n".to_string());
                         break;
                     }
 
@@ -443,7 +450,32 @@ impl AmiServer {
                             };
 
                             let resp_data = response.serialize();
-                            if send_tx.send(resp_data).await.is_err() {
+                            // Re-read auth state: a successful Login in this
+                            // dispatch has just flipped it.
+                            let now_authenticated = session.read().authenticated;
+                            let send_result = if now_authenticated {
+                                // Authenticated: a slow reader legitimately
+                                // backpressures; blocking here is normal flow
+                                // control, not a DoS.
+                                send_tx.send(resp_data).await
+                            } else {
+                                // Pre-auth: the auth deadline must bound the WHOLE
+                                // unauthenticated phase, not just reads. Otherwise a
+                                // flooder that never reads its responses parks on a
+                                // full channel here and evades auth_timeout while
+                                // holding its pre-auth slot (issue #130).
+                                tokio::select! {
+                                    r = send_tx.send(resp_data) => r,
+                                    _ = tokio::time::sleep_until(auth_deadline) => {
+                                        warn!(
+                                            "AMI session {}: authentication timeout ({}s) while sending pre-auth response — dropping connection from {}",
+                                            session_id, config.auth_timeout, addr
+                                        );
+                                        break;
+                                    }
+                                }
+                            };
+                            if send_result.is_err() {
                                 break;
                             }
 
@@ -471,7 +503,18 @@ impl AmiServer {
         }
         event_handle.abort();
         drop(send_tx);
-        let _ = writer_handle.await;
+        // Force the connection down. We CANNOT simply await the writer: the
+        // `AmiSession` (reachable until this function returns, and via the event
+        // task) still holds an mpsc sender clone, so the writer's channel never
+        // closes on its own and the writer only exits on a socket write error. A
+        // client we have decided to drop (auth timeout / cap / limit) that keeps
+        // its socket open and reads slowly would otherwise never error the
+        // writer, keeping the writer task — and this connection's fd — alive
+        // forever. Give the writer a brief grace to flush any final queued
+        // response, then abort it so the write half (and, on return, the read
+        // half) is dropped and the socket actually closes.
+        let _ = tokio::time::timeout(Duration::from_millis(500), &mut writer_handle).await;
+        writer_handle.abort();
     }
 
     /// Broadcast an event to all connected and authenticated sessions.
@@ -649,6 +692,61 @@ mod tests {
         assert!(
             got.is_ok_and(|s| s.contains("Authentication timeout")),
             "unauthenticated connection must be dropped after auth_timeout"
+        );
+    }
+
+    /// #130 auth_timeout regression (adversarial review SECURITY-1): the auth
+    /// deadline must bound the WHOLE unauthenticated phase, including the
+    /// response send AND the teardown. An unauthenticated client that floods
+    /// pre-auth actions and never reads its responses fills the bounded send
+    /// channel + socket buffer; the dispatch send then parks. Without the fix the
+    /// task is stuck OUTSIDE the read `select!`, so the deadline never fires; and
+    /// even once it does, awaiting the writer at teardown would hang (the session
+    /// holds an mpsc sender), leaking the connection. Neg-control: make the
+    /// pre-auth response send a plain `.await` (drop the `sleep_until` arm), OR
+    /// revert the teardown to `let _ = writer_handle.await;` → the connection is
+    /// never closed → `expect_closed` times out → RED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auth_timeout_covers_response_send_backpressure() {
+        let (_server, addr) = spawn_test_server(AmiServerConfig {
+            auth_timeout: 1,
+            ..Default::default()
+        })
+        .await;
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+
+        // Flood pre-auth actions in the background and never read the responses,
+        // filling the server's bounded channel + socket buffer until its
+        // dispatch send parks. Each returns a "Permission denied" response.
+        let writer = tokio::spawn(async move {
+            let msg = b"Action: Ping\r\n\r\n";
+            while wr.write_all(msg).await.is_ok() {}
+        });
+
+        // Do NOT read until well past the (1s) deadline, so the parked pre-auth
+        // send is what the deadline must interrupt.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // The server must have dropped us: draining now reaches EOF (or reset).
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return true,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        writer.abort();
+
+        assert!(
+            closed,
+            "an unauthenticated response-flooder must still be dropped at the auth deadline"
         );
     }
 
