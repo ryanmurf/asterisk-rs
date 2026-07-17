@@ -98,6 +98,12 @@ pub struct SipEventHandler {
     /// (issue #55). When absent (handler-level tests), finals are sent
     /// unrecorded.
     stack: OnceLock<Arc<crate::stack::SipStack>>,
+    /// RTP inactivity teardown (`rtptimeout`). `Some(d)` reaps an established
+    /// inbound call that receives no accepted inbound RTP for `d`; `None`
+    /// disables the reaper. Set once at startup via [`Self::set_rtp_timeout`];
+    /// defaults to disabled so handler-level tests are unaffected unless they
+    /// opt in.
+    rtp_timeout: RwLock<Option<std::time::Duration>>,
 }
 
 impl SipEventHandler {
@@ -135,7 +141,20 @@ impl SipEventHandler {
             fallback_rtp_allocator: RtpPortAllocator::default(),
             registrar: Arc::new(Registrar::new()),
             stack: OnceLock::new(),
+            rtp_timeout: RwLock::new(None),
         }
+    }
+
+    /// Configure the RTP inactivity teardown (`rtptimeout`). `Some(d)` arms the
+    /// reaper for every subsequently answered inbound call; `None` disables it.
+    /// Startup passes the value parsed from `rtp.conf`.
+    pub fn set_rtp_timeout(&self, timeout: Option<std::time::Duration>) {
+        *self.rtp_timeout.write() = timeout;
+    }
+
+    /// The currently configured RTP inactivity teardown, if any.
+    pub fn rtp_timeout(&self) -> Option<std::time::Duration> {
+        *self.rtp_timeout.read()
     }
 
     /// Attach the SIP stack so final INVITE responses are recorded in (and
@@ -749,6 +768,9 @@ impl SipEventHandler {
         // ends, so bound sockets are not leaked in the driver's channel map.
         let driver_for_cleanup = self.channel_driver.get().cloned();
         let channel_name_for_media = channel_name.clone();
+        // Snapshot the RTP inactivity teardown for this call. Captured here (not
+        // read inside the task) so the value is fixed for the call's lifetime.
+        let rtp_timeout_for_task = *self.rtp_timeout.read();
 
         // Notify that fires when Answer() is called on the channel.
         let answer_notify = Arc::new(tokio::sync::Notify::new());
@@ -894,10 +916,92 @@ impl SipEventHandler {
                 }
             }
 
-            // Wait for pbx_run to finish (unless it already has).
+            // Reflect the answered state in the GLOBAL STORE copy. pbx_run
+            // mutates a detached tokio copy of the channel, so without this the
+            // store's channel — what `core show channels` / AMI CoreStatus and
+            // every status consumer observes — stays at its pre-answer state
+            // for the entire established call. The answer callback only wakes a
+            // Notify; it does not touch the store copy for inbound calls.
+            // (M5, store.rs baseline.)
+            if established {
+                if let Some(store_chan) = store::find_by_name(&ch_name_for_cleanup) {
+                    let mut ch = store_chan.lock();
+                    if ch.state != ChannelState::Up && ch.state != ChannelState::Down {
+                        ch.set_state(ChannelState::Up);
+                    }
+                }
+            }
+
+            // Wait for pbx_run to finish (unless it already has). On an
+            // established call, enforce the RTP inactivity timeout
+            // (`rtptimeout`): if no accepted inbound RTP arrives for the
+            // configured window, tear the call down. This is the load-bearing
+            // reaper for a media-silent established call — nothing else bounds
+            // it (the SIP dialog would otherwise stay up until the peer sends
+            // BYE, and a long-running app such as Echo()/Wait() never returns).
             let result = match early_pbx_result {
                 Some(r) => r,
-                None => pbx_handle.await,
+                None => match (established, rtp_timeout_for_task, driver_for_cleanup.as_ref()) {
+                    (true, Some(timeout), Some(driver)) => {
+                        let watchdog_start = tokio::time::Instant::now();
+                        // Poll fine enough to reap near the deadline without
+                        // busy-looping; bounded to [250 ms, 1 s].
+                        let poll = (timeout / 10).clamp(
+                            std::time::Duration::from_millis(250),
+                            std::time::Duration::from_secs(1),
+                        );
+                        loop {
+                            tokio::select! {
+                                biased;
+                                r = &mut pbx_handle => break r,
+                                _ = tokio::time::sleep(poll) => {
+                                    let Some(idle) =
+                                        driver.channel_rtp_idle(&ch_name_for_cleanup).await
+                                    else {
+                                        // No media plane attached: nothing to
+                                        // police. Silence here is not an
+                                        // inactivity signal, so never reap.
+                                        continue;
+                                    };
+                                    // Discount pre-answer silence: measure from
+                                    // the later of last-activity and watchdog
+                                    // start (idle.min(elapsed-since-arming)).
+                                    let effective = idle.min(watchdog_start.elapsed());
+                                    if effective >= timeout {
+                                        info!(
+                                            call_id = %call_id_for_task,
+                                            ?timeout,
+                                            "RTP inactivity timeout reached; tearing down \
+                                             media-silent call"
+                                        );
+                                        // Signal hangup via the GLOBAL STORE copy
+                                        // only — the same signal handle_bye uses
+                                        // for an inbound call. Hangup-aware apps
+                                        // (Echo, Read, Wait, ConfBridge, ...)
+                                        // poll the store copy between reads and
+                                        // unwind. Deliberately not touching the
+                                        // detached tokio copy the app holds: the
+                                        // app owns that lock, and reaching for it
+                                        // here would contend with the very read
+                                        // loop we need to release.
+                                        if let Some(store_chan) =
+                                            store::find_by_name(&ch_name_for_cleanup)
+                                        {
+                                            let mut ch = store_chan.lock();
+                                            ch.hangup_cause = HangupCause::NoAnswer;
+                                            ch.softhangup(softhangup::AST_SOFTHANGUP_DEV);
+                                        }
+                                        // Wait for the app to unwind, then fall
+                                        // through to the normal established-call
+                                        // teardown below (BYE + finalize).
+                                        break (&mut pbx_handle).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => pbx_handle.await,
+                },
             };
             match &result {
                 Ok(r) => info!(channel = %ch_name_for_cleanup, "PBX completed with result: {:?}", r),
