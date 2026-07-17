@@ -921,7 +921,11 @@ assert_m3_zero_hit_audit() {
     # ever contains the 6-digit string, yet the full PIN is trivially
     # reassembled by reading the digit fields in order. For every runtime
     # artifact, extract each individually-logged DTMF digit value (shapes:
-    # `digit=5`, `digit='5'`, `digit: 5`, `Digit: 5`) preserving file order,
+    # `digit=5`, `digit='5'`, `digit: 5`, `Digit: 5`, plus the
+    # message-embedded quoted shape `DTMF '5'` / `by DTMF '5'` used by
+    # playback barge-in — REVIEW-BUNDLEB: the original extractor returned
+    # empty on that shape, so such a leak stayed silently GREEN) preserving
+    # file order,
     # and fail if either test PIN appears in that file's digit stream — raw,
     # or with consecutive duplicates collapsed (a begin+end pair logs every
     # digit twice: 112233… would defeat the raw check alone).
@@ -936,7 +940,12 @@ assert_m3_zero_hit_audit() {
     # scan above still covers freeswitch-artifacts/ unreduced. If the live
     # FreeSWITCH pod runs at a loglevel this chatty, its pod logs leak PIN
     # digits FS-side — flagged separately; not fixable from this repo.
-    local perdigit_extractor="[Dd]igit *[=:] *['\"]?[0-9A-D#*]"
+    # Two alternatives: the field shape (`digit=5` etc., quote optional) and
+    # the message-embedded shape (`DTMF '5'`, quote REQUIRED — unquoted
+    # `DTMF<x>` would false-match benign counters like `RTPDTMFDigitsRx=1`,
+    # polluting the stream and masking real leaks). Both alternatives end on
+    # the digit char so the `.$` extraction below works for either.
+    local perdigit_extractor="([Dd]igit *[=:] *['\"]?|[Dd][Tt][Mm][Ff] *['\"])[0-9A-D#*]"
     # ANSI SGR sequences must be stripped BEFORE matching: the tracing fmt
     # writer colors its output even into the redirected log file, so a leaked
     # field arrives as `digit\e[0m\e[2m=\e[0m7` — the literal bytes "digit="
@@ -948,10 +957,10 @@ assert_m3_zero_hit_audit() {
     # zero-hit result (guards against silent rot the same way the AMI
     # positive control above guards the subscriber).
     local perdigit_selftest
-    perdigit_selftest="$(printf "digit=4 a\nx digit: 2 b\nDigit: 4\ndigit='2'\n\x1b[3mdigit\x1b[0m\x1b[2m=\x1b[0m7\n" \
+    perdigit_selftest="$(printf "digit=4 a\nx digit: 2 b\nDigit: 4\ndigit='2'\n\x1b[3mdigit\x1b[0m\x1b[2m=\x1b[0m7\ninterrupted by DTMF '3' during file 'x'\nby DTMF \"8\"\n\x1b[2mDTMF\x1b[0m '9'\nRTPDTMFDigitsRx=1\n" \
         | sed -e "$strip_ansi" \
         | grep -aoE "$perdigit_extractor" | grep -o '.$' | tr -d '\n')"
-    [[ "$perdigit_selftest" == "42427" ]] \
+    [[ "$perdigit_selftest" == "42427389" ]] \
         || fail "per-digit extractor self-test failed (positive control): got '$perdigit_selftest'"
     local perdigit_stream
     local perdigit_squeezed
