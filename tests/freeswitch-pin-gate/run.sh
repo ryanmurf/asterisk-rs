@@ -248,6 +248,12 @@ core_status_response() {
 # Core (5) + all four transaction maps (4) + RTP port allocations, registrar
 # bindings, and the #122 hangup/answer callback counts (4). Per M-g,
 # active_channel_count==0 proves nothing — this asserts each registry exactly.
+#
+# NOTE (M5 review MINOR-2): the soak call loop uses `originate`/`park` and never
+# REGISTERs or expires a binding, so `SIPRegistrarBindings` here is a
+# *regression sentinel* (it must return to its exact pre-soak value), NOT a
+# proof of registrar lifecycle. Registrar bind/expire/removal correctness is
+# M6's dynamic-REGISTER acceptance, not this soak.
 full_snapshot() {
     local response value
     local fields=(
@@ -1426,7 +1432,9 @@ run_m5_soak_case() {
     # EXACT baseline restoration across every registry — zero drift. A per-call
     # leak of even one unit in any map (a stranded outbound register-store
     # channel per M-g, a leaked RTP socket, an unfreed callback closure) shows
-    # as non-zero drift after `count` calls.
+    # as non-zero drift after `count` calls. (SIPRegistrarBindings is a
+    # regression sentinel only — this soak drives no REGISTER lifecycle; see the
+    # full_snapshot note. Registrar bind/expire proof is M6's job.)
     after="$(wait_for_full_baseline "$baseline")"
     printf 'M5_SOAK: PASS (%d calls; exact baseline restored across all registries: %s)\n' \
         "$count" "$after"
