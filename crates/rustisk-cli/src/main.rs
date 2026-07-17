@@ -1114,19 +1114,43 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
     let mut current_section: Option<String> = None;
     let mut current_user_name: Option<String> = None;
     let mut current_secret: Option<String> = None;
+    // Per-user permission directives. `None` = the directive was ABSENT, which
+    // is least-privilege DENY (issue #127): an absent `read=`/`write=` grants
+    // NOTHING. `Some("")` (an explicit empty `write =`) also parses to NONE.
+    // Unknown/mis-typed category tokens are dropped by `parse_list` (fail-closed
+    // — never silently granted-all).
+    let mut current_read: Option<String> = None;
+    let mut current_write: Option<String> = None;
 
     // Helper to flush a pending user
-    let flush_user =
-        |config: &mut ManagerConfig, name: &Option<String>, secret: &Option<String>| {
-            if let Some(ref uname) = name {
-                match secret.as_deref() {
-                    Some(sec) if !sec.is_empty() => config
+    let flush_user = |config: &mut ManagerConfig,
+                      name: &Option<String>,
+                      secret: &Option<String>,
+                      read: &Option<String>,
+                      write: &Option<String>| {
+        if let Some(ref uname) = name {
+            match secret.as_deref() {
+                Some(sec) if !sec.is_empty() => {
+                    use asterisk_ami::events::EventCategory;
+                    // Default-DENY: an absent directive is NONE, not ALL.
+                    let read_perm = read
+                        .as_deref()
+                        .map(EventCategory::parse_list)
+                        .unwrap_or(EventCategory::NONE);
+                    let write_perm = write
+                        .as_deref()
+                        .map(EventCategory::parse_list)
+                        .unwrap_or(EventCategory::NONE);
+                    config
                         .users
-                        .push(asterisk_ami::auth::AmiUser::new(uname, sec)),
-                    _ => warn!("AMI user '{}' has no secret; ignoring user", uname),
+                        .push(asterisk_ami::auth::AmiUser::with_permissions(
+                            uname, sec, read_perm, write_perm,
+                        ));
                 }
+                _ => warn!("AMI user '{}' has no secret; ignoring user", uname),
             }
-        };
+        }
+    };
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1143,9 +1167,17 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
 
         if trimmed.starts_with('[') && trimmed.contains(']') {
             // Save previous user section
-            flush_user(&mut config, &current_user_name, &current_secret);
+            flush_user(
+                &mut config,
+                &current_user_name,
+                &current_secret,
+                &current_read,
+                &current_write,
+            );
             current_user_name = None;
             current_secret = None;
+            current_read = None;
+            current_write = None;
 
             let bracket_end = trimmed.find(']').unwrap();
             let section_name = trimmed[1..bracket_end].trim().to_string();
@@ -1179,8 +1211,19 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
                 Some(_) if key.eq_ignore_ascii_case("secret") => {
                     current_secret = Some(value.to_string());
                 }
+                Some(_) if key.eq_ignore_ascii_case("read") => {
+                    // Honor the configured read categories (issue #127). Absent
+                    // => NONE (handled at flush). `parse_list` drops unknown
+                    // tokens, so a typo fails closed rather than granting all.
+                    current_read = Some(value.to_string());
+                }
+                Some(_) if key.eq_ignore_ascii_case("write") => {
+                    // Honor the configured write categories (issue #127). These
+                    // are what `ActionRegistry::dispatch` enforces per action.
+                    current_write = Some(value.to_string());
+                }
                 Some(_) => {
-                    // read/write permissions are handled via AmiUser::new (defaults to ALL)
+                    // Unknown user directive: ignored (does NOT widen perms).
                 }
                 None => {}
             }
@@ -1188,7 +1231,13 @@ fn parse_manager_conf(config_dir: &str) -> ManagerConfig {
     }
 
     // Flush last user
-    flush_user(&mut config, &current_user_name, &current_secret);
+    flush_user(
+        &mut config,
+        &current_user_name,
+        &current_secret,
+        &current_read,
+        &current_write,
+    );
 
     if config.enabled && config.users.is_empty() {
         warn!("manager.conf enables AMI without any users; disabling AMI");
@@ -2692,6 +2741,104 @@ mod tests {
         assert_eq!(config.users.len(), 1);
         assert_eq!(config.users[0].username, "operator");
         assert_eq!(config.users[0].secret, "not-a-default");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // manager.conf read=/write= parsing + default-DENY (#127)
+    //
+    // RED capture: revert the parser's `read`/`write` arms to the old no-op
+    // (or build via `AmiUser::new`, which hard-codes ALL) and
+    // `manager_conf_absent_perms_default_to_deny` goes GREEN with ALL — so with
+    // the fix it must be RED. The explicit-perm and fail-closed tests likewise
+    // flip if `read=`/`write=` are dropped.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manager_conf_parses_explicit_read_and_write_perms() {
+        use asterisk_ami::events::EventCategory;
+        let dir = test_dir("manager-perms-explicit");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[monitor]\nsecret = s3cret-bogus\nread = call,system\nwrite = call\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert_eq!(config.users.len(), 1);
+        let user = &config.users[0];
+        // read = call,system -> exactly those categories.
+        assert!(user.read_perm.contains(EventCategory::CALL));
+        assert!(user.read_perm.contains(EventCategory::SYSTEM));
+        assert!(!user.read_perm.contains(EventCategory::DTMF));
+        // write = call -> CALL only; NOT command/system (so Command/Originate
+        // stay denied for this monitoring account).
+        assert!(user.write_perm.contains(EventCategory::CALL));
+        assert!(!user.write_perm.contains(EventCategory::COMMAND));
+        assert!(!user.write_perm.contains(EventCategory::SYSTEM));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_absent_perms_default_to_deny() {
+        use asterisk_ami::events::EventCategory;
+        let dir = test_dir("manager-perms-absent");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[operator]\nsecret = not-a-default\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        assert_eq!(config.users.len(), 1);
+        let user = &config.users[0];
+        // The decisive least-privilege property: no read=/write= directive
+        // grants NOTHING (not ALL). Fail-open would make these ALL.
+        assert_eq!(user.read_perm, EventCategory::NONE, "absent read= must be default-DENY");
+        assert_eq!(user.write_perm, EventCategory::NONE, "absent write= must be default-DENY");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_empty_write_directive_is_none() {
+        use asterisk_ami::events::EventCategory;
+        let dir = test_dir("manager-perms-empty-write");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[monitor]\nsecret = s3cret-bogus\nread = system,call\nwrite =\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        let user = &config.users[0];
+        assert!(user.read_perm.contains(EventCategory::SYSTEM));
+        // Explicit empty `write =` -> NONE (the operator's intended read-only).
+        assert_eq!(user.write_perm, EventCategory::NONE, "empty write= must be NONE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manager_conf_unknown_perm_token_fails_closed() {
+        use asterisk_ami::events::EventCategory;
+        let dir = test_dir("manager-perms-unknown");
+        std::fs::write(
+            dir.join("manager.conf"),
+            "[general]\nenabled = yes\n\n[monitor]\nsecret = s3cret-bogus\nwrite = bogus,call\n",
+        )
+        .unwrap();
+
+        let config = parse_manager_conf(dir.to_str().unwrap());
+
+        let user = &config.users[0];
+        // The bogus token is dropped; only the valid `call` is granted. A typo
+        // must NOT fall back to granting everything.
+        assert!(user.write_perm.contains(EventCategory::CALL));
+        assert!(!user.write_perm.contains(EventCategory::SYSTEM));
+        assert!(!user.write_perm.contains(EventCategory::COMMAND));
+        assert_ne!(user.write_perm, EventCategory::ALL, "unknown token must not grant ALL");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
