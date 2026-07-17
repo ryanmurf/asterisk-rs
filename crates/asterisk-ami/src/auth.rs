@@ -8,6 +8,7 @@
 use crate::events::EventCategory;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use tracing::debug;
 
 /// An AMI user, as configured in manager.conf.
@@ -125,8 +126,15 @@ pub enum AuthMethod {
 }
 
 /// Verify plaintext credentials against a user.
+///
+/// The comparison is constant-time with respect to the *contents* of the two
+/// secrets (via [`subtle::ConstantTimeEq`]). A plain `==` short-circuits on the
+/// first differing byte, which leaks — through response timing — how many
+/// leading bytes of a guess were correct, letting a network attacker recover
+/// the secret one byte at a time. This mirrors the M3 PIN-gate discipline
+/// (`asterisk-apps/src/pin_gate.rs`).
 pub fn verify_plaintext(user: &AmiUser, secret: &str) -> bool {
-    user.secret == secret
+    user.secret.as_bytes().ct_eq(secret.as_bytes()).into()
 }
 
 /// Generate a random challenge string for MD5 authentication.
@@ -141,9 +149,16 @@ pub fn generate_challenge() -> String {
 /// Verify an MD5 challenge response.
 ///
 /// The expected response is MD5(challenge + secret).
+///
+/// `expected` is always lowercase hex (produced by `hex::encode`). The
+/// client-supplied `response` is normalized to lowercase to preserve the
+/// historical case-insensitive behaviour, then compared in constant time so
+/// the match does not leak, via timing, how many leading hex digits of a
+/// forged response were correct.
 pub fn verify_md5_response(challenge: &str, secret: &str, response: &str) -> bool {
     let expected = compute_md5_response(challenge, secret);
-    expected.eq_ignore_ascii_case(response)
+    let response = response.to_ascii_lowercase();
+    expected.as_bytes().ct_eq(response.as_bytes()).into()
 }
 
 /// Compute the expected MD5 response for a challenge.
@@ -212,6 +227,28 @@ mod tests {
         assert!(!verify_plaintext(&user, "wrong_password"));
     }
 
+    /// Behavioural contract the constant-time comparison must preserve: a guess
+    /// that is wrong only in its LAST byte, and one wrong only in its FIRST
+    /// byte, must both be rejected, and a length-mismatched guess (prefix of
+    /// the secret) must be rejected without matching. (This locks the accept/
+    /// reject behaviour; the timing property itself is validated by using
+    /// `subtle::ConstantTimeEq` rather than `==`.)
+    #[test]
+    fn test_verify_plaintext_rejects_partial_matches() {
+        let user = AmiUser::new("admin", "s3cr3t-p4ss");
+        assert!(verify_plaintext(&user, "s3cr3t-p4ss"));
+        // Differs only in the final byte.
+        assert!(!verify_plaintext(&user, "s3cr3t-p4sX"));
+        // Differs only in the first byte.
+        assert!(!verify_plaintext(&user, "X3cr3t-p4ss"));
+        // Correct prefix, too short.
+        assert!(!verify_plaintext(&user, "s3cr3t"));
+        // Correct secret plus trailing bytes.
+        assert!(!verify_plaintext(&user, "s3cr3t-p4ss!"));
+        // Empty guess against a non-empty secret.
+        assert!(!verify_plaintext(&user, ""));
+    }
+
     #[test]
     fn test_challenge_generation() {
         let c1 = generate_challenge();
@@ -237,5 +274,29 @@ mod tests {
         let response = compute_md5_response(challenge, secret);
         let upper = response.to_uppercase();
         assert!(verify_md5_response(challenge, secret, &upper));
+    }
+
+    /// The constant-time MD5 verifier must keep rejecting malformed/short/long
+    /// responses (it must not, e.g., accept a correct prefix of the expected
+    /// hash) while still accepting the exact response in either case.
+    #[test]
+    fn test_md5_response_rejects_malformed() {
+        let challenge = "chal-xyz";
+        let secret = "hunter2";
+        let expected = compute_md5_response(challenge, secret);
+
+        assert!(verify_md5_response(challenge, secret, &expected));
+        assert!(verify_md5_response(challenge, secret, &expected.to_uppercase()));
+        // Correct hash with its last hex digit flipped.
+        let mut wrong_last = expected.clone();
+        wrong_last.pop();
+        wrong_last.push(if expected.ends_with('0') { '1' } else { '0' });
+        assert!(!verify_md5_response(challenge, secret, &wrong_last));
+        // A truncated (prefix) response must not match.
+        assert!(!verify_md5_response(challenge, secret, &expected[..16]));
+        // Empty response must not match.
+        assert!(!verify_md5_response(challenge, secret, ""));
+        // Wrong secret must not match.
+        assert!(!verify_md5_response(challenge, "wrong", &expected));
     }
 }

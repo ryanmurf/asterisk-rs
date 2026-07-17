@@ -246,9 +246,16 @@ fn handle_login(
 
     // Check for MD5 challenge/response authentication
     if let Some(key) = action.get_header("Key") {
-        // MD5 auth: verify against session challenge
-        if let Some(ref challenge) = session.challenge {
-            if auth::verify_md5_response(challenge, &user.secret, key) {
+        // MD5 auth: verify against session challenge.
+        //
+        // The challenge is single-use: consume it (`take`) before evaluating the
+        // response, so the nonce cannot be reused for a second Login on the same
+        // session. A client must request a fresh `Challenge` for every login
+        // attempt (this is how well-behaved AMI clients already work). Without
+        // this, a captured `Login` with a fixed challenge could be replayed, and
+        // an attacker could grind guesses against one stable nonce.
+        if let Some(challenge) = session.challenge.take() {
+            if auth::verify_md5_response(&challenge, &user.secret, key) {
                 session.authenticate(&user);
                 return AmiResponse::success("Authentication accepted");
             } else {
@@ -2534,6 +2541,59 @@ mod tests {
 
         assert!(login_resp.success);
         assert!(session.authenticated);
+    }
+
+    /// Regression: the MD5 challenge is single-use. After ONE Login attempt
+    /// consumes it, a second Login on the same session — even with the correct
+    /// Key for that same challenge — must be rejected with "No challenge sent",
+    /// forcing the client to request a fresh nonce.
+    ///
+    /// RED control: revert `session.challenge.take()` back to
+    /// `if let Some(ref challenge) = session.challenge` in `handle_login` and
+    /// this test fails — the replayed correct-Key login authenticates because
+    /// the stale challenge is still present.
+    #[test]
+    fn test_md5_challenge_is_single_use() {
+        let (ctx, _reg) = make_context();
+        let (mut session, _rx) = make_session();
+        let registry = ActionRegistry::new(ctx.user_registry.clone());
+
+        // Step 1: request a challenge.
+        let mut challenge_action = AmiAction::new("Challenge");
+        challenge_action.set_header("AuthType", "md5");
+        let challenge_resp = registry.dispatch(&challenge_action, &mut session, &ctx);
+        let challenge = challenge_resp.headers.get("Challenge").unwrap().clone();
+
+        // Correct response for this challenge (what an attacker who captured a
+        // valid Login would replay).
+        let correct_key = auth::compute_md5_response(&challenge, "secret");
+
+        // Step 2: a first Login attempt with a WRONG key consumes the challenge.
+        let mut wrong_login = AmiAction::new("Login");
+        wrong_login.set_header("Username", "admin");
+        wrong_login.set_header("AuthType", "md5");
+        wrong_login.set_header("Key", "00000000000000000000000000000000");
+        let wrong_resp = registry.dispatch(&wrong_login, &mut session, &ctx);
+        assert!(!wrong_resp.success, "wrong key must not authenticate");
+        assert!(!session.authenticated);
+
+        // Step 3: replay the CORRECT key against the now-consumed challenge.
+        // It must be rejected because the nonce is single-use.
+        let mut replay_login = AmiAction::new("Login");
+        replay_login.set_header("Username", "admin");
+        replay_login.set_header("AuthType", "md5");
+        replay_login.set_header("Key", &correct_key);
+        let replay_resp = registry.dispatch(&replay_login, &mut session, &ctx);
+
+        assert!(
+            !session.authenticated,
+            "a consumed challenge must not authenticate a replayed correct Key"
+        );
+        assert!(!replay_resp.success);
+        assert_eq!(
+            replay_resp.message, "No challenge sent",
+            "second login must be told the challenge is gone, forcing a fresh nonce"
+        );
     }
 
     #[test]

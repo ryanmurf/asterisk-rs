@@ -16,3 +16,4 @@ md-5 = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
+subtle = { workspace = true }

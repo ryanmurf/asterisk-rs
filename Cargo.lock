@@ -114,6 +114,7 @@ dependencies = [
  "md-5",
  "parking_lot",
  "regex",
+ "subtle",
  "tokio",
  "tracing",
  "uuid",
