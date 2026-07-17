@@ -863,7 +863,14 @@ pub fn extract_tag(header_value: &str) -> Option<String> {
 /// Extract the URI from a From/To header value (may be in angle brackets).
 pub fn extract_uri(header_value: &str) -> Option<String> {
     if let Some(start) = header_value.find('<') {
-        if let Some(end) = header_value.find('>') {
+        // The closing '>' must come *after* the opening '<'. Search only the
+        // tail after '<' so a hostile display-name containing a '>' before the
+        // URI (e.g. `"a>b" <sip:carol@host>`) cannot produce a reversed byte
+        // range — `header_value[start + 1..end]` panics when `end <= start`,
+        // which would crash the request-handling path (dialog creation,
+        // registrar, ACL) on an attacker-controlled From/To/Contact header.
+        if let Some(rel_end) = header_value[start + 1..].find('>') {
+            let end = start + 1 + rel_end;
             return Some(header_value[start + 1..end].to_string());
         }
     }
@@ -1199,6 +1206,31 @@ Content-Length: 0\r\n\
     fn test_retry_after_empty() {
         assert!(RetryAfter::parse("").is_none());
         assert!(RetryAfter::parse("   ").is_none());
+    }
+
+    // --- hardening: extract_uri must not panic on '>' before '<' -----------
+
+    #[test]
+    fn extract_uri_does_not_panic_on_reversed_angle_brackets() {
+        // A hostile display-name with a '>' before the URI's '<'. The old code
+        // computed start=find('<'), end=find('>') and sliced start+1..end with
+        // end < start, panicking. This is reachable from From/To/Contact on the
+        // request path (dialog creation, registrar, ACL).
+        let got = extract_uri("\"evil>name\" <sip:carol@example.com>");
+        assert_eq!(got.as_deref(), Some("sip:carol@example.com"));
+    }
+
+    #[test]
+    fn extract_uri_lone_leading_gt_is_not_treated_as_bracketed() {
+        // A '>' before the only '<'.
+        let got = extract_uri(">weird <sip:dave@example.com>");
+        assert_eq!(got.as_deref(), Some("sip:dave@example.com"));
+    }
+
+    #[test]
+    fn extract_uri_normal_bracketed_uri_unchanged() {
+        let got = extract_uri("Alice <sip:alice@example.com>;tag=1");
+        assert_eq!(got.as_deref(), Some("sip:alice@example.com"));
     }
 
     // --- issue #27: received/rport on the top Via (RFC 3261 §18.2.1 / 3581) ---
