@@ -22,6 +22,16 @@ harness (which drove a real Amazon Chime UAC into the real qa-sip Mumble bridge)
 
 ## What it asserts (receiver-side, like M0/M2)
 
+**INGRESS POLICY — captured Chime INVITE**
+- Loads a sanitized, shape-preserving 1,141-byte production-derived source
+  fixture with placeholder caller/resource IDs, then rewrites transaction IDs
+  and loopback media coordinates and recalculates the emitted Content-Length.
+  The replay retains the hostname R-URI, E.164 `+19709601891`, duplicate
+  Record-Route/Via, and `~` Contact alias.
+- the owned DID from the allowlisted Chime source reaches the PIN gate.
+- a neighboring E.164 DID gets 404, and the owned DID from an unallowlisted
+  packet source gets 403.
+
 **CASE 1 — REJECTED (wrong PIN must not reach the bridge)**
 - rustisk log contains `Verbose: PIN_GATE_RESULT=REJECTED`.
 - the mock endpoint's `invite_count == 0` — rustisk **never** Dialed the bridge.
@@ -59,6 +69,7 @@ Everything binds fresh loopback IPs + high ports, asserted free by a preflight
 | rustisk (SUT) | `127.0.0.60` | `35060` | `36000-36100` | `35038` |
 | synthetic Chime caller | `127.0.0.61` | `35062` | `36200` | — |
 | mock qa-bridge | `127.0.0.62` | `35064` | `36300` | — |
+| untrusted negative control | `127.0.0.63` | `35066` | `36400` | — |
 
 None of these touch the reserved live/arming ports (`:45070` live trunk,
 `:25060/:25038/:25062/:21000-21100` M9 arming, `:15060/:15038` M0) — the

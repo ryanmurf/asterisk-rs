@@ -20,12 +20,92 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import struct
 import sys
 import threading
 import time
 import wave
+
+
+CAPTURED_INVITE_SHA256 = "dd90ae2091827e471ad41173954c0b37b46a9e644f8642c27311437b0646758f"
+
+
+def validate_wire_message(invite):
+    """Fail closed if a transformed fixture is not a valid CRLF-framed SIP
+    message with an exact byte Content-Length."""
+    wire = invite.encode("ascii")
+    if b"\n" in wire.replace(b"\r\n", b""):
+        raise ValueError("transformed INVITE contains a bare LF")
+    try:
+        header_bytes, body_bytes = wire.split(b"\r\n\r\n", 1)
+    except ValueError as exc:
+        raise ValueError("transformed INVITE has no CRLF header terminator") from exc
+    lengths = [
+        line.split(b":", 1)[1].strip()
+        for line in header_bytes.split(b"\r\n")
+        if line.lower().startswith(b"content-length:")
+    ]
+    if len(lengths) != 1:
+        raise ValueError("transformed INVITE must have exactly one Content-Length")
+    if int(lengths[0]) != len(body_bytes):
+        raise ValueError(
+            f"transformed INVITE Content-Length {int(lengths[0])} != body bytes {len(body_bytes)}"
+        )
+
+
+def build_invite_from_capture(path, args, callid, fromtag, branch):
+    """Load the shape-preserving sanitized Chime capture, then rewrite only
+    values that must be local/unique for a hermetic replay.
+
+    The hash is over the 1,141 CRLF fixture bytes. Keeping the production
+    hostname R-URI, duplicate Record-Route/Via grammar, and Ribbon Contact
+    alias in a fixture prevents the synthetic UAC from drifting back to an
+    unrealistically simple request. Caller and carrier resource identifiers
+    are placeholders and contain no production identity.
+    """
+    import hashlib
+
+    with open(path, "rb") as f:
+        fixture = f.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    digest = hashlib.sha256(fixture).hexdigest()
+    if digest != CAPTURED_INVITE_SHA256:
+        raise ValueError(
+            f"captured INVITE fixture hash mismatch: {digest} != {CAPTURED_INVITE_SHA256}"
+        )
+
+    text = fixture.decode("ascii")
+    header_text, body = text.split("\r\n\r\n", 1)
+    if header_text.count("Record-Route:") != 2 or header_text.count("Via:") != 2:
+        raise ValueError("captured INVITE must retain both Record-Route and Via pairs")
+    if "alias=10.0.35.192~44933~2" not in header_text:
+        raise ValueError("captured INVITE lost the Ribbon/Kamailio Contact alias")
+
+    # Preserve the public signaling header shapes. Only the offered media
+    # endpoint must be reachable inside this loopback-only test.
+    body = body.replace("99.77.253.139", args.src_ip)
+    body = body.replace("m=audio 28948", f"m=audio {args.rtp_port}")
+    body = body.replace("a=rtcp:28949", f"a=rtcp:{args.rtp_port + 1}")
+
+    header_lines = header_text.split("\r\n")
+    top_via_rewritten = False
+    for index, line in enumerate(header_lines):
+        line = line.replace("+19709601891", args.exten)
+        line = line.replace("fixtureTag001", fromtag)
+        if line.startswith("Call-ID:"):
+            line = f"Call-ID: {callid}"
+        elif line.startswith("Content-Length:"):
+            line = f"Content-Length: {len(body.encode('ascii'))}"
+        elif line.startswith("Via: SIP/2.0/UDP 99.77.253.6:5060;") and not top_via_rewritten:
+            line = re.sub(r"(?<=;branch=)[^;]+", branch, line, count=1)
+            top_via_rewritten = True
+        header_lines[index] = line
+    header_text = "\r\n".join(header_lines)
+    invite = f"{header_text}\r\n\r\n{body}"
+    validate_wire_message(invite)
+    ruri = invite.split("\r\n", 1)[0].split()[1]
+    return invite, ruri
 
 
 def log(*a):
@@ -135,6 +215,8 @@ def main():
     ap.add_argument("--sip-port", type=int, default=35062)
     ap.add_argument("--rtp-port", type=int, default=36200)
     ap.add_argument("--exten", default="9000")
+    ap.add_argument("--invite-fixture")
+    ap.add_argument("--expect-status", type=int, default=200)
     ap.add_argument("--pin", required=True)
     ap.add_argument("--tone", type=int, default=440)  # A -> far-end tone
     ap.add_argument("--detect", type=int, default=660)  # far-end -> A tone we expect back
@@ -164,17 +246,29 @@ def main():
         f"a=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n"
         f"a=fmtp:101 0-15\r\na=ptime:20\r\na=sendrecv\r\n"
     )
-    ruri = f"sip:{args.exten}@{args.dst_ip}:{args.dst_port}"
-    invite = (
-        f"INVITE {ruri} SIP/2.0\r\n"
-        f"Via: SIP/2.0/UDP {args.src_ip}:{args.sip_port};branch={branch};rport\r\n"
-        f"Max-Forwards: 70\r\n"
-        f"From: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
-        f"To: <{ruri}>\r\n"
-        f"Call-ID: {callid}\r\nCSeq: {cseq} INVITE\r\n"
-        f"Contact: <sip:chime@{args.src_ip}:{args.sip_port}>\r\n"
-        f"Content-Type: application/sdp\r\nContent-Length: {len(sdp)}\r\n\r\n{sdp}"
-    )
+    if args.invite_fixture:
+        invite, ruri = build_invite_from_capture(
+            args.invite_fixture, args, callid, fromtag, branch
+        )
+    else:
+        ruri = f"sip:{args.exten}@{args.dst_ip}:{args.dst_port}"
+        invite = (
+            f"INVITE {ruri} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {args.src_ip}:{args.sip_port};branch={branch};rport\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"From: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
+            f"To: <{ruri}>\r\n"
+            f"Call-ID: {callid}\r\nCSeq: {cseq} INVITE\r\n"
+            f"Contact: <sip:chime@{args.src_ip}:{args.sip_port}>\r\n"
+            f"Content-Type: application/sdp\r\nContent-Length: {len(sdp)}\r\n\r\n{sdp}"
+        )
+    # The production capture uses a large carrier-generated CSeq rather than
+    # the synthetic default of 1. ACK must reuse it and BYE must advance it or
+    # rustisk correctly rejects those in-dialog requests.
+    cseq_match = re.search(r"(?m)^CSeq: (\d+) INVITE\r?$", invite)
+    if not cseq_match:
+        raise ValueError("INVITE fixture has no numeric INVITE CSeq")
+    cseq = int(cseq_match.group(1))
     sipsock.sendto(invite.encode(), (args.dst_ip, args.dst_port))
     log(f"INVITE -> {ruri}")
 
@@ -190,7 +284,21 @@ def main():
         msg = data.decode("latin1")
         first = msg.split("\r\n", 1)[0]
         log("SIP <=", first)
-        if " 200 " in first:
+        parts = first.split()
+        status = int(parts[1]) if len(parts) >= 2 and parts[0] == "SIP/2.0" else None
+        if status is not None and status >= 200 and status != args.expect_status:
+            log(f"unexpected final status: wanted {args.expect_status}, got {status}")
+            _write_result(
+                args,
+                {"error": "unexpected_status", "sip_status": status, "voice_rx": 0},
+                exit_code=2,
+            )
+            return 2
+        if status == args.expect_status and status != 200:
+            log(f"expected SIP {status} received")
+            _write_result(args, {"sip_status": status, "voice_rx": 0}, exit_code=0)
+            return 0
+        if status == 200:
             for l in msg.split("\r\n"):
                 if l.lower().startswith("to:") and "tag=" in l.lower():
                     totag = l.split("tag=", 1)[1].strip()
@@ -198,8 +306,12 @@ def main():
             break
         # 100/180/183 -> keep waiting
     if ok_body is None:
-        log("no 200 OK; aborting")
-        _write_result(args, {"error": "no_200_ok", "voice_rx": 0}, exit_code=2)
+        log(f"no expected SIP {args.expect_status}; aborting")
+        _write_result(
+            args,
+            {"error": "no_expected_status", "expected_status": args.expect_status, "voice_rx": 0},
+            exit_code=2,
+        )
         return 2
 
     pcmu_pt, tev_pt, rip, rport = parse_sdp_pts(ok_body)
