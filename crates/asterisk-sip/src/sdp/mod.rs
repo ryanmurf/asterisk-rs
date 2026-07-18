@@ -1531,6 +1531,38 @@ a=sendrecv\r\n";
     }
 
     #[test]
+    fn chime_rtcp_attributes_do_not_reject_offer_or_answer() {
+        let offer = SessionDescription::parse(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 10.0.0.1\r\n\
+             s=Chime\r\n\
+             c=IN IP4 10.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtcp:40001 IN IP4 10.0.0.1\r\n\
+             a=rtcp-mux\r\n\
+             a=sendrecv\r\n",
+        )
+        .expect("Chime-style SDP offer must parse");
+
+        let offered_audio = &offer.media_descriptions[0];
+        assert!(offered_audio.has_rtcp_mux());
+        assert!(offered_audio.attributes.iter().any(|(name, value)| {
+            name == "rtcp" && value.as_deref() == Some("40001 IN IP4 10.0.0.1")
+        }));
+
+        let answer =
+            SessionDescription::create_answer(&offer, "127.0.0.1", 55555, &[codecs_pcmu()]);
+        assert_eq!(answer.media_descriptions.len(), 1);
+        assert_eq!(answer.media_descriptions[0].port, 55555);
+
+        let reparsed_answer = SessionDescription::parse(&answer.to_string())
+            .expect("answer to Chime-style offer must serialize and parse");
+        assert_eq!(reparsed_answer.media_descriptions[0].port, 55555);
+    }
+
+    #[test]
     fn test_sdp_parse_dtls_attributes() {
         let sdp_text = "v=0\r\n\
             o=- 12345 12345 IN IP4 10.0.0.1\r\n\
