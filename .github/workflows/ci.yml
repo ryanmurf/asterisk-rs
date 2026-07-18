@@ -71,3 +71,20 @@ jobs:
         run: scripts/fetch-pjproject.sh
       - name: Build shim with pjproject-cffi
         run: cargo build -p pjsip-shim --features pjproject-cffi
+
+  e2e-trunk:
+    # Hermetic end-to-end proof of the inbound-trunk PIN-gate path
+    # (synthetic Chime INVITE -> PinGate -> GRANTED -> Dial(PJSIP/qa-bridge)
+    # -> a mock registered SIP endpoint -> two-way RTP; and wrong PIN ->
+    # REJECTED -> no Dial). It is fully self-contained: only the rustisk
+    # binary + python3 stdlib + loopback (no FreeSWITCH, Mumble, docker,
+    # NET_RAW or root), so it runs unattended here. See tests/e2e-trunk/README.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rustisk binary
+        run: cargo build --bin rustisk
+      - name: Run hermetic trunk e2e (PIN gate -> bridge -> two-way RTP + reject)
+        run: tests/e2e-trunk/run.sh

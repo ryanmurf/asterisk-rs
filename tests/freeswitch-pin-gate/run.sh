@@ -1083,6 +1083,7 @@ run_m2_two_way_bye_case() {
     local sniff_pid
     local metadata_file="$RUNTIME_DIR/m2-a-rtp-metadata.json"
     local sniffer_ready="$RUNTIME_DIR/m2-sniffer-ready"
+    local sniffer_go="$RUNTIME_DIR/m2-sniffer-go"
     local metadata
     local payload_type
     local sequence
@@ -1117,13 +1118,14 @@ run_m2_two_way_bye_case() {
     [[ "$negotiated_remote" == "$FS_CONTAINER_IP:$a_source_port" ]] \
         || fail "inbound negotiated remote mismatch: expected=$FS_CONTAINER_IP:$a_source_port actual=$negotiated_remote"
 
-    rm -f "$sniffer_ready"
+    rm -f "$sniffer_ready" "$sniffer_go"
     rtp_sniffer sniff \
         --source-ip "$FS_CONTAINER_IP" \
         --source-port "$a_source_port" \
         --destination-ip "$FS_HOST_IP" \
         --destination-port "$a_destination_port" \
         --ready-file /runtime/m2-sniffer-ready \
+        --go-file /runtime/m2-sniffer-go \
         --timeout 5 >"$metadata_file" &
     sniff_pid=$!
     for _ in {1..100}; do
@@ -1131,7 +1133,17 @@ run_m2_two_way_bye_case() {
         sleep 0.05
     done
     [[ -f "$sniffer_ready" ]] || fail "RTP sniffer did not become ready"
+    # The sniffer's 5s match deadline does not start until it observes
+    # $sniffer_go (see rtp_injector.py's priming phase). Only touch it after
+    # fs_cli's synchronous ESL round trip confirms FreeSWITCH actually
+    # accepted uuid_broadcast — this closes the race where docker-exec/ESL
+    # setup latency was silently consumed out of the match window before any
+    # real media left FreeSWITCH (previously: deadline started at socket
+    # open, so a slow `docker exec`+ESL round trip could eat the whole
+    # window and fail with "no matching RTP packet observed" while real
+    # frames were still incoming or about to arrive).
     fs_cli "uuid_broadcast $a_uuid tone_stream://%(1000,0,440) aleg" >/dev/null
+    touch "$sniffer_go"
     wait "$sniff_pid" || fail "RTP sniffer did not observe A's negotiated source"
     sleep 1.2
     fs_cli "uuid_broadcast $b_uuid tone_stream://%(1000,0,660) aleg" >/dev/null
@@ -1639,6 +1651,13 @@ fi
 if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m5-soak" ]]; then
     run_m5_soak_case
     printf '\nPASS: isolated M5 exact-baseline soak.\n'
+    printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
+    exit 0
+fi
+
+if [[ "${FREESWITCH_PIN_GATE_CASE:-all}" == "m2-standalone" ]]; then
+    run_m2_two_way_bye_case
+    printf '\nPASS: isolated M2 two-way / ingress-hygiene / BYE-silent re-run.\n'
     printf 'Proof artifacts: %s\n' "$RUNTIME_DIR"
     exit 0
 fi
