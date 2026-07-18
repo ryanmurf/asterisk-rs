@@ -1,0 +1,29 @@
+INVITE sip:+19709601891@voice.murphytek.com:45070;transport=UDP SIP/2.0
+Record-Route: <sip:99.77.253.6:5060;r2=on;lr;ftag=fixtureTag001;did=0000.0000;nat=yes>
+Record-Route: <sip:99.77.253.6;transport=tcp;r2=on;lr;ftag=fixtureTag001;did=0000.0000;nat=yes>
+Via: SIP/2.0/UDP 99.77.253.6:5060;branch=z9hG4bKaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0;i=000
+Via: SIP/2.0/UDP 10.0.35.192;received=10.0.35.192;rport=44933;branch=z9hG4bKfixtureBranch
+Max-Forwards: 69
+From: <sip:+15555550100@10.0.35.192:5060>;tag=fixtureTag001
+To: <sip:+19709601891@voice.murphytek.com:45070>;transport=UDP
+Call-ID: 00000000-0000-4000-8000-000000000000
+CSeq: 100000001 INVITE
+Contact: <sip:10.0.35.192:5060;alias=10.0.35.192~44933~2>
+Content-Type: application/sdp
+Content-Length: 250
+X-Vine-ID: 00000000-0000-4000-8000-000000000000
+X-VoiceConnector-ID: fixture000000000000000
+User-Agent: VineProx-v2.3
+
+v=0
+o=Sonus_UAC 000000 00000 IN IP4 99.77.253.139
+s=SIP Media Capabilities
+t=0 0
+m=audio 28948 RTP/AVP 0 101
+c=IN IP4 99.77.253.139
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+a=rtcp:28949
+a=ptime:20

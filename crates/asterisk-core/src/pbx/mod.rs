@@ -516,6 +516,17 @@ mod tests {
     }
 
     #[test]
+    fn test_e164_plus_requires_literal_extension() {
+        let digit_pattern = Extension::new("_X.");
+        assert!(digit_pattern.matches("19709601891"));
+        assert!(!digit_pattern.matches("+19709601891"));
+
+        let owned_did = Extension::new("+19709601891");
+        assert!(owned_did.matches("+19709601891"));
+        assert!(!owned_did.matches("+19709601892"));
+    }
+
+    #[test]
     fn test_pattern_n() {
         let ext = Extension::new("_NXX");
         assert!(ext.matches("200"));

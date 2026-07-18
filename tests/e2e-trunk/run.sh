@@ -39,6 +39,13 @@ RK_IP=127.0.0.60;  RK_SIP=35060;  RK_AMI=35038
 RTP_START=36000;   RTP_END=36100
 CALLER_IP=127.0.0.61; CALLER_SIP=35062; CALLER_RTP=36200
 MOCK_IP=127.0.0.62;   MOCK_SIP=35064;   MOCK_RTP=36300
+UNTRUSTED_IP=127.0.0.63; UNTRUSTED_SIP=35066; UNTRUSTED_RTP=36400
+
+# The one production DID this least-privilege trunk accepts. Chime presents it
+# in canonical E.164 form, including the leading '+'.
+CHIME_DID="+19709601891"
+WRONG_CHIME_DID="+19709601892"
+CHIME_INVITE_FIXTURE="$HARNESS_DIR/fixtures/chime-invite.txt"
 
 # --- TEST-ONLY secrets (never the real PIN / qa-bridge password) ---
 TEST_PIN="246813"
@@ -88,19 +95,19 @@ preflight_ports() {
     udp="$(ss -Huan 2>/dev/null || true)"
     tcp="$(ss -Htan 2>/dev/null || true)"
     local p
-    for p in "$RK_SIP" "$CALLER_SIP" "$MOCK_SIP" "$CALLER_RTP" "$MOCK_RTP" "$RTP_START" "$RTP_END"; do
+    for p in "$RK_SIP" "$CALLER_SIP" "$MOCK_SIP" "$UNTRUSTED_SIP" "$CALLER_RTP" "$MOCK_RTP" "$UNTRUSTED_RTP" "$RTP_START" "$RTP_END"; do
         grep -qE "[.:]$p( |\$)|:$p " <<<"$udp" && busy+="udp/$p "
     done
     grep -qE "[.:]$RK_AMI( |\$)|:$RK_AMI " <<<"$tcp" && busy+="tcp/$RK_AMI "
     # Also assert we are NOT about to touch any known live/m0/m9 port.
     local forbidden="45070 25060 25038 25062 21000 21100 15060 15038"
-    for p in "$RK_SIP" "$RK_AMI" "$CALLER_SIP" "$MOCK_SIP" "$RTP_START" "$RTP_END" "$CALLER_RTP" "$MOCK_RTP"; do
+    for p in "$RK_SIP" "$RK_AMI" "$CALLER_SIP" "$MOCK_SIP" "$UNTRUSTED_SIP" "$RTP_START" "$RTP_END" "$CALLER_RTP" "$MOCK_RTP" "$UNTRUSTED_RTP"; do
         for f in $forbidden; do
             [[ "$p" == "$f" ]] && fail "port $p collides with a reserved live/m0/m9 port"
         done
     done
     [[ -z "$busy" ]] || fail "ports already in use: $busy (is a stray rustisk/mock running?)"
-    log "PREFLIGHT: OK — SIP $RK_SIP / AMI $RK_AMI / RTP $RTP_START-$RTP_END + caller $CALLER_SIP/$CALLER_RTP + mock $MOCK_SIP/$MOCK_RTP all free"
+    log "PREFLIGHT: OK — SIP $RK_SIP / AMI $RK_AMI / RTP $RTP_START-$RTP_END + caller $CALLER_SIP/$CALLER_RTP + mock $MOCK_SIP/$MOCK_RTP + untrusted $UNTRUSTED_SIP/$UNTRUSTED_RTP all free"
 }
 
 ensure_binary() {
@@ -197,22 +204,11 @@ match = $MOCK_IP/32
 EOF
 
     cat >"$CONFIG_DIR/extensions.conf" <<EOF
-; Chime INVITE (any DID) -> PIN gate. On GRANTED, Dial(PJSIP/qa-bridge) bridges
+; Owned Chime DID -> PIN gate. On GRANTED, Dial(PJSIP/qa-bridge) bridges
 ; the caller into the registered mock endpoint. On REJECTED, play + hang up
 ; WITHOUT dialing (the bridge must never be INVITEd).
 [pin-gate]
-exten => _X.,1,Answer()
- same => n,PinGate($PROMPT_DIR/pin-prompt.wav,20,7)
- same => n,GotoIf(\$["\${PINGATESTATUS}" = "GRANTED"]?10:20)
- same => 10,Verbose(0,PIN_GATE_RESULT=GRANTED)
- same => n,Playback($PROMPT_DIR/granted.wav)
- same => n,Dial(PJSIP/$BRIDGE_USER,30)
- same => n,Hangup()
- same => 20,Verbose(0,PIN_GATE_RESULT=REJECTED)
- same => n,Playback($PROMPT_DIR/rejected.wav)
- same => n,Hangup()
-
-exten => 9000,1,Answer()
+exten => $CHIME_DID,1,Answer()
  same => n,PinGate($PROMPT_DIR/pin-prompt.wav,20,7)
  same => n,GotoIf(\$["\${PINGATESTATUS}" = "GRANTED"]?10:20)
  same => 10,Verbose(0,PIN_GATE_RESULT=GRANTED)
@@ -270,10 +266,25 @@ run_caller() {
     python3 "$HARNESS_DIR/chime_caller.py" \
         --dst-ip "$RK_IP" --dst-port "$RK_SIP" \
         --src-ip "$CALLER_IP" --sip-port "$CALLER_SIP" --rtp-port "$CALLER_RTP" \
-        --exten 9000 --pin "$pin" \
+        --exten "$CHIME_DID" --invite-fixture "$CHIME_INVITE_FIXTURE" --pin "$pin" \
         --tone "$CALLER_TONE" --detect "$BRIDGE_TONE" \
         --call-secs "$callsecs" --rx-wav "$rxwav" --result-file "$result" \
         2>"$RUNTIME_DIR/$(basename "$result").caller.log" || true
+}
+
+run_status_probe() {
+    local src_ip="$1" sip_port="$2" rtp_port="$3" exten="$4" status="$5" result="$6"
+    rm -f "$result"
+    python3 "$HARNESS_DIR/chime_caller.py" \
+        --dst-ip "$RK_IP" --dst-port "$RK_SIP" \
+        --src-ip "$src_ip" --sip-port "$sip_port" --rtp-port "$rtp_port" \
+        --exten "$exten" --invite-fixture "$CHIME_INVITE_FIXTURE" \
+        --expect-status "$status" --pin "$WRONG_PIN" \
+        --call-secs 0.1 --rx-wav "$RUNTIME_DIR/probe-unused.wav" --result-file "$result" \
+        2>"$result.caller.log" || true
+    assert_json "$result" "captured INVITE expected SIP $status" \
+        "d.get('sip_status') == $status" >/dev/null \
+        || fail "captured INVITE probe from $src_ip to $exten did not receive SIP $status"
 }
 
 # JSON assertion helper: python3 predicate over a result file. Exits non-zero
@@ -306,10 +317,24 @@ PY
 main() {
     require python3; require ss; require stdbuf
     log "=== rustisk e2e-trunk (hermetic) ==="
+    python3 "$HARNESS_DIR/test_chime_fixture.py"
     preflight_ports
     ensure_binary
     write_configs
     start_rustisk
+
+    # ---------- ingress policy: exact DID + source ACL ----------
+    # These are the two negative controls for the sanitized production-derived
+    # Chime request shape. A neighboring E.164 DID must not enter the gate,
+    # and even the owned DID must be rejected when its source is not identified.
+    log ""
+    log "--- INGRESS POLICY: exact E.164 DID + allowlisted Chime source ---"
+    run_status_probe "$CALLER_IP" "$CALLER_SIP" "$CALLER_RTP" \
+        "$WRONG_CHIME_DID" 404 "$RUNTIME_DIR/wrong-did.json"
+    log "WRONG DID: PASS ($WRONG_CHIME_DID -> SIP 404)"
+    run_status_probe "$UNTRUSTED_IP" "$UNTRUSTED_SIP" "$UNTRUSTED_RTP" \
+        "$CHIME_DID" 403 "$RUNTIME_DIR/untrusted-source.json"
+    log "UNTRUSTED SOURCE: PASS ($UNTRUSTED_IP -> SIP 403)"
 
     # ---------- CASE 1: REJECTED (wrong PIN -> NO Dial) ----------
     log ""
