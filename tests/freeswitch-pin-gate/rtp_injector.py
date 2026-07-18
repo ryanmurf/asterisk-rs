@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 import json
 import math
+import os
 import socket
 import struct
 import time
@@ -61,8 +62,54 @@ def raw_udp(
         raw.sendto(header + udp, (destination_ip, destination_port))
 
 
+def _read_one(packet_socket: socket.socket, args: argparse.Namespace, totals: Counter, udp_flows: Counter):
+    """Read and classify a single frame. Returns a match dict, or None if the
+    frame (if any) didn't match — never blocks longer than the socket's own
+    recv timeout. Always updates totals/udp_flows so nothing observed during
+    any phase of the sniff is lost."""
+    try:
+        frame = packet_socket.recv(65535)
+    except TimeoutError:
+        return None
+    totals["frames"] += 1
+    if len(frame) < 34 or struct.unpack("!H", frame[12:14])[0] != 0x0800:
+        return None
+    totals["ipv4"] += 1
+    ip_offset = 14
+    ihl = (frame[ip_offset] & 0x0F) * 4
+    if len(frame) < ip_offset + ihl + 8 or frame[ip_offset + 9] != socket.IPPROTO_UDP:
+        return None
+    totals["udp"] += 1
+    source_ip = socket.inet_ntoa(frame[ip_offset + 12 : ip_offset + 16])
+    destination_ip = socket.inet_ntoa(frame[ip_offset + 16 : ip_offset + 20])
+    udp_offset = ip_offset + ihl
+    source_port, destination_port = struct.unpack("!HH", frame[udp_offset : udp_offset + 4])
+    payload = frame[udp_offset + 8 :]
+    udp_flows[f"{source_ip}:{source_port}->{destination_ip}:{destination_port}"] += 1
+    if (
+        source_ip != args.source_ip
+        or destination_ip != args.destination_ip
+        or source_port != args.source_port
+        or destination_port != args.destination_port
+        or len(payload) < 12
+        or payload[0] >> 6 != 2
+    ):
+        return None
+    payload_type = payload[1] & 0x7F
+    sequence, timestamp, ssrc = struct.unpack("!HII", payload[2:12])
+    return {
+        "payload_type": payload_type,
+        "sequence": sequence,
+        "timestamp": timestamp,
+        "ssrc": ssrc,
+    }
+
+
+def _flows_summary(udp_flows: Counter) -> str:
+    return ", ".join(f"{flow}={count}" for flow, count in udp_flows.most_common(8))
+
+
 def sniff(args: argparse.Namespace) -> None:
-    deadline = time.monotonic() + args.timeout
     totals: Counter[str] = Counter()
     udp_flows: Counter[str] = Counter()
     with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as packet_socket:
@@ -70,54 +117,47 @@ def sniff(args: argparse.Namespace) -> None:
             with open(args.ready_file, "w", encoding="utf-8") as ready:
                 ready.write("ready\n")
         packet_socket.settimeout(0.2)
-        while time.monotonic() < deadline:
-            try:
-                frame = packet_socket.recv(65535)
-            except TimeoutError:
-                continue
-            totals["frames"] += 1
-            if len(frame) < 34 or struct.unpack("!H", frame[12:14])[0] != 0x0800:
-                continue
-            totals["ipv4"] += 1
-            ip_offset = 14
-            ihl = (frame[ip_offset] & 0x0F) * 4
-            if len(frame) < ip_offset + ihl + 8 or frame[ip_offset + 9] != socket.IPPROTO_UDP:
-                continue
-            totals["udp"] += 1
-            source_ip = socket.inet_ntoa(frame[ip_offset + 12 : ip_offset + 16])
-            destination_ip = socket.inet_ntoa(frame[ip_offset + 16 : ip_offset + 20])
-            udp_offset = ip_offset + ihl
-            source_port, destination_port = struct.unpack("!HH", frame[udp_offset : udp_offset + 4])
-            payload = frame[udp_offset + 8 :]
-            udp_flows[f"{source_ip}:{source_port}->{destination_ip}:{destination_port}"] += 1
-            if (
-                source_ip != args.source_ip
-                or destination_ip != args.destination_ip
-                or source_port != args.source_port
-                or destination_port != args.destination_port
-                or len(payload) < 12
-                or payload[0] >> 6 != 2
-            ):
-                continue
-            payload_type = payload[1] & 0x7F
-            sequence, timestamp, ssrc = struct.unpack("!HII", payload[2:12])
-            print(
-                json.dumps(
-                    {
-                        "payload_type": payload_type,
-                        "sequence": sequence,
-                        "timestamp": timestamp,
-                        "ssrc": ssrc,
-                    },
-                    sort_keys=True,
-                )
+
+        # Priming phase. The capture loop is already live at this point (the
+        # ready-file above proves the raw socket is bound), but the caller's
+        # flow-triggering action (an ESL round trip through a `docker exec`
+        # into a FreeSWITCH container) has its own, host-load-dependent
+        # startup latency that has nothing to do with RTP transit time. The
+        # original implementation started its match deadline the instant the
+        # socket opened, so that setup latency was silently deducted from the
+        # assertion window — occasionally consuming all of it before
+        # FreeSWITCH ever emitted a packet, which read as "no matching RTP
+        # packet observed" even though RTP was about to flow (or had just
+        # started) fine. Keep reading and classifying every frame during this
+        # phase — so an early packet is never missed — but don't start the
+        # real timeout clock until the caller confirms (via go_file) that it
+        # has actually issued the flow-triggering action. If a match arrives
+        # during priming, that's fine too: treat it as an immediate go.
+        match = None
+        if args.go_file:
+            priming_deadline = time.monotonic() + args.priming_timeout
+            while match is None and not os.path.exists(args.go_file):
+                if time.monotonic() > priming_deadline:
+                    raise SystemExit(
+                        "go-file was never observed within the priming budget "
+                        f"({args.priming_timeout}s) — the flow-triggering action "
+                        "was never confirmed issued: "
+                        f"frames={totals['frames']} ipv4={totals['ipv4']} "
+                        f"udp={totals['udp']} flows=[{_flows_summary(udp_flows)}]"
+                    )
+                match = _read_one(packet_socket, args, totals, udp_flows)
+
+        deadline = time.monotonic() + args.timeout
+        while match is None and time.monotonic() < deadline:
+            match = _read_one(packet_socket, args, totals, udp_flows)
+
+        if match is None:
+            raise SystemExit(
+                "no matching RTP packet observed: "
+                f"frames={totals['frames']} ipv4={totals['ipv4']} udp={totals['udp']} "
+                f"flows=[{_flows_summary(udp_flows)}]"
             )
-            return
-    flows = ", ".join(f"{flow}={count}" for flow, count in udp_flows.most_common(8))
-    raise SystemExit(
-        "no matching RTP packet observed: "
-        f"frames={totals['frames']} ipv4={totals['ipv4']} udp={totals['udp']} flows=[{flows}]"
-    )
+        print(json.dumps(match, sort_keys=True))
 
 
 def inject(args: argparse.Namespace) -> None:
@@ -262,6 +302,22 @@ def main() -> None:
     common_arguments(sniff_parser)
     sniff_parser.add_argument("--timeout", type=float, default=5.0)
     sniff_parser.add_argument("--ready-file")
+    sniff_parser.add_argument(
+        "--go-file",
+        help=(
+            "Path the caller creates once it has confirmed the flow-triggering "
+            "action was actually issued (e.g. after a synchronous ESL command "
+            "returns). --timeout is measured from this point, not from socket "
+            "open, so caller-side setup latency can't eat into the match window. "
+            "If omitted, --timeout is measured from socket open as before."
+        ),
+    )
+    sniff_parser.add_argument(
+        "--priming-timeout",
+        type=float,
+        default=20.0,
+        help="Bounded fallback: how long to wait for --go-file to appear before giving up.",
+    )
     sniff_parser.set_defaults(function=sniff)
 
     inject_parser = commands.add_parser("inject")
