@@ -29,16 +29,25 @@ harness (which drove a real Amazon Chime UAC into the real qa-sip Mumble bridge)
 **CASE 2 — GRANTED (correct PIN → Dial → two-way media)**
 - rustisk log contains `Verbose: PIN_GATE_RESULT=GRANTED`.
 - **A → bridge:** the mock received the caller's relayed tone —
-  `invite_count == 1`, `rx_voice ≥ 100` frames, and **440 Hz is the dominant
-  band** in the mock's received audio.
+  `invite_count == 1`, `rx_voice ≥ 100` frames, 440 Hz **above the noise floor
+  AND ≥ 10× every other band**, and the RTP arrived **from rustisk's media IP**.
 - **bridge → A:** the caller received the bridge's distinct tone —
-  `voice_rx ≥ 100` frames, and **660 Hz is the dominant band** in the caller's
-  received audio.
+  `voice_rx ≥ 100` frames, 660 Hz **above the noise floor AND ≥ 10× every other
+  band**, and the RTP arrived **from rustisk's media IP**.
 
-Distinct tones (caller 440 Hz, mock 660 Hz), each detected on the *far* side,
-make each RTP direction independently attributable by frequency — a stronger
-proof than an echo (an echo cannot distinguish a relayed frame from a socket
-loop). Tone detection is a stdlib Goertzel filter, so **CI needs no numpy**.
+Three independent things are asserted per direction, so a passing GRANTED case
+cannot be faked:
+1. **Distinct tones** (caller 440, mock 660), each detected only on the *far*
+   side — an echo or socket loop carries the wrong frequency and fails.
+2. **Above-noise + 10× dominance** — the target band must clear a floor well
+   above the Goertzel noise band (~150-360) *and* beat every other band by 10×,
+   so silence / comfort-noise (which still counts as frames) can't slip through
+   on a coincidental band win.
+3. **Relay-source check** — the received RTP source IP must equal rustisk's
+   media IP, proving rustisk *relayed* the audio rather than the legs going
+   peer-to-peer (defends against a `direct_media` regression).
+
+Tone detection is a stdlib Goertzel filter, so **CI needs no numpy**.
 
 ## Isolation (no collision with live / m0 / m9)
 
@@ -74,7 +83,8 @@ Linux loopback. No docker, no NET_RAW, no root. Exit status **is** the result
 `target/e2e-trunk/`.
 
 Knobs: `RUSTISK_BIN`, `MIN_VOICE_FRAMES` (default 100), `MIN_TONE_RATIO`
-(default 20), `KEEP_RUNTIME` (keep artifacts).
+(default 5000 — an order of magnitude above the noise floor), `KEEP_RUNTIME`
+(keep artifacts).
 
 ## Proven green — 2× consecutive (calibration runs, rustisk @ 461ad74)
 

@@ -51,8 +51,12 @@ CALLER_TONE=440    # caller -> bridge  (proves A->bridge on the mock RX)
 BRIDGE_TONE=660    # bridge -> caller  (proves bridge->A on the caller RX)
 
 # --- assertion thresholds (overridable) ---
+# MIN_TONE_RATIO is deliberately set an order of magnitude ABOVE the observed
+# Goertzel noise-band floor (~150-360) and ~3 orders BELOW a real relayed tone
+# (~2e6), so a silence/comfort-noise "relay" can neither clear the floor nor the
+# 10x dominance margin the GRANTED assertions also require.
 MIN_VOICE_FRAMES="${MIN_VOICE_FRAMES:-100}"
-MIN_TONE_RATIO="${MIN_TONE_RATIO:-20}"
+MIN_TONE_RATIO="${MIN_TONE_RATIO:-5000}"
 
 RUSTISK_PID=""
 MOCK_PID=""
@@ -340,15 +344,17 @@ main() {
     assert_json "$grt_res" "GRANTED mock RX (A->bridge)" \
         "d['invite_count'] == 1" \
         "d['rx_voice'] >= $MIN_VOICE_FRAMES" \
+        "d.get('rtp_src') == '$RK_IP'" \
         "ratio($CALLER_TONE) >= $MIN_TONE_RATIO" \
-        "ratio($CALLER_TONE) == max((ratio($CALLER_TONE), ratio($BRIDGE_TONE), ratio(350), ratio(880)))" \
+        "ratio($CALLER_TONE) >= 10 * max((ratio($BRIDGE_TONE), ratio(350), ratio(880), 1))" \
         || fail "GRANTED case: A->bridge media not proven on the mock"
 
     # bridge -> A: the caller received the bridge's distinct 660 Hz tone
     assert_json "$caller_res" "GRANTED caller RX (bridge->A)" \
         "d.get('voice_rx',0) >= $MIN_VOICE_FRAMES" \
+        "d.get('rtp_src') == '$RK_IP'" \
         "ratio($BRIDGE_TONE) >= $MIN_TONE_RATIO" \
-        "ratio($BRIDGE_TONE) == max((ratio($BRIDGE_TONE), ratio($CALLER_TONE), ratio(350), ratio(880)))" \
+        "ratio($BRIDGE_TONE) >= 10 * max((ratio($CALLER_TONE), ratio(350), ratio(880), 1))" \
         || fail "GRANTED case: bridge->A media not proven on the caller"
 
     log "GRANTED: PASS (two-way RTP: A->bridge 440 Hz + bridge->A 660 Hz, both directions)"

@@ -292,13 +292,14 @@ def main():
     stop_media = threading.Event()
     got_bye = threading.Event()
     rx_pcm = []
+    rtp_srcs = {}  # source-IP histogram of received voice RTP (proves who relayed)
     media_started = threading.Event()
     remote = {"ip": None, "port": None, "pcmu_pt": 0}
 
     def rx_loop():
         while not stop_media.is_set():
             try:
-                pkt, _ = rtpsock.recvfrom(4096)
+                pkt, addr = rtpsock.recvfrom(4096)
             except socket.timeout:
                 continue
             if len(pkt) < 12:
@@ -308,6 +309,7 @@ def main():
             payload = pkt[12:]
             if pt == remote["pcmu_pt"] and payload:
                 state["rx_voice"] += 1
+                rtp_srcs[addr[0]] = rtp_srcs.get(addr[0], 0) + 1
                 rx_pcm.extend(mulaw_to_linear(b) for b in payload)
 
     def tx_loop():
@@ -315,7 +317,11 @@ def main():
         ts = random.randint(0, 0x7FFFFFFF)
         ssrc = random.randint(0, 0x7FFFFFFF)
         idx = 0
-        media_started.wait()
+        # Wait for the call to answer, but wake periodically so a REJECTED-case
+        # shutdown (no INVITE ever arrives) doesn't leave this thread parked.
+        while not media_started.wait(timeout=0.2):
+            if stop_media.is_set():
+                return
         while not stop_media.is_set():
             if remote["ip"]:
                 pkt = rtp_hdr(remote["pcmu_pt"], seq, ts, ssrc) + tone_pcmu(args.tx_tone, idx)
@@ -382,7 +388,7 @@ def main():
             respond(sipsock, addr, "200 OK", msg)
 
     stop_media.set()
-    time.sleep(0.2)
+    time.sleep(0.3)  # exceed the 0.25s rx socket timeout so rx_loop settles
 
     det = {}
     if len(rx_pcm) >= 1600:
@@ -397,6 +403,7 @@ def main():
         "rx_voice": state["rx_voice"],
         "rx_bytes": state["rx_bytes"],
         "rx_samples": len(rx_pcm),
+        "rtp_src": (max(rtp_srcs, key=rtp_srcs.get) if rtp_srcs else None),
         "tone_ratios": det,
         "detect_hz": args.detect,
     }

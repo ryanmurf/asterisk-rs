@@ -218,12 +218,13 @@ def main():
     stop = threading.Event()
     rx_frames = {"voice": 0, "other": 0, "bytes": 0}
     rx_pcm = []  # accumulated ONLY during the measurement window (post-bridge)
+    rtp_srcs = {}  # source-IP histogram of measured voice RTP (proves who relayed)
     measure_open = threading.Event()
 
     def rx_loop():
         while not stop.is_set():
             try:
-                pkt, _ = rtpsock.recvfrom(4096)
+                pkt, addr = rtpsock.recvfrom(4096)
             except socket.timeout:
                 continue
             if len(pkt) < 12:
@@ -234,6 +235,7 @@ def main():
             if pt == pcmu_pt and len(payload) > 0:
                 rx_frames["voice"] += 1
                 if measure_open.is_set():
+                    rtp_srcs[addr[0]] = rtp_srcs.get(addr[0], 0) + 1
                     rx_pcm.extend(mulaw_to_linear(b) for b in payload)
             else:
                 rx_frames["other"] += 1
@@ -320,6 +322,7 @@ def main():
         "other_rx": rx_frames["other"],
         "rx_bytes": rx_frames["bytes"],
         "rx_samples": len(rx_pcm),
+        "rtp_src": (max(rtp_srcs, key=rtp_srcs.get) if rtp_srcs else None),
         "tone_ratios": det,
         "detect_hz": args.detect,
     }
