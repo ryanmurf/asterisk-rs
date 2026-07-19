@@ -380,12 +380,27 @@ impl SipSession {
 
     /// Build a 200 OK response (for UAS).
     pub fn build_200_ok(&self) -> Option<SipMessage> {
+        self.build_200_ok_with_signaling_hostport(&self.signaling_hostport())
+    }
+
+    fn build_200_ok_with_signaling_hostport(&self, signaling_hostport: &str) -> Option<SipMessage> {
         let invite = self.invite.as_ref()?;
         let mut response = invite.create_response(200, "OK").ok()?;
 
+        // RFC 3261 section 12.1.1: a response that establishes a dialog MUST
+        // copy every Record-Route value from the request, preserving order and
+        // all parameters. Without this the UAC builds an empty route set and
+        // its ACK may bypass the proxy path that delivered the INVITE.
+        for record_route in invite.get_headers(header_names::RECORD_ROUTE) {
+            response.headers.push(SipHeader {
+                name: header_names::RECORD_ROUTE.to_string(),
+                value: record_route.to_string(),
+            });
+        }
+
         // Add Contact (NAT-scoped toward the peer: external addr/port for a
         // peer outside local_net, internal otherwise — New-3).
-        let contact = format!("<sip:asterisk@{}>", self.signaling_hostport());
+        let contact = format!("<sip:asterisk@{signaling_hostport}>");
         response.headers.push(SipHeader {
             name: header_names::CONTACT.to_string(),
             value: contact,
@@ -923,6 +938,120 @@ mod cp1_tests {
         assert!(routes[0].contains("10.0.0.9:5070"));
         // Physical next hop is the route-set first hop.
         assert_eq!(s.in_dialog_next_hop(), Some(addr("10.0.0.9:5070")));
+    }
+
+    #[test]
+    fn inbound_twoxx_copies_production_shaped_route_set_and_public_contact() {
+        let invite = SipMessage::parse(
+            b"INVITE sip:service@pbx.example.invalid SIP/2.0\r\n\
+              Record-Route: <sip:edge.example.invalid:5060;r2=on;lr;ftag=fixture;did=fixture;nat=yes>\r\n\
+              Record-Route: <sip:edge.example.invalid;transport=tcp;r2=on;lr;ftag=fixture;did=fixture;nat=yes>\r\n\
+              Via: SIP/2.0/UDP edge.example.invalid:5060;branch=z9hG4bKedge\r\n\
+              Via: SIP/2.0/TCP 10.0.0.9;branch=z9hG4bKuac\r\n\
+              From: <sip:caller@10.0.0.9>;tag=fixture\r\n\
+              To: <sip:service@pbx.example.invalid>\r\n\
+              Call-ID: fixture-call\r\n\
+              CSeq: 100000001 INVITE\r\n\
+              Contact: <sip:caller@10.0.0.9>\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        let session = SipSession::new_inbound(
+            &invite,
+            addr("192.0.2.10:45070"),
+            addr("198.51.100.7:5060"),
+        )
+        .unwrap();
+
+        let ok = session
+            .build_200_ok_with_signaling_hostport("203.0.113.99:45070")
+            .unwrap();
+        assert_eq!(
+            ok.get_header(header_names::CONTACT),
+            Some("<sip:asterisk@203.0.113.99:45070>"),
+            "the dialog Contact must advertise the public signaling target",
+        );
+        assert_eq!(
+            ok.get_headers(header_names::RECORD_ROUTE),
+            invite.get_headers(header_names::RECORD_ROUTE),
+            "the 2xx must preserve every Record-Route value, parameter, and order",
+        );
+    }
+
+    #[test]
+    fn preserved_route_set_sends_uac_ack_to_proxy_before_public_contact() {
+        let mut uac = SipSession::new_outbound(
+            addr("192.0.2.20:5060"),
+            addr("198.51.100.10:5060"),
+        );
+        let mut routed_invite =
+            uac.build_invite("sip:service@198.51.100.10:5060");
+        routed_invite.add_header(
+            header_names::RECORD_ROUTE,
+            "<sip:198.51.100.20:5060;r2=on;lr;nat=yes>",
+        );
+        routed_invite.add_header(
+            header_names::RECORD_ROUTE,
+            "<sip:198.51.100.21:5060;transport=tcp;r2=on;lr;nat=yes>",
+        );
+        let uas = SipSession::new_inbound(
+            &routed_invite,
+            addr("10.0.0.10:45070"),
+            addr("198.51.100.20:5060"),
+        )
+        .unwrap();
+        let ok = uas
+            .build_200_ok_with_signaling_hostport("203.0.113.99:45070")
+            .unwrap();
+
+        uac.on_response(&ok);
+        let ack = uac.build_ack().unwrap();
+        assert_eq!(
+            request_uri(&ack),
+            "sip:asterisk@203.0.113.99:45070",
+            "the public Contact is the ACK's remote target",
+        );
+        assert_eq!(
+            ack.get_headers(header_names::ROUTE),
+            vec![
+                "<sip:198.51.100.21:5060;transport=tcp;r2=on;lr;nat=yes>",
+                "<sip:198.51.100.20:5060;r2=on;lr;nat=yes>",
+            ],
+            "the UAC must reverse the copied Record-Route set for its ACK",
+        );
+        assert_eq!(
+            uac.in_dialog_next_hop(),
+            Some(addr("198.51.100.21:5060")),
+            "the ACK must reach the route-set proxy rather than going directly to Contact",
+        );
+    }
+
+    #[test]
+    fn inbound_twoxx_does_not_invent_record_route() {
+        let invite = SipMessage::parse(
+            b"INVITE sip:service@192.0.2.10 SIP/2.0\r\n\
+              Via: SIP/2.0/UDP 198.51.100.7;branch=z9hG4bKdirect\r\n\
+              From: <sip:caller@198.51.100.7>;tag=direct\r\n\
+              To: <sip:service@192.0.2.10>\r\n\
+              Call-ID: direct-call\r\n\
+              CSeq: 1 INVITE\r\n\
+              Contact: <sip:caller@198.51.100.7>\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        let session = SipSession::new_inbound(
+            &invite,
+            addr("192.0.2.10:45070"),
+            addr("198.51.100.7:5060"),
+        )
+        .unwrap();
+        let ok = session
+            .build_200_ok_with_signaling_hostport("203.0.113.99:45070")
+            .unwrap();
+        assert!(
+            ok.get_headers(header_names::RECORD_ROUTE).is_empty(),
+            "a direct dialog must not gain a proxy route set",
+        );
     }
 
     #[test]
