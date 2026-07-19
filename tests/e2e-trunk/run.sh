@@ -155,10 +155,10 @@ read = all
 write = system
 EOF
 
-    # NOTE: no external_media_address / external_signaling_address — for a
-    # loopback test rustisk then advertises its own bind IP ($RK_IP) as the
-    # media address (avoids the external-address blackhole documented in the
-    # rustisk SDP path). Each endpoint is identified by a DISTINCT /32 so an
+    # Exercise the external-signaling Contact path with a reachable loopback
+    # address/port. external_media_address remains unset so the media answer
+    # uses its routed loopback address (avoids an artificial media blackhole).
+    # Each endpoint is identified by a DISTINCT /32 so an
     # inbound INVITE from the caller maps to chime-trunk and the mock's
     # REGISTER/traffic maps to qa-bridge with no ambiguity.
     cat >"$CONFIG_DIR/pjsip.conf" <<EOF
@@ -166,6 +166,8 @@ EOF
 type = transport
 protocol = udp
 bind = $RK_IP:$RK_SIP
+external_signaling_address = $RK_IP
+external_signaling_port = $RK_SIP
 
 [chime-trunk]
 type = endpoint

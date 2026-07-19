@@ -207,6 +207,35 @@ def parse_sdp_pts(body):
     return pcmu, tev, rip, rport
 
 
+def parse_contact_target(message):
+    """Return the 200 Contact URI and its IPv4 UDP target.
+
+    The hermetic UAC deliberately derives its ACK target from the response
+    instead of sending to the configured INVITE destination by coincidence.
+    """
+    contact = next(
+        (line.split(":", 1)[1].strip() for line in message.split("\r\n")
+         if line.lower().startswith("contact:")),
+        None,
+    )
+    if contact is None:
+        return None, None
+    match = re.search(
+        r"(?i)<\s*(sip:[^@>]+@(?P<host>\[[^]]+\]|[^:;>]+)(?::(?P<port>\d+))?[^>]*)>",
+        contact,
+    )
+    if match is None:
+        return None, None
+    uri = match.group(1)
+    host = match.group("host").strip("[]")
+    port = int(match.group("port") or 5060)
+    try:
+        target = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+    except OSError:
+        return uri, None
+    return uri, target
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dst-ip", required=True)
@@ -274,6 +303,7 @@ def main():
 
     totag = None
     ok_body = None
+    ok_message = None
     deadline = time.time() + 8
     while time.time() < deadline:
         try:
@@ -303,6 +333,7 @@ def main():
                 if l.lower().startswith("to:") and "tag=" in l.lower():
                     totag = l.split("tag=", 1)[1].strip()
             ok_body = msg.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in msg else ""
+            ok_message = msg
             break
         # 100/180/183 -> keep waiting
     if ok_body is None:
@@ -313,6 +344,27 @@ def main():
             exit_code=2,
         )
         return 2
+
+    contact_uri, contact_target = parse_contact_target(ok_message)
+    if contact_target is None:
+        log("200 OK has no resolvable SIP Contact; ACK cannot reach the dialog target")
+        _write_result(args, {"error": "unreachable_contact", "voice_rx": 0}, exit_code=2)
+        return 2
+    if args.invite_fixture:
+        expected_routes = [
+            line.split(":", 1)[1].strip()
+            for line in invite.split("\r\n")
+            if line.lower().startswith("record-route:")
+        ]
+        actual_routes = [
+            line.split(":", 1)[1].strip()
+            for line in ok_message.split("\r\n")
+            if line.lower().startswith("record-route:")
+        ]
+        if actual_routes != expected_routes:
+            log("200 OK did not preserve the INVITE Record-Route set")
+            _write_result(args, {"error": "record_route_mismatch", "voice_rx": 0}, exit_code=2)
+            return 2
 
     pcmu_pt, tev_pt, rip, rport = parse_sdp_pts(ok_body)
     if not rip or rip == "0.0.0.0":
@@ -329,12 +381,14 @@ def main():
             "transport=udp;lr;nat=yes>\r\n"
         )
     ack = (
-        f"ACK {ruri} SIP/2.0\r\n"
+        f"ACK {contact_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {args.src_ip}:{args.sip_port};branch=z9hG4bK{random.randint(0, 1 << 32):08x};rport\r\n"
         f"Max-Forwards: 70\r\n{ack_route}From: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
         f"To: <{ruri}>;tag={totag}\r\nCall-ID: {callid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n"
     )
-    sipsock.sendto(ack.encode(), (args.dst_ip, args.dst_port))
+    # This harness represents the last proxy hop: Route remains on the wire,
+    # while the datagram is delivered to the UAS's advertised Contact target.
+    sipsock.sendto(ack.encode(), contact_target)
 
     # ---- media threads ----
     stop = threading.Event()
@@ -418,12 +472,12 @@ def main():
     stop.set()
     time.sleep(0.3)
     bye = (
-        f"BYE {ruri} SIP/2.0\r\n"
+        f"BYE {contact_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {args.src_ip}:{args.sip_port};branch=z9hG4bK{random.randint(0, 1 << 32):08x};rport\r\n"
         f"Max-Forwards: 70\r\nFrom: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
         f"To: <{ruri}>;tag={totag}\r\nCall-ID: {callid}\r\nCSeq: {cseq + 1} BYE\r\nContent-Length: 0\r\n\r\n"
     )
-    sipsock.sendto(bye.encode(), (args.dst_ip, args.dst_port))
+    sipsock.sendto(bye.encode(), contact_target)
 
     # write RX wav (8k mono s16) from the measurement window
     with wave.open(args.rx_wav, "wb") as w:
