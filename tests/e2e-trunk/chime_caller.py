@@ -318,10 +318,20 @@ def main():
     if not rip or rip == "0.0.0.0":
         rip = args.dst_ip
     log(f"answered: PCMU_PT={pcmu_pt} TEV_PT={tev_pt} remote_media={rip}:{rport}")
+    # A production proxy may consume one hop from the captured double
+    # Record-Route topology and rewrite the surviving Route before the ACK
+    # reaches rustisk. Exercise that shape end-to-end without retaining any
+    # production carrier address or identifier.
+    ack_route = ""
+    if args.invite_fixture:
+        ack_route = (
+            "Route: <sip:rewritten-edge.example.invalid:5080;"
+            "transport=udp;lr;nat=yes>\r\n"
+        )
     ack = (
         f"ACK {ruri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {args.src_ip}:{args.sip_port};branch=z9hG4bK{random.randint(0, 1 << 32):08x};rport\r\n"
-        f"Max-Forwards: 70\r\nFrom: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
+        f"Max-Forwards: 70\r\n{ack_route}From: <sip:chime@{args.src_ip}>;tag={fromtag}\r\n"
         f"To: <{ruri}>;tag={totag}\r\nCall-ID: {callid}\r\nCSeq: {cseq} ACK\r\nContent-Length: 0\r\n\r\n"
     )
     sipsock.sendto(ack.encode(), (args.dst_ip, args.dst_port))

@@ -39,20 +39,6 @@ fn request_identity_matches(original: &SipMessage, retransmission: &SipMessage) 
             == retransmission.from_header().and_then(extract_tag)
 }
 
-fn ack_route_set_matches(invite: &SipMessage, ack: &SipMessage) -> bool {
-    let actual = ack.get_headers(header_names::ROUTE);
-    if actual.is_empty() {
-        return true;
-    }
-    let expected = invite.get_headers(header_names::RECORD_ROUTE);
-    actual.len() == expected.len()
-        && actual.iter().zip(expected).all(|(actual, expected)| {
-            actual.split_whitespace().collect::<String>().eq_ignore_ascii_case(
-                &expected.split_whitespace().collect::<String>(),
-            )
-        })
-}
-
 /// Build the transaction ACK for a 300-699 INVITE response. It reuses the
 /// INVITE branch and Request-URI, unlike the new-branch dialog ACK for 2xx.
 fn build_non_2xx_ack(invite: &SipMessage, response: &SipMessage) -> Option<SipMessage> {
@@ -335,28 +321,78 @@ impl TransactionLayer {
     /// its packet source identifies the INVITE server transaction. Stateful
     /// SIP proxy pools may deliver the ACK from a different tuple than the
     /// INVITE. Match the dialog identity and INVITE CSeq instead (RFC 3261
-    /// Sections 12.2.1.1 and 13.2.2.4). The TU separately performs full source
-    /// tuple and dialog validation before accepting any application effects.
+    /// Sections 12.2.1.1 and 13.2.2.4). Route headers are deliberately not a
+    /// transaction identity predicate: proxies consume and may rewrite them
+    /// while forwarding an in-dialog request. The TU separately performs full
+    /// source tuple and dialog validation before accepting application effects.
     fn accepted_ack_branch(&self, ack: &SipMessage, _src: SocketAddr) -> Option<String> {
-        let call_id = ack.call_id()?;
-        let from_tag = ack.from_header().and_then(extract_tag)?;
-        let to_tag = ack.to_header().and_then(extract_tag)?;
-        let ack_cseq = cseq_number(ack)?;
+        let Some(call_id) = ack.call_id() else {
+            debug!(reason = "missing Call-ID", "ACK identity was incomplete");
+            return None;
+        };
+        let Some(from_tag) = ack.from_header().and_then(extract_tag) else {
+            debug!(reason = "missing From tag", "ACK identity was incomplete");
+            return None;
+        };
+        let Some(to_tag) = ack.to_header().and_then(extract_tag) else {
+            debug!(reason = "missing To tag", "ACK identity was incomplete");
+            return None;
+        };
+        let Some(ack_cseq) = cseq_number(ack) else {
+            debug!(reason = "missing CSeq", "ACK identity was incomplete");
+            return None;
+        };
 
-        self.invite_server_txns.iter().find_map(|(branch, txn)| {
-            if txn.state != crate::transaction::InviteServerState::Accepted
-                || txn.request.call_id() != Some(call_id)
-                || txn.request.from_header().and_then(extract_tag).as_deref()
-                    != Some(from_tag.as_str())
-                || cseq_number(&txn.request) != Some(ack_cseq)
-                || !ack_route_set_matches(&txn.request, ack)
-            {
-                return None;
+        let mut accepted_candidates = 0usize;
+        let mut call_id_matches = 0usize;
+        let mut from_tag_matches = 0usize;
+        let mut cseq_matches = 0usize;
+        let mut response_to_tags = 0usize;
+        let mut to_tag_mismatches = 0usize;
+
+        for (branch, txn) in &self.invite_server_txns {
+            if txn.state != crate::transaction::InviteServerState::Accepted {
+                continue;
             }
-            let response_to_tag = txn.last_response.as_ref()?
-                .to_header().and_then(extract_tag)?;
-            (response_to_tag == to_tag).then(|| branch.clone())
-        })
+            accepted_candidates += 1;
+            if txn.request.call_id() != Some(call_id) {
+                continue;
+            }
+            call_id_matches += 1;
+            if txn.request.from_header().and_then(extract_tag).as_deref()
+                != Some(from_tag.as_str())
+            {
+                continue;
+            }
+            from_tag_matches += 1;
+            if cseq_number(&txn.request) != Some(ack_cseq) {
+                continue;
+            }
+            cseq_matches += 1;
+            let Some(response_to_tag) = txn.last_response.as_ref()
+                .and_then(SipMessage::to_header)
+                .and_then(extract_tag)
+            else {
+                continue;
+            };
+            response_to_tags += 1;
+            if response_to_tag != to_tag {
+                to_tag_mismatches += 1;
+                continue;
+            }
+            return Some(branch.clone());
+        }
+
+        debug!(
+            accepted_candidates,
+            call_id_matches,
+            from_tag_matches,
+            cseq_matches,
+            response_to_tags,
+            to_tag_mismatches,
+            "ACK did not match an accepted INVITE dialog identity"
+        );
+        None
     }
 
     /// Collect branches that need retransmission for INVITE client transactions.
@@ -1713,7 +1749,8 @@ mod tests {
 
     /// The TU retains and retransmits a successful final until its dialog ACK
     /// arrives. A production proxy pool may change the ACK's Via stack and
-    /// source tuple; dialog identity, not transport tuple, matches the 2xx ACK.
+    /// source tuple and may consume or rewrite Route hops; dialog identity
+    /// matches the 2xx ACK.
     #[tokio::test]
     async fn test_2xx_retransmits_until_new_branch_ack_reaches_tu() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1723,7 +1760,14 @@ mod tests {
         let peer_addr = peer.local_addr().unwrap();
 
         let mut invite = build_invite_request("accepted-call", "z9hG4bKaccepted");
-        invite.add_header("Record-Route", "<sip:proxy.example.com;lr>");
+        invite.add_header(
+            "Record-Route",
+            "<sip:edge.example.invalid:5060;r2=on;lr;ftag=c55;did=fixture;nat=yes>",
+        );
+        invite.add_header(
+            "Record-Route",
+            "<sip:edge.example.invalid;transport=tcp;r2=on;lr;ftag=c55;did=fixture;nat=yes>",
+        );
         stack.handle_request(invite.clone(), peer_addr).await;
         let _ = rx.recv().await;
         let mut ok = invite.create_response(200, "OK").unwrap();
@@ -1739,11 +1783,31 @@ mod tests {
         assert_eq!(recv_peer(&peer).await.to_string(), ok.to_string(),
             "the cached 2xx must be byte-equivalent");
 
-        let mut forged_ack =
-            build_2xx_ack("accepted-call", "z9hG4bKforged-ack-branch", "server-tag");
-        forged_ack.add_header("Route", "<sip:attacker.example.com;lr>");
-        stack.handle_request(forged_ack, peer_addr).await;
-        assert!(rx.try_recv().is_err(), "forged route-set ACK must not reach TU");
+        let forged_to_tag =
+            build_2xx_ack("accepted-call", "z9hG4bKforged-to-branch", "wrong-server-tag");
+        stack.handle_request(forged_to_tag, peer_addr).await;
+        assert!(rx.try_recv().is_err(), "wrong To-tag ACK must not reach TU");
+
+        let mut forged_from_tag =
+            build_2xx_ack("accepted-call", "z9hG4bKforged-from-branch", "server-tag");
+        forged_from_tag.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::FROM))
+            .unwrap().value = "<sip:caller@127.0.0.1>;tag=wrong-caller-tag".to_string();
+        stack.handle_request(forged_from_tag, peer_addr).await;
+        assert!(rx.try_recv().is_err(), "wrong From-tag ACK must not reach TU");
+
+        let forged_call_id =
+            build_2xx_ack("wrong-call", "z9hG4bKforged-call-branch", "server-tag");
+        stack.handle_request(forged_call_id, peer_addr).await;
+        assert!(rx.try_recv().is_err(), "wrong Call-ID ACK must not reach TU");
+
+        let mut forged_cseq =
+            build_2xx_ack("accepted-call", "z9hG4bKforged-cseq-branch", "server-tag");
+        forged_cseq.headers.iter_mut()
+            .find(|header| header.name.eq_ignore_ascii_case(header_names::CSEQ))
+            .unwrap().value = "2 ACK".to_string();
+        stack.handle_request(forged_cseq, peer_addr).await;
+        assert!(rx.try_recv().is_err(), "wrong CSeq ACK must not reach TU");
         assert_eq!(
             stack
                 .transaction_layer
@@ -1753,7 +1817,7 @@ mod tests {
                 .unwrap()
                 .state,
             crate::transaction::InviteServerState::Accepted,
-            "forged ACK must not stop 2xx retransmission"
+            "forged dialog ACKs must not stop 2xx retransmission"
         );
 
         let ack_peer = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
@@ -1762,6 +1826,12 @@ mod tests {
         ack.add_header(
             "Via",
             "SIP/2.0/UDP proxy.invalid:5060;branch=z9hG4bKproxy-hop;rport",
+        );
+        // Production-shaped double Record-Route topologies may consume one
+        // hop and rewrite the surviving Route before the ACK reaches the UAS.
+        ack.add_header(
+            "Route",
+            "<sip:rewritten-edge.example.invalid:5080;transport=udp;lr;nat=yes>",
         );
         let mut expected_ack = ack.clone();
         expected_ack.stamp_via_received_rport(ack_peer_addr);
