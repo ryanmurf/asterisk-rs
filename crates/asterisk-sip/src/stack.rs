@@ -331,9 +331,13 @@ impl TransactionLayer {
         }
     }
 
-    /// A 2xx ACK has a new Via branch. Match it by the dialog identity,
-    /// source tuple, and INVITE CSeq instead (RFC 3261 Section 13.2.2.4).
-    fn accepted_ack_branch(&self, ack: &SipMessage, src: SocketAddr) -> Option<String> {
+    /// A 2xx ACK has its own client transaction, so neither its Via branch nor
+    /// its packet source identifies the INVITE server transaction. Stateful
+    /// SIP proxy pools may deliver the ACK from a different tuple than the
+    /// INVITE. Match the dialog identity and INVITE CSeq instead (RFC 3261
+    /// Sections 12.2.1.1 and 13.2.2.4). The TU separately performs full source
+    /// tuple and dialog validation before accepting any application effects.
+    fn accepted_ack_branch(&self, ack: &SipMessage, _src: SocketAddr) -> Option<String> {
         let call_id = ack.call_id()?;
         let from_tag = ack.from_header().and_then(extract_tag)?;
         let to_tag = ack.to_header().and_then(extract_tag)?;
@@ -341,7 +345,6 @@ impl TransactionLayer {
 
         self.invite_server_txns.iter().find_map(|(branch, txn)| {
             if txn.state != crate::transaction::InviteServerState::Accepted
-                || txn.remote_addr != src
                 || txn.request.call_id() != Some(call_id)
                 || txn.request.from_header().and_then(extract_tag).as_deref()
                     != Some(from_tag.as_str())
@@ -1709,7 +1712,8 @@ mod tests {
     }
 
     /// The TU retains and retransmits a successful final until its dialog ACK
-    /// arrives. The ACK uses a different branch and reaches the application.
+    /// arrives. A production proxy pool may change the ACK's Via stack and
+    /// source tuple; dialog identity, not transport tuple, matches the 2xx ACK.
     #[tokio::test]
     async fn test_2xx_retransmits_until_new_branch_ack_reaches_tu() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1752,20 +1756,48 @@ mod tests {
             "forged ACK must not stop 2xx retransmission"
         );
 
-        let ack = build_2xx_ack("accepted-call", "z9hG4bKnew-ack-branch", "server-tag");
-        stack.handle_request(ack.clone(), peer_addr).await;
+        let ack_peer = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        let ack_peer_addr = ack_peer.local_addr().unwrap();
+        let mut ack = build_2xx_ack("accepted-call", "z9hG4bKnew-ack-branch", "server-tag");
+        ack.add_header(
+            "Via",
+            "SIP/2.0/UDP proxy.invalid:5060;branch=z9hG4bKproxy-hop;rport",
+        );
+        let mut expected_ack = ack.clone();
+        expected_ack.stamp_via_received_rport(ack_peer_addr);
+        stack.handle_request(ack.clone(), ack_peer_addr).await;
         match rx.recv().await.expect("2xx ACK must reach TU") {
             SipEvent::IncomingAck { call_id, request, remote_addr } => {
                 assert_eq!(call_id, "accepted-call");
-                assert_eq!(request.to_string(), ack.to_string());
-                assert_eq!(remote_addr, peer_addr);
+                assert_eq!(request.to_string(), expected_ack.to_string());
+                assert_eq!(remote_addr, ack_peer_addr);
             }
             other => panic!("Expected IncomingAck, got {other:?}"),
         }
-
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            stack
+                .transaction_layer
+                .read()
+                .invite_server_txns
+                .get("z9hG4bKaccepted")
+                .unwrap()
+                .state,
+            crate::transaction::InviteServerState::Terminated,
+            "dialog ACK from another proxy tuple must terminate the accepted transaction",
+        );
+        stack
+            .transaction_layer
+            .write()
+            .invite_server_txns
+            .get_mut("z9hG4bKaccepted")
+            .unwrap()
+            .expire_final_response_timer();
         stack.handle_timers().await;
         assert!(recv_peer_opt(&peer, 300).await.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "a matched ACK must suppress the Timer-H timeout event",
+        );
     }
 
     #[tokio::test]
